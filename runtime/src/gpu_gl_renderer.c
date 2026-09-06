@@ -87,6 +87,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "png_write.h"   /* png_write_rgb — present_shot readback */
+/* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp
+ * (see main.cpp's identical include for the same reason). Used to decode HD
+ * texture replacement PNGs -- see hd_gl_get_texture below. */
+#include "../third_party/stb_image.h"
 
 #ifndef GL_BGRA
 #define GL_BGRA 0x80E1
@@ -149,6 +153,7 @@ typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform2f)(GLint, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
+typedef void   (APIENTRY *PFN_glUniform3f)(GLint, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
 typedef void   (APIENTRY *PFN_glBlendEquationSeparate)(GLenum, GLenum);
@@ -212,6 +217,7 @@ static PFN_glUniform2i         p_glUniform2i;
 static PFN_glUniform4i         p_glUniform4i;
 static PFN_glUniform2f         p_glUniform2f;
 static PFN_glUniform4f         p_glUniform4f;
+static PFN_glUniform3f         p_glUniform3f;
 static PFN_glBlendColor        p_glBlendColor;
 static PFN_glBlendFuncSeparate p_glBlendFuncSeparate;
 static PFN_glBlendEquationSeparate p_glBlendEquationSeparate;
@@ -267,6 +273,7 @@ static int load_modern_gl(void) {
     LOAD(p_glUniform2i, "glUniform2i"); LOAD(p_glUniform4i, "glUniform4i");
     LOAD(p_glUniform2f, "glUniform2f");
     LOAD(p_glUniform4f, "glUniform4f");
+    LOAD(p_glUniform3f, "glUniform3f");
     LOAD(p_glBlendColor, "glBlendColor");
     LOAD(p_glBlendFuncSeparate, "glBlendFuncSeparate");
     LOAD(p_glBlendEquationSeparate, "glBlendEquationSeparate");
@@ -1996,6 +2003,261 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
     gpu_geometry(GL_LINES, xs, ys, cs, 2, semi);
 }
 
+/* ---- HD texture replacement (DuckStation-compatible dump, Stage 2) -------
+ * An opaque textured primitive that gpu_hd_texture_dump_match() resolves (see
+ * src/textures/hd_texture_dump.h in the game project, wired through
+ * gpu_hd_texture_dump_match in gpu.c) draws through this separate, minimal
+ * pipeline instead of the native batched TEX program: a single unbatched
+ * triangle sampling a decoded replacement PNG with GL's own bilinear
+ * filtering, no CLUT/depth decode. Every matched primitive is its own draw
+ * call -- no attempt to coalesce them, unlike the native path's batching.
+ *
+ * Deliberately NOT handled here (falls through to the native path
+ * unchanged): semi-transparent primitives (semi >= 0) -- sidesteps the
+ * native pipeline's two-pass mask/stencil semi-transparency handling
+ * entirely for this first pass, since most diffuse world/character textures
+ * are opaque and this keeps the addition's risk contained.
+ *
+ * KNOWN LIMITATION: always uses the canonical (non-wide) x projection
+ * (u_xoff=0, u_xhalf=512) -- if native-wide widescreen is active at the same
+ * time as an HD replacement, the replaced primitive will not shift with the
+ * rest of the wide-mirrored scene. Revisit if widescreen + HD textures are
+ * ever actually used together (today's default widescreen state is off). */
+static GLuint s_hd_prog = 0, s_hd_vao = 0, s_hd_vbo = 0;
+static GLint  s_hd_uXoff = -1, s_hd_uXhalf = -1, s_hd_uShift = -1, s_hd_uTex = -1, s_hd_uTint = -1,
+             s_hd_uRaw = -1;
+
+static const char *HD_VS =
+    "#version 330\n"
+    "layout(location=0) in vec2 a_pos;\n"
+    "layout(location=1) in vec2 a_uv;\n"
+    "layout(location=2) in vec3 a_col;\n"
+    "uniform float u_shift;\n"
+    "uniform float u_xoff;\n"
+    "uniform float u_xhalf;\n"
+    "noperspective out vec2 v_uv;\n"
+    "noperspective out vec3 v_col;\n"
+    "void main(){ v_uv = a_uv; v_col = a_col;\n"
+    "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0,\n"
+    "                     (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+static const char *HD_FS =
+    "#version 330\n"
+    "noperspective in vec2 v_uv; noperspective in vec3 v_col; out vec4 frag;\n"
+    "uniform sampler2D u_tex;\n"
+    /* Per-channel multiplier for the shading-approximation fallback (see
+     * hd_texture_dump.h's header comment on hd_texture_dump_match) -- (1,1,1)
+     * for an exact palette-hash match, a derived tint otherwise so a scene
+     * lighting change (e.g. Vagrant Story's battle-mode darkening) still
+     * shows on the HD texture instead of it falling back to native. */
+    "uniform vec3 u_tint;\n"
+    /* 1 = this primitive is in raw/unlit mode (no per-vertex shading), same
+     * convention as the native TEX_FS's v_raw. */
+    "uniform int u_raw;\n"
+    /* PS1 opaque-classified prims (semi < 0, the only ones this pipeline
+     * handles) still cut out fully: any texel whose native VRAM value was
+     * exactly 0 is discarded (see TEX_FS's fetch_texel/"if (raw==0) discard"
+     * -- e.g. hair strands, foliage holes, sprite silhouettes against
+     * whatever is drawn behind them). A replacement PNG's alpha channel is
+     * the pack author's encoding of that same cutout, so this must discard
+     * on it the same way or those areas render as solid blocks instead of
+     * see-through -- exactly the "transparency between textures" the user
+     * spotted looking wrong. A hard discard (not real alpha blending)
+     * matches the original PS1 behavior for this prim class faithfully. */
+    "void main(){\n"
+    "  vec4 c = texture(u_tex, v_uv);\n"
+    "  if (c.a < 0.5) discard;\n"
+    /* Per-vertex Gouraud shading (ambient/room lighting), same formula and
+     * *2.0 scale as TEX_FS's "rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0)"
+     * -- PS1 vertex colors are stored so 0x80 (0.5 normalized) means neutral
+     * "full brightness, no tint", hence the doubling. Skipped for raw/unlit
+     * prims, exactly like the native path. Missing this entirely was why HD-
+     * replaced textures rendered at flat full brightness regardless of the
+     * room's actual lighting (confirmed live: DuckStation's floor read
+     * visibly darker/shaded than this recomp's in the identical room). */
+    "  vec3 rgb = c.rgb * u_tint;\n"
+    "  if (u_raw == 0) rgb = clamp(rgb * v_col * 2.0, 0.0, 1.0);\n"
+    "  frag = vec4(rgb, c.a);\n"
+    "}\n";
+
+/* entry_id -> decoded/uploaded GL texture. Small in practice (one entry per
+ * distinct replacement PNG actually drawn this session), so linear scan is
+ * fine; grows by doubling. Never shrinks/evicts -- a whole session's worth
+ * of HD textures for one game is not expected to be a meaningful budget
+ * concern, unlike the native VRAM texture cache this deliberately avoids
+ * touching. */
+typedef struct { uint32_t entry_id; GLuint tex; int failed; } HdGlTexEntry;
+static HdGlTexEntry *s_hd_tex_cache = NULL;
+static int s_hd_tex_cache_count = 0, s_hd_tex_cache_cap = 0;
+static uint64_t s_hd_draws_issued = 0;    /* draw_hd_replacement_triangle calls */
+static uint64_t s_hd_matches_seen = 0;    /* gpu_hd_texture_dump_match hits (incl. failed decode) */
+uint64_t gl_renderer_hd_draws_issued(void) { return s_hd_draws_issued; }
+uint64_t gl_renderer_hd_matches_seen(void) { return s_hd_matches_seen; }
+int gl_renderer_hd_prog_ready(void) { return s_hd_prog != 0; }
+int gl_renderer_hd_tex_cache_count(void) { return s_hd_tex_cache_count; }
+
+/* Coverage-debugging aid (PSXRECOMP_HD_TEXTURE_DEBUG_MISSING=1): paints every
+ * opaque textured primitive that did NOT end up HD-replaced (no match, or a
+ * match whose PNG failed to decode) solid violet instead of letting it fall
+ * through to native rendering. Answers "is this scene mostly HD or mostly
+ * native" at a glance, and makes exactly which objects/tiles the pack
+ * doesn't cover immediately visible while walking around -- much faster than
+ * reasoning about match-funnel counters alone. Implemented as a 1x1 solid-
+ * color texture fed through the SAME draw_hd_replacement_triangle pipeline
+ * (not a new shader/VAO): zero additional risk of the hr_begin/hr_end-less
+ * black-screen regression this file already hit once. */
+static int s_hd_debug_missing = 0;
+static GLuint s_hd_debug_missing_tex = 0;
+int gl_renderer_hd_debug_missing(void) { return s_hd_debug_missing; }
+
+static void hd_gl_init(void) {
+    s_hd_prog = build_program(HD_VS, HD_FS);
+    if (!s_hd_prog) return;
+    s_hd_uXoff  = p_glGetUniformLocation(s_hd_prog, "u_xoff");
+    s_hd_uXhalf = p_glGetUniformLocation(s_hd_prog, "u_xhalf");
+    s_hd_uShift = p_glGetUniformLocation(s_hd_prog, "u_shift");
+    s_hd_uTex   = p_glGetUniformLocation(s_hd_prog, "u_tex");
+    s_hd_uTint  = p_glGetUniformLocation(s_hd_prog, "u_tint");
+    s_hd_uRaw   = p_glGetUniformLocation(s_hd_prog, "u_raw");
+    p_glGenVertexArrays(1, &s_hd_vao);
+    p_glBindVertexArray(s_hd_vao);
+    p_glGenBuffers(1, &s_hd_vbo);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_hd_vbo);
+    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)0);
+    p_glEnableVertexAttribArray(0);
+    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)(2 * sizeof(float)));
+    p_glEnableVertexAttribArray(1);
+    p_glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)(4 * sizeof(float)));
+    p_glEnableVertexAttribArray(2);
+    p_glBindVertexArray(0);
+    p_glUseProgram(s_hd_prog);
+    p_glUniform1f(s_hd_uXoff, 0.0f);
+    p_glUniform1f(s_hd_uXhalf, 512.0f);
+    /* Same formula as the native GEO/TEX programs' u_shift (see the comment
+     * above GEO_VS) -- s_scale is fixed for the pipeline's lifetime, so this
+     * is computed once here rather than mirrored from those programs. */
+    p_glUniform1f(s_hd_uShift, 0.5f / (float)s_scale - 1.0f / 64.0f);
+    p_glUniform1i(s_hd_uTex, 0);
+    p_glUniform3f(s_hd_uTint, 1.0f, 1.0f, 1.0f);
+    p_glUseProgram(0);
+
+    const char *debug_missing_env = getenv("PSXRECOMP_HD_TEXTURE_DEBUG_MISSING");
+    s_hd_debug_missing = debug_missing_env && debug_missing_env[0] && debug_missing_env[0] != '0';
+    if (s_hd_debug_missing) {
+        static const unsigned char violet[4] = { 200, 0, 220, 255 };
+        glGenTextures(1, &s_hd_debug_missing_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_hd_debug_missing_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, violet);
+        fprintf(stdout, "psxrecomp: HD texture coverage-debug ON -- unreplaced opaque prims render solid violet\n");
+    }
+}
+
+static GLuint hd_gl_get_texture(uint32_t entry_id, const char *png_path) {
+    for (int i = 0; i < s_hd_tex_cache_count; i++)
+        if (s_hd_tex_cache[i].entry_id == entry_id)
+            return s_hd_tex_cache[i].failed ? 0 : s_hd_tex_cache[i].tex;
+    if (s_hd_tex_cache_count == s_hd_tex_cache_cap) {
+        int new_cap = s_hd_tex_cache_cap ? s_hd_tex_cache_cap * 2 : 64;
+        HdGlTexEntry *grown = (HdGlTexEntry *)realloc(
+            s_hd_tex_cache, (size_t)new_cap * sizeof(HdGlTexEntry));
+        if (!grown) return 0;
+        s_hd_tex_cache = grown;
+        s_hd_tex_cache_cap = new_cap;
+    }
+    HdGlTexEntry *slot = &s_hd_tex_cache[s_hd_tex_cache_count++];
+    slot->entry_id = entry_id;
+    slot->tex = 0;
+    slot->failed = 1;
+    /* The shared stb_image implementation (psx_window_icon.cpp) is built
+     * with STBI_NO_STDIO -- no stbi_load(path, ...) -- so the file is read
+     * into memory here and handed to stbi_load_from_memory instead. */
+    unsigned char *pixels = NULL;
+    int w = 0, h = 0, comp = 0;
+    FILE *f = fopen(png_path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (len > 0) {
+            unsigned char *filebuf = (unsigned char *)malloc((size_t)len);
+            if (filebuf && fread(filebuf, 1, (size_t)len, f) == (size_t)len)
+                pixels = stbi_load_from_memory(filebuf, (int)len, &w, &h, &comp, 4);
+            free(filebuf);
+        }
+        fclose(f);
+    }
+    if (!pixels) {
+        fprintf(stdout, "psxrecomp: HD texture decode failed: %s\n", png_path);
+        return 0;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    if (tex) {
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        slot->tex = tex;
+        slot->failed = 0;
+    }
+    stbi_image_free(pixels);
+    return slot->failed ? 0 : slot->tex;
+}
+
+/* Draws ONE textured triangle through the HD replacement pipeline. xs/ys are
+ * the same screen-space (VRAM px, draw-offset-applied) coordinates the
+ * native path already computed; us/vs are the ORIGINAL PS1 texel
+ * coordinates (pre-remap) -- gpu_hd_texture_dump_match's affine remap
+ * (u_scale/u_offset/v_scale/v_offset) is applied right here, per vertex. */
+static void draw_hd_replacement_triangle(const int *xs, const int *ys,
+                                         const int *us, const int *vs,
+                                         const float *col, int rawtex,
+                                         GLuint tex, float u_scale, float u_offset,
+                                         float v_scale, float v_offset,
+                                         float tint_r, float tint_g, float tint_b) {
+    float verts[3 * 7];
+    for (int i = 0; i < 3; i++) {
+        verts[i * 7 + 0] = (float)xs[i];
+        verts[i * 7 + 1] = (float)ys[i];
+        verts[i * 7 + 2] = (float)us[i] * u_scale + u_offset;
+        verts[i * 7 + 3] = (float)vs[i] * v_scale + v_offset;
+        verts[i * 7 + 4] = col[i * 3 + 0];
+        verts[i * 7 + 5] = col[i * 3 + 1];
+        verts[i * 7 + 6] = col[i * 3 + 2];
+    }
+    /* Same FBO/viewport/scissor bracket every other draw path in this file
+     * uses (see flush_flat_batch/flush_tex_batch) -- without it this drew to
+     * whatever framebuffer/viewport happened to be left bound by whichever
+     * native draw ran immediately before it (observed live: a full black
+     * window while the CPU-side/raw VRAM state stayed correct, i.e. the
+     * scene was rendering somewhere, just not into the accumulated frame the
+     * window actually presents), and skipped hr_end()'s state reset that
+     * later native draws rely on running symmetrically. */
+    hr_begin(1);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    p_glUseProgram(s_hd_prog);
+    p_glUniform3f(s_hd_uTint, tint_r, tint_g, tint_b);
+    p_glUniform1i(s_hd_uRaw, rawtex);
+    glDisable(GL_BLEND);
+    mask_stencil(s_mask_set);
+    p_glBindVertexArray(s_hd_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_hd_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    hr_end();
+    s_hd_draws_issued++;
+}
+
 /* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
  * implementation for GL/VK/SW, see gpu_uv.h. */
 #include "gpu_uv.h"
@@ -2030,6 +2292,45 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
     flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);  /* flushes batch iff it must pack */
     mark_prim_dirty(xs, ys, 3, 1 /* textured */);
+
+    /* HD texture replacement (Stage 2, opaque prims only -- see the pipeline
+     * comment above draw_hd_replacement_triangle). Checked before the native
+     * batch append so a match bypasses it entirely, drawing through the
+     * separate unbatched HD pipeline instead; anything unmatched (the
+     * overwhelming common case, and every semi-transparent prim regardless)
+     * falls through unchanged to the native path below. lim[] is
+     * {u_first, v_first, u_last, v_last} (see gpu_uv.h's psx_uv_tri_limits);
+     * gpu_hd_texture_dump_match wants u_first,u_last,v_first,v_last. */
+    if (semi < 0 && s_hd_prog) {
+        uint32_t hd_entry_id = 0;
+        const char *hd_png_path = NULL;
+        float hd_u_scale = 0, hd_u_offset = 0, hd_v_scale = 0, hd_v_offset = 0;
+        float hd_tint_r = 1.0f, hd_tint_g = 1.0f, hd_tint_b = 1.0f;
+        GLuint hd_tex = 0;
+        if (gpu_hd_texture_dump_match(base_x, base_y, depth, lim[0], lim[2], lim[1], lim[3],
+                                      clut_x, clut_y,
+                                      &hd_entry_id, &hd_png_path, &hd_u_scale, &hd_u_offset,
+                                      &hd_v_scale, &hd_v_offset,
+                                      &hd_tint_r, &hd_tint_g, &hd_tint_b)) {
+            s_hd_matches_seen++;
+            hd_tex = hd_gl_get_texture(hd_entry_id, hd_png_path);
+        }
+        if (hd_tex) {
+            flush_flat_batch();
+            flush_tex_batch();
+            draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, hd_tex,
+                                         hd_u_scale, hd_u_offset, hd_v_scale, hd_v_offset,
+                                         hd_tint_r, hd_tint_g, hd_tint_b);
+            return;
+        }
+        if (s_hd_debug_missing) {
+            flush_flat_batch();
+            flush_tex_batch();
+            draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, s_hd_debug_missing_tex,
+                                         0.0f, 0.5f, 0.0f, 0.5f, 1.0f, 1.0f, 1.0f);
+            return;
+        }
+    }
 
     /* Append to the textured batch. Flush first if this prim's blend/mask/twin/
      * filter differ from the open batch, or the buffer is full. Per-prim texture
@@ -2881,6 +3182,8 @@ static int init_gpu_raster(void) {
 
     p_glGenVertexArrays(1, &s_empty_vao);
     p_glBindVertexArray(0);
+
+    hd_gl_init();
 
     /* Clear the authoritative surface (color + stencil) and queue a full
      * upload of whatever the CPU VRAM already holds (pre-context software

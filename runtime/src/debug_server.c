@@ -5368,6 +5368,65 @@ static void handle_gpu_state(int id, const char *json)
              ws.angle_max_vanilla, ws.angle_max_widened);
 }
 
+/* HD texture-replacement dump (DuckStation-compatible, Stage 1: hash +
+ * lookup verification only -- see src/textures/hd_texture_dump.h). Reports
+ * the most recently tracked CPU->VRAM uploads and whether each one's XXH3
+ * hash matched a src_hash from the loaded replacement pack, so a live
+ * session can be checked against a real community texture dump without
+ * any rendering wiring yet. */
+static void handle_hdtex_recent(int id, const char *json)
+{
+    int n = json_get_int(json, "count", 16);
+    if (n < 1) n = 1;
+    if (n > 32) n = 32;
+    uint32_t entry_count = 0, unique_hash_count = 0;
+    gpu_hd_texture_dump_info(&entry_count, &unique_hash_count);
+    const int available = gpu_hd_texture_dump_recent_count();
+    if (n > available) n = available;
+
+    uint64_t match_stats[8];
+    gpu_hd_texture_dump_match_stats(match_stats);
+
+    int bufsz = 384 + n * 96;
+    char *buf = (char *)malloc((size_t)bufsz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"pack_entries\":%u,"
+                       "\"pack_unique_hashes\":%u,"
+                       "\"hd_prog_ready\":%d,\"hd_matches_seen\":%llu,"
+                       "\"hd_draws_issued\":%llu,\"hd_tex_cache_count\":%d,"
+                       "\"hd_pal_cache_size\":%u,\"hd_debug_missing\":%d,"
+                       "\"match_stats\":{\"attempts\":%llu,\"reject_wrapped_uv\":%llu,"
+                       "\"no_tracked_upload\":%llu,\"hash_not_in_pack\":%llu,"
+                       "\"reject_palette\":%llu,\"reject_region\":%llu,"
+                       "\"matched\":%llu,\"matched_fallback\":%llu},"
+                       "\"recent\":[",
+                       id, entry_count, unique_hash_count,
+                       gl_renderer_hd_prog_ready(),
+                       (unsigned long long)gl_renderer_hd_matches_seen(),
+                       (unsigned long long)gl_renderer_hd_draws_issued(),
+                       gl_renderer_hd_tex_cache_count(),
+                       gpu_hd_texture_dump_pal_cache_size(),
+                       gl_renderer_hd_debug_missing(),
+                       (unsigned long long)match_stats[0], (unsigned long long)match_stats[1],
+                       (unsigned long long)match_stats[2], (unsigned long long)match_stats[3],
+                       (unsigned long long)match_stats[4], (unsigned long long)match_stats[5],
+                       (unsigned long long)match_stats[6], (unsigned long long)match_stats[7]);
+    for (int i = 0; i < n && pos < bufsz - 96; i++) {
+        uint64_t hash = 0;
+        int x = 0, y = 0, w = 0, h = 0, matched = 0;
+        if (!gpu_hd_texture_dump_recent_get(i, &hash, &x, &y, &w, &h, &matched))
+            break;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"hash\":\"%016llX\",\"x\":%d,\"y\":%d,"
+                        "\"width_words\":%d,\"height\":%d,\"matched\":%d}",
+                        i ? "," : "", (unsigned long long)hash, x, y, w, h, matched);
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
 static void handle_ws_aspect_cone_site(int id, const char *json)
 {
     char addr_str[32];
@@ -13590,6 +13649,7 @@ static const CmdEntry s_commands[] = {
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
+    { "hdtex_recent",      handle_hdtex_recent },
     { "geom_correction",   handle_geom_correction },
     { "pgxp",              handle_pgxp },
     { "ws_aspect_cone_site", handle_ws_aspect_cone_site },

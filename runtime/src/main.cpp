@@ -13367,6 +13367,12 @@ session_reboot:
                      g_video_renderer == 1 ? "opengl" : "software");
     }
     gpu_init();
+    /* HD texture-replacement dump (DuckStation-compatible, Stage 1: hash +
+     * lookup verification only, see src/textures/hd_texture_dump.h). Env-var
+     * gated for now rather than a game.toml/mod key -- this is still being
+     * verified against the live game before it grows a real config surface. */
+    if (const char* hd_texture_root = std::getenv("PSXRECOMP_HD_TEXTURE_DUMP_ROOT"))
+        gpu_hd_texture_dump_init(hd_texture_root);
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init.
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
@@ -14956,10 +14962,18 @@ soft_return_lobby:
                 PSX_HOTKEY_PAD_SELECT_L1);
             g_hotkey_pad_fast_forward_toggle = normalize_hotkey_pad_binding(
                 ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD_TOGGLE], 0);
-            switch (ls.aspect_index) {
-                case 2:  g_video_aspect_num = 21; g_video_aspect_den = 9; break;
-                case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;
-                default: g_video_aspect_num = 4;  g_video_aspect_den = 3; break;
+            /* Widescreen is mod-owned on PSX (ws_offered == false): ls.aspect_index
+             * is never wired to a launcher control and stays 0, so applying it
+             * unconditionally would silently reset a trusted activation plugin's
+             * psx_mod_set_fixed_display_aspect() choice back to 4:3 on every
+             * settle -- the same clobber class documented above for
+             * skip_fmv_offered/turbo_loads_offered, just missing the guard. */
+            if (ws_offered) {
+                switch (ls.aspect_index) {
+                    case 2:  g_video_aspect_num = 21; g_video_aspect_den = 9; break;
+                    case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;
+                    default: g_video_aspect_num = 4;  g_video_aspect_den = 3; break;
+                }
             }
             g_video_win_w = ls.window_width > 0 ? ls.window_width : g_video_win_w;
             /* Preference for persistence; session settle may override boot path. */

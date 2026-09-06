@@ -54,6 +54,19 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 int  gl_renderer_set_bezel(const void *rgba, int w, int h);
 int  gl_renderer_has_bezel(void);
 
+/* HD texture replacement (Stage 2) diagnostics -- for the hdtex_recent debug
+ * command / live troubleshooting of "is the replacement pipeline actually
+ * drawing anything" independent of what it looks like on screen. */
+uint64_t gl_renderer_hd_draws_issued(void);  /* draw_hd_replacement_triangle calls */
+uint64_t gl_renderer_hd_matches_seen(void);  /* gpu_hd_texture_dump_match hits */
+int      gl_renderer_hd_prog_ready(void);    /* 1 = HD shader built OK */
+int      gl_renderer_hd_tex_cache_count(void); /* distinct replacement textures decoded */
+/* 1 if PSXRECOMP_HD_TEXTURE_DEBUG_MISSING is set -- unreplaced opaque prims
+ * render solid violet instead of falling through to native, so replacement
+ * coverage gaps are visible while playing instead of only inferable from
+ * hd_matches_seen/hd_draws_issued counters. */
+int      gl_renderer_hd_debug_missing(void);
+
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 

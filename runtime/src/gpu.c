@@ -39,6 +39,128 @@ extern uint16_t psx_read_half(uint32_t addr);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint32_t psx_read_word(uint32_t addr);
 
+/* HD texture-replacement dump (DuckStation-compatible, Stage 1). Declared
+ * inline rather than included: the implementation lives in the downstream
+ * game project (src/textures/hd_texture_dump.cpp), not this shared
+ * framework submodule, matching how other cross-boundary externs in this
+ * file (e.g. fntrace_is_game_started) are handled elsewhere in the
+ * runtime -- see src/textures/hd_texture_dump.h for the authoritative
+ * signatures. */
+typedef struct HdTextureDump HdTextureDump;
+extern int hd_texture_dump_load(const char* root_dir, HdTextureDump** out_dump,
+                                char* error, size_t error_capacity);
+extern uint64_t hd_texture_dump_track_upload(HdTextureDump* dump, uint16_t x, uint16_t y,
+                                             uint16_t width_words, uint16_t height,
+                                             const uint16_t* words, size_t word_count);
+extern size_t hd_texture_dump_entry_count(const HdTextureDump* dump);
+extern size_t hd_texture_dump_unique_src_hash_count(const HdTextureDump* dump);
+extern int hd_texture_dump_recent_count(const HdTextureDump* dump);
+extern int hd_texture_dump_get_recent_entry(const HdTextureDump* dump, int index,
+                                            uint64_t* hash, uint16_t* x, uint16_t* y,
+                                            uint16_t* width_words, uint16_t* height,
+                                            int* matched);
+extern void hd_texture_dump_note_upload(HdTextureDump* dump, uint16_t x, uint16_t y,
+                                        uint16_t width_words, uint16_t height,
+                                        uint64_t hash);
+/* Mirrors hd_texture_dump.h's HdTextureDumpMatch layout exactly (field
+ * types and order) so this declaration and the real definition are the same
+ * type for linking purposes without gpu.c including that downstream-project
+ * header -- see the comment above the HdTextureDump forward declaration. */
+typedef struct HdTextureDumpMatch {
+    uint32_t entry_id;
+    const char* png_path;
+    float u_scale, u_offset, v_scale, v_offset;
+    float tint_r, tint_g, tint_b;
+} HdTextureDumpMatch;
+typedef uint16_t (*HdTextureDumpVramReadFn)(int x, int y);
+extern int hd_texture_dump_match(HdTextureDump* dump, uint16_t page_x, uint16_t page_y,
+                                 int depth, int u_first, int u_last, int v_first, int v_last,
+                                 uint16_t clut_x, uint16_t clut_y,
+                                 HdTextureDumpVramReadFn vram_read,
+                                 HdTextureDumpMatch* out_match);
+extern size_t hd_texture_dump_pal_cache_size(const HdTextureDump* dump);
+extern void hd_texture_dump_get_match_stats(const HdTextureDump* dump, uint64_t out[8]);
+extern void hd_texture_dump_frame_tick(HdTextureDump* dump);
+
+static HdTextureDump* g_hd_texture_dump = NULL;
+
+void gpu_hd_texture_dump_init(const char* root_dir) {
+    if (g_hd_texture_dump || !root_dir || !root_dir[0]) return;
+    char error[256];
+    error[0] = '\0';
+    if (!hd_texture_dump_load(root_dir, &g_hd_texture_dump, error, sizeof(error))) {
+        fprintf(stderr, "psxrecomp: hd_texture_dump_load(\"%s\") failed: %s\n",
+                root_dir, error[0] ? error : "unknown error");
+        g_hd_texture_dump = NULL;
+        return;
+    }
+    fprintf(stdout,
+        "psxrecomp: HD texture dump loaded from \"%s\" (%zu replacement file(s), "
+        "%zu unique upload hash(es))\n",
+        root_dir, hd_texture_dump_entry_count(g_hd_texture_dump),
+        hd_texture_dump_unique_src_hash_count(g_hd_texture_dump));
+}
+
+void gpu_hd_texture_dump_info(uint32_t* entry_count, uint32_t* unique_hash_count) {
+    if (entry_count) *entry_count = (uint32_t)hd_texture_dump_entry_count(g_hd_texture_dump);
+    if (unique_hash_count)
+        *unique_hash_count = (uint32_t)hd_texture_dump_unique_src_hash_count(g_hd_texture_dump);
+}
+
+uint32_t gpu_hd_texture_dump_pal_cache_size(void) {
+    return (uint32_t)hd_texture_dump_pal_cache_size(g_hd_texture_dump);
+}
+
+void gpu_hd_texture_dump_match_stats(uint64_t out[8]) {
+    hd_texture_dump_get_match_stats(g_hd_texture_dump, out);
+}
+
+void gpu_hd_texture_dump_frame_tick(void) {
+    hd_texture_dump_frame_tick(g_hd_texture_dump);
+}
+
+int gpu_hd_texture_dump_recent_count(void) {
+    return hd_texture_dump_recent_count(g_hd_texture_dump);
+}
+
+int gpu_hd_texture_dump_recent_get(int index, uint64_t* hash, int* x, int* y,
+                                   int* width_words, int* height, int* matched) {
+    uint16_t ux = 0, uy = 0, uw = 0, uh = 0;
+    if (!hd_texture_dump_get_recent_entry(g_hd_texture_dump, index, hash, &ux, &uy,
+                                          &uw, &uh, matched))
+        return 0;
+    if (x) *x = ux;
+    if (y) *y = uy;
+    if (width_words) *width_words = uw;
+    if (height) *height = uh;
+    return 1;
+}
+
+int gpu_hd_texture_dump_match(int page_x, int page_y, int depth,
+                              int u_first, int u_last, int v_first, int v_last,
+                              int clut_x, int clut_y,
+                              uint32_t* entry_id, const char** png_path,
+                              float* u_scale, float* u_offset,
+                              float* v_scale, float* v_offset,
+                              float* tint_r, float* tint_g, float* tint_b) {
+    if (!g_hd_texture_dump) return 0;
+    HdTextureDumpMatch m;
+    if (!hd_texture_dump_match(g_hd_texture_dump, (uint16_t)page_x, (uint16_t)page_y, depth,
+                               u_first, u_last, v_first, v_last,
+                               (uint16_t)clut_x, (uint16_t)clut_y, gpu_vram_peek, &m))
+        return 0;
+    if (entry_id) *entry_id = m.entry_id;
+    if (png_path) *png_path = m.png_path;
+    if (u_scale) *u_scale = m.u_scale;
+    if (u_offset) *u_offset = m.u_offset;
+    if (v_scale) *v_scale = m.v_scale;
+    if (v_offset) *v_offset = m.v_offset;
+    if (tint_r) *tint_r = m.tint_r;
+    if (tint_g) *tint_g = m.tint_g;
+    if (tint_b) *tint_b = m.tint_b;
+    return 1;
+}
+
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
 
@@ -2335,6 +2457,14 @@ static void gp0_commit_cpu_to_vram(void) {
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
     depth24_note_upload(vram_write_x, vram_write_w);
+    {
+        const uint64_t hd_hash = hd_texture_dump_track_upload(
+            g_hd_texture_dump, vram_write_x, vram_write_y, vram_write_w, vram_write_h,
+            vram_write_pixels, (size_t)vram_write_w * vram_write_h);
+        if (g_hd_texture_dump)
+            hd_texture_dump_note_upload(g_hd_texture_dump, vram_write_x, vram_write_y,
+                                        vram_write_w, vram_write_h, hd_hash);
+    }
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
     text_xlate_vram_upload(vram_write_x, vram_write_y,
@@ -2965,6 +3095,7 @@ void gpu_vblank_flush_present(void) {
 }
 
 void gpu_vblank_tick(void) {
+    gpu_hd_texture_dump_frame_tick();
     lcf ^= 1;
     /* GPUSTAT.13 (interlace FIELD): on real hardware this alternates per
      * field while GP1(08h) vertical interlace is on, in antiphase with the

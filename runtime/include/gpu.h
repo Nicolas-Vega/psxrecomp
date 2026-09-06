@@ -82,6 +82,52 @@ void gpu_get_crtc_debug(uint32_t *x1, uint32_t *x2, uint32_t *y1, uint32_t *y2,
 uint64_t gpu_get_gp0_count(void);  /* Total GP0 writes since init */
 void gpu_get_gp0_stats(uint64_t* nop, uint64_t* fill, uint64_t* draw, uint64_t* env, uint64_t* copy);
 
+/* HD texture-replacement dump (DuckStation-compatible, Stage 1: hash +
+ * lookup verification only -- see src/textures/hd_texture_dump.h). Loads a
+ * pack rooted at `root_dir` (NULL/empty = disabled). Every CPU->VRAM upload
+ * is hashed and checked against the pack regardless of whether one is
+ * loaded, so the recent-upload ring stays useful for debugging even with no
+ * pack configured (every entry just reports matched=0). */
+void gpu_hd_texture_dump_init(const char* root_dir);
+void gpu_hd_texture_dump_info(uint32_t* entry_count, uint32_t* unique_hash_count);
+/* Live entry count of the palette-bounds cache (see hd_texture_dump.cpp) --
+ * diagnostic only, surfaced via the "hdtex_recent" debug-server command. */
+uint32_t gpu_hd_texture_dump_pal_cache_size(void);
+/* Match-funnel diagnostics -- see hd_texture_dump.h's
+ * hd_texture_dump_get_match_stats for the 8-slot layout. */
+void gpu_hd_texture_dump_match_stats(uint64_t out[8]);
+/* Call once per displayed frame -- see hd_texture_dump.h's
+ * hd_texture_dump_frame_tick for why (debounces the palette-range cache's
+ * recompute against games that rewrite a CLUT bank every single frame). */
+void gpu_hd_texture_dump_frame_tick(void);
+int  gpu_hd_texture_dump_recent_count(void);
+/* index 0 = most recently tracked upload. Returns 0 if index is out of range. */
+int  gpu_hd_texture_dump_recent_get(int index, uint64_t* hash, int* x, int* y,
+                                    int* width_words, int* height, int* matched);
+
+/* Stage 2: draw-time sub-region matching, called from gpu_gl_renderer.c.
+ * depth: 0=4bpp, 1=8bpp, 2=16bpp direct (same convention gpu_gl_renderer.c
+ * already uses for its own `depth` local). u_first/u_last/v_first/v_last are
+ * the inclusive PS1 texel UV bounds for this primitive. Returns 1 and fills
+ * every out-parameter on a match (entry_id is a stable per-entry id, for the
+ * caller's own GL-texture cache; png_path is valid for the process lifetime
+ * of the loaded pack; u0/v0/u1/v1 are normalized [0,1] UVs into that PNG),
+ * 0 otherwise (the common case: no HD replacement for this exact draw). */
+/* tint_r/g/b: per-channel color multiplier the caller should apply when
+ * sampling the replacement PNG -- (1,1,1) for an exact match; a non-identity
+ * value means this came from the shading-approximation fallback (a lighting/
+ * darkening effect recolored the CLUT enough that the exact hash no longer
+ * matches, but a past match for this same entry was remembered -- see
+ * hd_texture_dump.h's header comment on hd_texture_dump_match). May be NULL
+ * if the caller doesn't want to apply tinting. */
+int gpu_hd_texture_dump_match(int page_x, int page_y, int depth,
+                              int u_first, int u_last, int v_first, int v_last,
+                              int clut_x, int clut_y,
+                              uint32_t* entry_id, const char** png_path,
+                              float* u_scale, float* u_offset,
+                              float* v_scale, float* v_offset,
+                              float* tint_r, float* tint_g, float* tint_b);
+
 typedef struct {
     uint32_t left, top, right, bottom;
     int32_t offset_x, offset_y;
