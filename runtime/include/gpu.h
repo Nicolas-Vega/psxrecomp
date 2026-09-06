@@ -363,6 +363,10 @@ int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm);
 int  psx_ws_func_has_screen_cull(const uint32_t *words, int n);
 /* Classify words[idx] as an X left-edge reject bltz (runtime imm sets). */
 int  psx_ws_cull_bltz_at(const uint32_t *words, int n, int idx);
+/* Classify words[idx] as an X left-edge reject `slti v, sx, 0` paired to a
+ * later same-register width compare (idiom 4, ws_cull_detect.h — Vagrant
+ * Story's per-axis-independent split). Runtime imm sets. */
+int  psx_ws_cull_slti_zero_at(const uint32_t *words, int n, int idx);
 /* Per-game cull signature immediates ([widescreen.cull] screen_w_imms /
  * screen_h_imms); defaults 0x140/0x141 + 0xE0/0xF1. */
 void gpu_ws_set_cull_imms(const uint32_t *w, int nw, const uint32_t *h, int nh);

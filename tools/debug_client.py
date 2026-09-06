@@ -21,6 +21,8 @@ Commands (shared — identical on both servers):
     write <addr> <hex>          Write RAM bytes
     scratch <addr> [len]        Read scratchpad bytes
     gpu                         GPU display state
+    geom / geom_correction      PGXP/geometry-correction census (read-only)
+    pgxp <key> <val> [...]      Live toggle PGXP (geometry|texture|cpu_mode|tolerance)
     overlay                     Overlay state
     watch <addr>                Set byte watchpoint
     unwatch <addr>              Remove watchpoint
@@ -225,6 +227,35 @@ def build_cmd(args):
         # enhancements actually engaging on this title? Free-running totals;
         # sample twice and diff for a per-window rate.
         return {"cmd": "geom_correction"}, pretty_json
+    elif cmd in ("save_state", "savestate_save"):
+        if len(args) < 2:
+            return None, lambda _: "Usage: save_state <slot>"
+        return {"cmd": "savestate", "op": "save", "slot": int(args[1])}, pretty_json
+    elif cmd in ("load_state", "savestate_load"):
+        if len(args) < 2:
+            return None, lambda _: "Usage: load_state <slot>"
+        return {"cmd": "savestate", "op": "load", "slot": int(args[1])}, pretty_json
+    elif cmd == "ws_cull_diag":
+        # Is [widescreen.cull] auto_screen_x's instruction-pattern detector
+        # even seeing this title's screen-reject checks? seen vs qualified
+        # per instruction class (slti/sltiu/bltz). Free-running; sample twice
+        # and diff for a per-window rate.
+        return {"cmd": "ws_cull_diag"}, pretty_json
+    elif cmd == "pgxp":
+        # Live one-toggle-at-a-time A/B for the PGXP value-propagation engine
+        # (no rebuild needed): pgxp geometry 0|1, pgxp texture 0|1,
+        # pgxp cpu_mode 0|1, pgxp tolerance <pixels>. Any subset of these may
+        # be given; the reply echoes the resulting live state.
+        d = {"cmd": "pgxp"}
+        it = iter(args[1:])
+        for key in it:
+            val = next(it, None)
+            if val is None:
+                return None, lambda _: (
+                    "Usage: pgxp <geometry|texture|cpu_mode|tolerance> <value> "
+                    "[<key> <value> ...]")
+            d[key] = val
+        return d, pretty_json
     elif cmd == "overlay":
         return {"cmd": "overlay_state"}, pretty_json
     elif cmd == "watch":

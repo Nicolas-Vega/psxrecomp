@@ -5245,6 +5245,41 @@ static void handle_geom_correction(int id, const char *json)
              (unsigned long long)ps.swc2_stores);
 }
 
+/* ws_cull_diag — is the interpreted-overlay [widescreen.cull] auto_screen_x
+ * detector (dirty_ram_interp.c) even seeing this title's screen-reject
+ * instructions? "seen" counts an SLTI/SLTIU/BLTZ executed while auto_screen_x
+ * is on; "qualified" counts how many of those had their enclosing +/-512-byte
+ * window actually pair a configured width immediate with a height immediate
+ * (ws_cull_detect.h) and so got widened. seen==0 for a given class means this
+ * title's overlay never executes that instruction shape at all; seen>0 with
+ * qualified==0 means the shape is close but isn't pairing with the other axis
+ * (or the configured screen_w_imms/screen_h_imms don't match this title's
+ * actual immediates) — diagnostic for a title whose pop-in survives
+ * auto_screen_x=true (see docs/ENHANCEMENTS.md widescreen investigation). */
+static void handle_ws_cull_diag(int id, const char *json)
+{
+    (void)json;
+    uint64_t d[8];
+    uint32_t pcs[8];
+    dirty_ram_ws_cull_diag_get(d);
+    dirty_ram_ws_cull_diag_get_pcs(pcs);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"slti_seen\":%llu,\"slti_qualified\":%llu,"
+             "\"sltiu_seen\":%llu,\"sltiu_qualified\":%llu,"
+             "\"bltz_seen\":%llu,\"bltz_qualified\":%llu,"
+             "\"slti_zero_seen\":%llu,\"slti_zero_qualified\":%llu,"
+             "\"last_pc\":{\"slti_seen\":\"0x%08X\",\"slti_qualified\":\"0x%08X\","
+             "\"sltiu_seen\":\"0x%08X\",\"sltiu_qualified\":\"0x%08X\","
+             "\"bltz_seen\":\"0x%08X\",\"bltz_qualified\":\"0x%08X\","
+             "\"slti_zero_seen\":\"0x%08X\",\"slti_zero_qualified\":\"0x%08X\"}}",
+             id,
+             (unsigned long long)d[0], (unsigned long long)d[1],
+             (unsigned long long)d[2], (unsigned long long)d[3],
+             (unsigned long long)d[4], (unsigned long long)d[5],
+             (unsigned long long)d[6], (unsigned long long)d[7],
+             pcs[0], pcs[1], pcs[2], pcs[3], pcs[4], pcs[5], pcs[6], pcs[7]);
+}
+
 /* pgxp — live-tune the value-propagation engine for one-toggle isolation runs
  * without a rebuild: {"cmd":"pgxp","cpu_mode":0|1,"tolerance":F}. Fields are
  * optional; the reply echoes the resulting state (same shape as
@@ -13651,6 +13686,7 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "hdtex_recent",      handle_hdtex_recent },
     { "geom_correction",   handle_geom_correction },
+    { "ws_cull_diag",      handle_ws_cull_diag },
     { "pgxp",              handle_pgxp },
     { "ws_aspect_cone_site", handle_ws_aspect_cone_site },
     { "ws_margin",         handle_ws_margin },

@@ -57,6 +57,29 @@ void dirty_ram_ld_delay_discard(void);
  * otherwise entered the post-FMV dirty wait on opposite poll phases. */
 void dirty_ram_irq_ambient_resync_after_restore(void);
 
+/* Diagnostic counters for the interpreted-overlay [widescreen.cull]
+ * auto_screen_x detector (ws_cull_site/ws_cull_bltz_site/ws_cull_slti_zero_site
+ * in dirty_ram_interp.c): how often an SLTI/SLTIU/BLTZ with a configured W/H
+ * immediate was executed at all ("seen") vs. how often its enclosing +/-512
+ * byte window actually carried the paired width+height signature and so was
+ * widened ("qualified"). A title whose overlay never trips "seen" at all
+ * isn't using this instruction idiom for its screen reject; "seen" without
+ * "qualified" means the idiom is close but the window scan isn't pairing it
+ * with the other axis. slti_zero is idiom 4 (a bare `slti v,x,0` paired to a
+ * later same-register width compare — Vagrant Story's split lower/upper-bound
+ * shape), tracked separately since its own immediate is always 0. out[] =
+ * {slti_seen, slti_qualified, sltiu_seen, sltiu_qualified, bltz_seen,
+ * bltz_qualified, slti_zero_seen, slti_zero_qualified}. */
+void dirty_ram_ws_cull_diag_get(uint64_t out[8]);
+
+/* Last PC seen in each ws_cull_diag category (see above), for pulling up the
+ * actual instruction window with `dump`/`read` once a category's ratio looks
+ * suspicious. out[] = {last_slti_seen_pc, last_slti_qualified_pc,
+ * last_sltiu_seen_pc, last_sltiu_qualified_pc, last_bltz_seen_pc,
+ * last_bltz_qualified_pc, last_slti_zero_seen_pc, last_slti_zero_qualified_pc},
+ * each 0 if that category has never fired. */
+void dirty_ram_ws_cull_diag_get_pcs(uint32_t out[8]);
+
 /* Overlay-cache windows — the address ranges eligible for capture, offline
  * recompilation, and per-entry-validated native execution (Rule 18 code that
  * does not exist in any compile-time image):

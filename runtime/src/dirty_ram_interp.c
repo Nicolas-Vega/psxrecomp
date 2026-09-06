@@ -536,6 +536,38 @@ static inline uint32_t fetch_word(uint32_t phys) {
 extern uint32_t g_dirty_ram_code_gen;
 #define WS_SITE_CACHE_SLOTS 8192u             /* 32 KB of code coverage per cache */
 
+/* Diagnostic-only: see dirty_ram_ws_cull_diag_get in dirty_ram_interp.h. */
+static uint64_t ws_cull_diag_slti_seen, ws_cull_diag_slti_qualified;
+static uint64_t ws_cull_diag_sltiu_seen, ws_cull_diag_sltiu_qualified;
+static uint64_t ws_cull_diag_bltz_seen, ws_cull_diag_bltz_qualified;
+static uint64_t ws_cull_diag_slti_zero_seen, ws_cull_diag_slti_zero_qualified;
+static uint32_t ws_cull_diag_pc_slti_seen, ws_cull_diag_pc_slti_qualified;
+static uint32_t ws_cull_diag_pc_sltiu_seen, ws_cull_diag_pc_sltiu_qualified;
+static uint32_t ws_cull_diag_pc_bltz_seen, ws_cull_diag_pc_bltz_qualified;
+static uint32_t ws_cull_diag_pc_slti_zero_seen, ws_cull_diag_pc_slti_zero_qualified;
+
+void dirty_ram_ws_cull_diag_get(uint64_t out[8]) {
+    out[0] = ws_cull_diag_slti_seen;
+    out[1] = ws_cull_diag_slti_qualified;
+    out[2] = ws_cull_diag_sltiu_seen;
+    out[3] = ws_cull_diag_sltiu_qualified;
+    out[4] = ws_cull_diag_bltz_seen;
+    out[5] = ws_cull_diag_bltz_qualified;
+    out[6] = ws_cull_diag_slti_zero_seen;
+    out[7] = ws_cull_diag_slti_zero_qualified;
+}
+
+void dirty_ram_ws_cull_diag_get_pcs(uint32_t out[8]) {
+    out[0] = ws_cull_diag_pc_slti_seen;
+    out[1] = ws_cull_diag_pc_slti_qualified;
+    out[2] = ws_cull_diag_pc_sltiu_seen;
+    out[3] = ws_cull_diag_pc_sltiu_qualified;
+    out[4] = ws_cull_diag_pc_bltz_seen;
+    out[5] = ws_cull_diag_pc_bltz_qualified;
+    out[6] = ws_cull_diag_pc_slti_zero_seen;
+    out[7] = ws_cull_diag_pc_slti_zero_qualified;
+}
+
 static int ws_cull_site(uint32_t pc) {
     enum { WIN = 128 };                       /* +/- 128 words = +/- 512 bytes */
     static struct { uint32_t pc; uint32_t gen; uint32_t word; int8_t flag; } cache[WS_SITE_CACHE_SLOTS];
@@ -585,6 +617,37 @@ static int ws_cull_bltz_site(uint32_t pc) {
     int idx = (int)((phys - lo) / 4u);
     int flag = psx_ws_func_has_screen_cull(words, n) &&
                psx_ws_cull_bltz_at(words, n, idx);
+    cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
+    cache[slot].word = fetch_word(phys); cache[slot].flag = (int8_t)flag;
+    return flag;
+}
+
+/* Widescreen X LOWER-EDGE `slti v, sx, 0` classification (auto_screen_x, idiom
+ * 4 — ws_cull_detect.h): the per-axis-independent split some titles (Vagrant
+ * Story) use instead of the min/max+bltz shapes idioms 2/3 assume. Same
+ * ±512-byte window qualification + per-PC cache discipline as ws_cull_site /
+ * ws_cull_bltz_site above; additionally classifies THIS slti structurally
+ * (zero immediate whose register is tested against a width immediate later in
+ * the window), so an unrelated `slti v, x, 0` sign test in a qualifying
+ * window stays vanilla. */
+static int ws_cull_slti_zero_site(uint32_t pc) {
+    enum { WIN = 128 };                       /* +/- 128 words = +/- 512 bytes */
+    static struct { uint32_t pc; uint32_t gen; uint32_t word; int8_t flag; } cache[WS_SITE_CACHE_SLOTS];
+    uint32_t slot = (pc >> 2) & (WS_SITE_CACHE_SLOTS - 1u);
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen &&
+        cache[slot].word == fetch_word(phys))
+        return cache[slot].flag;
+    uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+    uint32_t hi = phys + (uint32_t)(WIN * 4);
+    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    static uint32_t words[2 * WIN + 1];
+    int n = 0;
+    for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
+        words[n++] = fetch_word(a);
+    int idx = (int)((phys - lo) / 4u);
+    int flag = psx_ws_func_has_screen_cull(words, n) &&
+               psx_ws_cull_slti_zero_at(words, n, idx);
     cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
     cache[slot].word = fetch_word(phys); cache[slot].flag = (int8_t)flag;
     return flag;
@@ -1946,10 +2009,17 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             /* Widescreen render-funnel LEFT-edge widen (auto_screen_x): a
              * classified funnel bltz rejects only past the revealed margin.
              * Identity at 4:3 (margin 0). Gated per-game, cheap cached scan. */
-            if (psx_ws_auto_cull_on() && ws_cull_bltz_site(pc))
-                taken = psx_ws_cull_bltz(cpu->gpr[rs]);
-            else
-                taken = ((int32_t)cpu->gpr[rs] <  0);
+            if (psx_ws_auto_cull_on()) {
+                ws_cull_diag_bltz_seen++;
+                ws_cull_diag_pc_bltz_seen = pc;
+                if (ws_cull_bltz_site(pc)) {
+                    ws_cull_diag_bltz_qualified++;
+                    ws_cull_diag_pc_bltz_qualified = pc;
+                    taken = psx_ws_cull_bltz(cpu->gpr[rs]);
+                    break;
+                }
+            }
+            taken = ((int32_t)cpu->gpr[rs] <  0);
             break;
         case 0x01: /* BGEZ */    taken = ((int32_t)cpu->gpr[rs] >= 0); break;
         case 0x10: /* BLTZAL */  taken = ((int32_t)cpu->gpr[rs] <  0);
@@ -2007,11 +2077,42 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         else if (psx_ws_is_cull_slti_lower_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti_lower(
                 cpu->gpr[rs], imm);
-        else if (psx_ws_is_cull_slti_site(pc) ||
-            (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
-            cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
-        else
-            cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
+        else {
+            /* Auto-detected X lower-edge companion (idiom 4, ws_cull_detect.h):
+             * some titles (Vagrant Story) split the on-screen test into two
+             * independent SLTI compares per axis instead of the min/max+bltz
+             * shapes idioms 2/3 assume -- `slti v, sx, 0` paired to a later
+             * same-register width compare. Checked before the general auto W-
+             * imm path below since its own immediate is 0, never a W/H imm. */
+            int zero_qualifies = 0;
+            if (imm == 0 && psx_ws_auto_cull_on()) {
+                ws_cull_diag_slti_zero_seen++;
+                ws_cull_diag_pc_slti_zero_seen = pc;
+                if (ws_cull_slti_zero_site(pc)) {
+                    ws_cull_diag_slti_zero_qualified++;
+                    ws_cull_diag_pc_slti_zero_qualified = pc;
+                    zero_qualifies = 1;
+                }
+            }
+            if (zero_qualifies) {
+                cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti_lower(cpu->gpr[rs], imm);
+            } else {
+                int auto_qualifies = 0;
+                if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm)) {
+                    ws_cull_diag_slti_seen++;
+                    ws_cull_diag_pc_slti_seen = pc;
+                    if (ws_cull_site(pc)) {
+                        ws_cull_diag_slti_qualified++;
+                        ws_cull_diag_pc_slti_qualified = pc;
+                        auto_qualifies = 1;
+                    }
+                }
+                if (psx_ws_is_cull_slti_site(pc) || auto_qualifies)
+                    cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
+                else
+                    cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
+            }
+        }
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2037,10 +2138,22 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                             ((uint32_t)simm + 2u *
                              (uint32_t)psx_ws_activation_margin())) ? 1u : 0u;
         }
-        else if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
-            cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
-        else
-            cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
+        else {
+            int auto_qualifies = 0;
+            if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm)) {
+                ws_cull_diag_sltiu_seen++;
+                ws_cull_diag_pc_sltiu_seen = pc;
+                if (ws_cull_site(pc)) {
+                    ws_cull_diag_sltiu_qualified++;
+                    ws_cull_diag_pc_sltiu_qualified = pc;
+                    auto_qualifies = 1;
+                }
+            }
+            if (auto_qualifies)
+                cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
+            else
+                cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
+        }
         cpu->gpr[0] = 0;
         return 0;
     }

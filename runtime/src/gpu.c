@@ -1628,6 +1628,14 @@ int psx_ws_cull_bltz_at(const uint32_t *words, int n, int idx) {
     return psx_ws_cull_bltz_here(words, n, idx, ws_cull_w_imms, ws_cull_w_n);
 }
 
+/* Classify words[idx] as an X left-edge reject `slti v, sx, 0` whose SAME
+ * register is tested against a configured width immediate later in the
+ * window (idiom 4, ws_cull_detect.h — the per-axis-independent split some
+ * titles use instead of idioms 1-3). Caller qualifies the window first. */
+int psx_ws_cull_slti_zero_at(const uint32_t *words, int n, int idx) {
+    return psx_ws_cull_slti_zero_here(words, n, idx, ws_cull_w_imms, ws_cull_w_n);
+}
+
 /* Widescreen backdrop screen-X correction ([widescreen.backdrop] x_sites).
  * The parallax 2D backdrop layer (ocean/cloud/mountain/grass — overlay actor
  * handlers e.g. 0x801216BC) computes its screen-X in pure integer math

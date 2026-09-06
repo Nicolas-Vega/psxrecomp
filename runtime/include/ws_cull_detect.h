@@ -117,4 +117,37 @@ static inline int psx_ws_cull_bltz_here(const uint32_t *words, int n, int idx,
     return 0;
 }
 
+/* Classify words[idx] as an X LOWER-EDGE ("< 0") companion of a LATER W-bound
+ * compare on the SAME register within the window (idiom 4, found on Vagrant
+ * Story): rather than the min/max-plus-bltz shapes idioms 2/3 assume, this
+ * title splits the on-screen test into two independent per-axis SLTI compares
+ * per vertex slot -- `slti v, sx, 0` (is this coordinate negative) followed
+ * later by `slti v, sx, W` (is it past the right edge), same source register,
+ * same vertex slot, reused for the Y axis with an H compare right before it in
+ * the exact same shape (`slti v, sy, 0` before `slti v, sy, H`). Recognising
+ * the bare zero-immediate compare on its own would be far too broad -- it is
+ * an extremely common idiom for unrelated sign tests -- so the discriminator
+ * is pairing it to a LATER width-bound compare on the IDENTICAL register
+ * within the qualifying window. A title whose zero-compare register instead
+ * reappears against an H immediate is the Y companion and must NOT widen
+ * (native-wide only widens horizontally); this function only ever matches the
+ * W-paired (X) case. */
+static inline int psx_ws_cull_slti_zero_here(const uint32_t *words, int n, int idx,
+                                           const uint32_t *w_imms, int nw) {
+    if (idx < 0 || idx >= n) return 0;
+    uint32_t w = words[idx];
+    if ((w >> 26) != 0x0Au) return 0;      /* slti only (signed compare) */
+    if ((w & 0xFFFFu) != 0u) return 0;     /* zero immediate only */
+    uint32_t rs = (w >> 21) & 0x1Fu;
+    if (rs == 0u) return 0;                /* $zero can't hold a coordinate */
+    for (int j = idx + 1; j < n && j <= idx + 48; j++) {
+        uint32_t s = words[j];
+        if ((s >> 26) != 0x0Au) continue;
+        if (((s >> 21) & 0x1Fu) != rs) continue;
+        if (psx_ws_cull_imm_in(s & 0xFFFFu, w_imms, nw)) return 1;
+        break; /* first later slti on this register decides it; don't skip past it */
+    }
+    return 0;
+}
+
 #endif /* PSX_WS_CULL_DETECT_H */
