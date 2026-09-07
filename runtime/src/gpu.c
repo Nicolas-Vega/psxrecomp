@@ -54,6 +54,8 @@ extern uint64_t hd_texture_dump_track_upload(HdTextureDump* dump, uint16_t x, ui
                                              const uint16_t* words, size_t word_count);
 extern size_t hd_texture_dump_entry_count(const HdTextureDump* dump);
 extern size_t hd_texture_dump_unique_src_hash_count(const HdTextureDump* dump);
+extern int hd_texture_dump_get_entry(const HdTextureDump* dump, size_t index,
+                                     uint32_t* out_entry_id, const char** out_png_path);
 extern int hd_texture_dump_recent_count(const HdTextureDump* dump);
 extern int hd_texture_dump_get_recent_entry(const HdTextureDump* dump, int index,
                                             uint64_t* hash, uint16_t* x, uint16_t* y,
@@ -82,7 +84,18 @@ extern size_t hd_texture_dump_pal_cache_size(const HdTextureDump* dump);
 extern void hd_texture_dump_get_match_stats(const HdTextureDump* dump, uint64_t out[8]);
 extern void hd_texture_dump_frame_tick(HdTextureDump* dump);
 
+/* Second HD-replacement backend: Beetle PSX HW's own pack format
+ * (hd_texture_pack.h). Framework-owned (unlike hd_texture_dump above), so
+ * it's a real #include rather than a forward-declared extern block. */
+#include "hd_texture_pack.h"
+
 static HdTextureDump* g_hd_texture_dump = NULL;
+static HdTexturePack* g_hd_texture_pack = NULL;
+/* 0 = hd_texture_dump (DuckStation format, default), 1 = hd_texture_pack
+ * (Beetle format), 2 = none (original PS1 textures, no HD replacement at
+ * all -- a safety net when a pack has a bad/mislabeled entry). See gpu.h's
+ * gpu_hd_texture_set_backend. */
+static int g_hd_texture_backend = 0;
 
 void gpu_hd_texture_dump_init(const char* root_dir) {
     if (g_hd_texture_dump || !root_dir || !root_dir[0]) return;
@@ -161,8 +174,211 @@ int gpu_hd_texture_dump_match(int page_x, int page_y, int depth,
     return 1;
 }
 
+void gpu_hd_texture_pack_init(const char* root_dir) {
+    if (g_hd_texture_pack || !root_dir || !root_dir[0]) return;
+    char error[256];
+    error[0] = '\0';
+    if (!hd_texture_pack_create(root_dir, &g_hd_texture_pack, error, sizeof(error))) {
+        fprintf(stderr, "psxrecomp: hd_texture_pack_create(\"%s\") failed: %s\n",
+                root_dir, error[0] ? error : "unknown error");
+        g_hd_texture_pack = NULL;
+        return;
+    }
+    HdTexturePackInfo info;
+    hd_texture_pack_get_info(g_hd_texture_pack, &info);
+    fprintf(stdout,
+        "psxrecomp: HD texture pack (Beetle format) loaded from \"%s\" (%zu replacement "
+        "file(s), %zu unique key(s), %zu ambiguous)\n",
+        root_dir, info.replacement_file_count, info.unique_key_count, info.ambiguous_key_count);
+}
+
+void gpu_hd_texture_pack_info(uint32_t* entry_count, uint32_t* unique_key_count,
+                              uint32_t* ambiguous_key_count) {
+    HdTexturePackInfo info = {0};
+    if (g_hd_texture_pack) hd_texture_pack_get_info(g_hd_texture_pack, &info);
+    if (entry_count) *entry_count = (uint32_t)info.replacement_file_count;
+    if (unique_key_count) *unique_key_count = (uint32_t)info.unique_key_count;
+    if (ambiguous_key_count) *ambiguous_key_count = (uint32_t)info.ambiguous_key_count;
+}
+
+int gpu_hd_texture_pack_dump_uploads(char* out, size_t out_capacity) {
+    return hd_texture_pack_diag_dump_uploads(g_hd_texture_pack, out, out_capacity);
+}
+
+int gpu_hd_texture_pack_dump_match_ring(char* out, size_t out_capacity) {
+    return hd_texture_pack_diag_dump_ring(out, out_capacity);
+}
+
+/* Boot-time / backend-switch preload enumeration (see gpu_gl_renderer.c's
+ * gpu_hd_texture_preload_active): both wrap the same signature (index in,
+ * entry_id + png_path out) so that function can preload whichever backend
+ * is active without branching on the underlying pack type beyond picking
+ * which count/entry pair to call. */
+uint32_t gpu_hd_texture_dump_preload_count(void) {
+    return (uint32_t)hd_texture_dump_entry_count(g_hd_texture_dump);
+}
+int gpu_hd_texture_dump_preload_entry(uint32_t index, uint32_t* out_entry_id,
+                                      const char** out_png_path) {
+    return hd_texture_dump_get_entry(g_hd_texture_dump, index, out_entry_id, out_png_path);
+}
+uint32_t gpu_hd_texture_pack_preload_count(void) {
+    return (uint32_t)hd_texture_pack_entry_count(g_hd_texture_pack);
+}
+int gpu_hd_texture_pack_preload_entry(uint32_t index, uint32_t* out_cache_key,
+                                      const char** out_png_path) {
+    HdTexturePackEntry entry;
+    if (!hd_texture_pack_get_entry(g_hd_texture_pack, index, &entry)) return 0;
+    /* Same cache_key formula as gpu_hd_texture_pack_match's FOUND branch --
+     * must match exactly, or the preload warms a different cache slot than
+     * the one the live match path will look up. */
+    if (out_cache_key)
+        *out_cache_key = 0x80000000u |
+                         (entry.texture_hash ^ (entry.palette_hash * 2654435761u));
+    if (out_png_path) *out_png_path = entry.replacement_path;
+    return 1;
+}
+
+/* Hot-reload support: given a small set of replacement PNG paths that just
+ * changed on disk (e.g. generate_font_pack.py regenerated the font),
+ * evict them from the render backend's GL texture cache so the next draw
+ * that references each one re-decodes and re-uploads from scratch, instead
+ * of requiring a relaunch. See gl_renderer_hd_tex_reload for the actual
+ * eviction (GL-context-thread-only -- caller must be on that thread; the
+ * in-game font picker menu already is, same as every other menu overlay). */
+extern int gl_renderer_hd_tex_reload(const uint32_t *entry_ids, const char *const *png_paths, int count);
+
+int gpu_hd_texture_pack_reload_paths(const char *const *paths, int count) {
+    if (!g_hd_texture_pack || count <= 0) return 0;
+    uint32_t entry_ids[8];
+    const char *matched_paths[8];
+    int matched = 0;
+    const size_t total = hd_texture_pack_entry_count(g_hd_texture_pack);
+    for (size_t i = 0; i < total && matched < 8; i++) {
+        HdTexturePackEntry entry;
+        if (!hd_texture_pack_get_entry(g_hd_texture_pack, i, &entry)) continue;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(entry.replacement_path, paths[j]) != 0) continue;
+            entry_ids[matched] = 0x80000000u |
+                                 (entry.texture_hash ^ (entry.palette_hash * 2654435761u));
+            matched_paths[matched] = entry.replacement_path;
+            matched++;
+            break;
+        }
+    }
+    return gl_renderer_hd_tex_reload(entry_ids, matched_paths, matched);
+}
+
+void gpu_hd_texture_set_backend(int backend) {
+    g_hd_texture_backend = (backend == 1 || backend == 2) ? backend : 0;
+}
+int  gpu_hd_texture_get_backend(void) { return g_hd_texture_backend; }
+
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
+
+/* Diagnostic-only counters (see gpu_hd_texture_pack_match_stats): whether
+ * this backend's matcher is even being asked (attempts), and where a draw
+ * that could have been HD-replaced actually falls through -- mirrors
+ * hd_texture_dump's own match_stats, added here after the Beetle backend
+ * shipped with none at all and a live A/B ("switching backends visibly does
+ * nothing") had no way to tell "never matches" from "matches identically". */
+static uint64_t g_hd_pack_attempts = 0;
+static uint64_t g_hd_pack_none = 0;       /* HD_TEXTURE_LOOKUP_NONE: no residency/pack-key hit */
+static uint64_t g_hd_pack_ambiguous = 0;  /* HD_TEXTURE_LOOKUP_AMBIGUOUS */
+static uint64_t g_hd_pack_error = 0;      /* HD_TEXTURE_LOOKUP_ERROR (reserved texpage depth, etc.) */
+static uint64_t g_hd_pack_matched = 0;
+
+static uint64_t g_hd_pack_track_calls = 0;
+static uint64_t g_hd_pack_track_ok = 0;
+
+void gpu_hd_texture_pack_match_stats(uint64_t out[5]) {
+    out[0] = g_hd_pack_attempts;
+    out[1] = g_hd_pack_none;
+    out[2] = g_hd_pack_ambiguous;
+    out[3] = g_hd_pack_error;
+    out[4] = g_hd_pack_matched;
+}
+
+void gpu_hd_texture_pack_track_stats(uint64_t out[2]) {
+    out[0] = g_hd_pack_track_calls;
+    out[1] = g_hd_pack_track_ok;
+}
+
+int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
+                              int u_first, int u_last, int v_first, int v_last,
+                              uint32_t* cache_key, const char** png_path,
+                              float* u_scale, float* u_offset,
+                              float* v_scale, float* v_offset) {
+    if (!g_hd_texture_pack) return 0;
+    ++g_hd_pack_attempts;
+    HdTextureMatch m;
+    int status = hd_texture_pack_match_draw(
+        g_hd_texture_pack, (uint16_t)texpage, (uint16_t)clut_x, (uint16_t)clut_y,
+        (uint8_t)u_first, (uint8_t)u_last, (uint8_t)v_first, (uint8_t)v_last,
+        vram, sizeof(vram) / sizeof(vram[0]), &m);
+    if (status != HD_TEXTURE_LOOKUP_FOUND) {
+        if (status == HD_TEXTURE_LOOKUP_AMBIGUOUS) ++g_hd_pack_ambiguous;
+        else if (status == HD_TEXTURE_LOOKUP_ERROR) ++g_hd_pack_error;
+        else ++g_hd_pack_none;
+        return 0;
+    }
+
+    /* Same depth decode gpu_gl_renderer.c's own `depth` local uses (texpage
+     * bits 7-8); needed here to convert the match's upload dimensions from
+     * VRAM words to texels for the UV remap below. */
+    const int depth_bits = (texpage >> 7) & 3;
+    const unsigned ppw = depth_bits == 0 ? 4u : depth_bits == 1 ? 2u : 1u;
+    const unsigned upload_w_texels = (unsigned)m.upload_width_words * ppw;
+    const unsigned upload_h = m.upload_height;
+    if (upload_w_texels == 0 || upload_h == 0) { ++g_hd_pack_error; return 0; }
+
+    /* hd_gl_get_texture's cache (gpu_gl_renderer.c) keys purely by this
+     * integer -- it does NOT also compare png_path -- so this value must
+     * never collide with a DuckStation entry_id (a small dense index,
+     * 0..hd_texture_dump_entry_count()-1). Reserving the top bit makes that
+     * structurally impossible rather than merely astronomically unlikely. */
+    if (cache_key)
+        *cache_key = 0x80000000u |
+                     (m.entry.texture_hash ^ (m.entry.palette_hash * 2654435761u));
+    if (png_path) *png_path = m.entry.replacement_path;
+    if (u_scale) *u_scale = 1.0f / (float)upload_w_texels;
+    if (v_scale) *v_scale = 1.0f / (float)upload_h;
+    /* m.source_word_x/source_y are the ABSOLUTE upload-relative position of
+     * THIS draw's own (u_first, v_first) corner (hd_texture_pack.h: "first
+     * queried word within the original upload") -- not a page-vs-upload
+     * alignment constant independent of u_first/v_first the way
+     * DuckStation's page_dx_texels/page_dy are. Using it directly as the
+     * additive offset double-counts u_first/v_first for any primitive with a
+     * nonzero one (added once here, again by the per-vertex u_texel/v_texel
+     * the shader interpolates from u_first..u_last) -- sampling the wrong
+     * part of the replacement PNG for every primitive except one starting
+     * exactly at its page origin (the "textures look mixed up" symptom this
+     * fixes). Subtracting back out u_first/v_first recovers the page-origin-
+     * relative-to-upload constant DuckStation's formula expects.
+     *
+     * u_first must come back out in WORD units, matching the truncating
+     * `query->u_first / pixels_per_word` hd_texture_pack.cpp itself used to
+     * fold u_first into source_word_x (hd_texture_pack.cpp's
+     * hd_texture_pack_match: `first_x = page_x + u_first / pixels_per_word`,
+     * C integer division). Subtracting the full-precision u_first AFTER
+     * scaling source_word_x back to texels (as an earlier revision of this
+     * fix did) does not undo that truncation -- it leaves a residual
+     * (u_first mod pixels_per_word) error, up to 3 texels at 4bpp -- small
+     * enough to go unnoticed on large textures but a visible sub-block
+     * misalignment on fine detail (confirmed live: text-box graphics showing
+     * a sliver of a neighboring image in the same upload). Redoing the exact
+     * same truncating division here before subtracting, THEN scaling to
+     * texels, cancels it exactly instead. v needs no such correction: PS1
+     * never packs multiple texel rows per VRAM row, so v_first was folded
+     * into source_y with no division (and no truncation) to begin with. */
+    if (u_offset)
+        *u_offset = (float)(((unsigned)m.source_word_x - (unsigned)u_first / ppw) * ppw) /
+                    (float)upload_w_texels;
+    if (v_offset)
+        *v_offset = ((float)m.source_y - (float)v_first) / (float)upload_h;
+    ++g_hd_pack_matched;
+    return 1;
+}
 
 /* ---- GP0 state machine ---- */
 
@@ -2472,11 +2688,66 @@ static void gp0_commit_cpu_to_vram(void) {
         if (g_hd_texture_dump)
             hd_texture_dump_note_upload(g_hd_texture_dump, vram_write_x, vram_write_y,
                                         vram_write_w, vram_write_h, hd_hash);
+        /* Second backend's own tracker, fed unconditionally like the one
+         * above (see gpu_hd_texture_set_backend) so flipping backends live
+         * re-matches immediately instead of needing a reload. Invalidation
+         * of intersected older residency happens inside track_upload itself
+         * (unlike hd_texture_dump's separate track/note split above). */
+        if (g_hd_texture_pack) {
+            uint32_t unused_hash = 0;
+            ++g_hd_pack_track_calls;
+            if (hd_texture_pack_track_upload(g_hd_texture_pack, vram_write_x, vram_write_y,
+                                            vram_write_w, vram_write_h, vram_write_pixels,
+                                            (size_t)vram_write_w * vram_write_h, &unused_hash))
+                ++g_hd_pack_track_ok;
+        }
     }
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
     text_xlate_vram_upload(vram_write_x, vram_write_y,
                            vram_write_w, vram_write_h);
+}
+
+/* VRAM->VRAM copies (GP0 0x80-0x9F) composite UI/font content directly inside
+ * VRAM without a CPU round-trip, so gp0_commit_cpu_to_vram never sees them.
+ * Without this, both HD-texture trackers keep matching whatever upload used
+ * to occupy the destination words, which surfaces as a stale, wrong texture
+ * bleeding through at the copy's destination (e.g. dialogue text boxes that
+ * reuse a shared VRAM region for compositing). Read the source into the
+ * scratch buffer before writing the destination so overlapping src/dst
+ * copies resolve the same way the GPU-side copy_rect does. */
+static void gpu_hd_note_vram_copy(int sx, int sy, int dx, int dy, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    for (int row = 0; row < h; row++)
+        for (int col = 0; col < w; col++)
+            vram_write_pixels[row * w + col] =
+                vram[((sy + row) & 511) * 1024 + ((sx + col) & 1023)];
+    for (int row = 0; row < h; row++)
+        for (int col = 0; col < w; col++)
+            vram[((dy + row) & 511) * 1024 + ((dx + col) & 1023)] =
+                vram_write_pixels[row * w + col];
+
+    /* Large VRAM->VRAM copies are screen-wide fade/wipe/scroll effects, not
+     * texture compositing. Tracking them as HD-pack uploads is meaningless
+     * (they aren't texture data) and, at the frequency these effects run,
+     * expensive: invalidation walks every tracked upload the cut rect
+     * touches. Skip the tracker for anything bigger than a generous texture
+     * atlas; the vram[] mirror above still gets updated regardless. */
+    if ((uint32_t)w * (uint32_t)h > 256u * 256u) return;
+
+    const uint16_t ux = (uint16_t)dx, uy = (uint16_t)dy;
+    const uint16_t uw = (uint16_t)w,  uh = (uint16_t)h;
+    const uint64_t hd_hash = hd_texture_dump_track_upload(
+        g_hd_texture_dump, ux, uy, uw, uh, vram_write_pixels, (size_t)w * h);
+    if (g_hd_texture_dump)
+        hd_texture_dump_note_upload(g_hd_texture_dump, ux, uy, uw, uh, hd_hash);
+    if (g_hd_texture_pack) {
+        uint32_t unused_hash = 0;
+        ++g_hd_pack_track_calls;
+        if (hd_texture_pack_track_upload(g_hd_texture_pack, ux, uy, uw, uh,
+                                         vram_write_pixels, (size_t)w * h, &unused_hash))
+            ++g_hd_pack_track_ok;
+    }
 }
 
 /* VRAM read transfer state (VRAM→CPU, command 0xC0) */
@@ -5469,6 +5740,7 @@ static void gp0_execute_command(void) {
             if (w == 0) w = 0x400;
             if (h == 0) h = 0x200;
             gr_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+            gpu_hd_note_vram_copy(src_x, src_y, dst_x, dst_y, w, h);
             break;
         }
 

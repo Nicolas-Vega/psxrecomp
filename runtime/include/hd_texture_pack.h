@@ -80,6 +80,16 @@ void hd_texture_pack_destroy(HdTexturePack* pack);
 void hd_texture_pack_get_info(const HdTexturePack* pack,
                               HdTexturePackInfo* out_info);
 
+/* Indexed access over every loaded entry (0..hd_texture_pack_entry_count-1,
+ * arbitrary but stable within a pack's lifetime), for a boot-time preload
+ * pass that decodes/uploads every replacement PNG up front instead of the
+ * first time gameplay actually draws it -- see gpu_gl_renderer.c's
+ * gpu_hd_texture_preload_active. Returns 0 for an out-of-range index or a
+ * null pack. */
+size_t hd_texture_pack_entry_count(const HdTexturePack* pack);
+int hd_texture_pack_get_entry(const HdTexturePack* pack, size_t index,
+                              HdTexturePackEntry* out_entry);
+
 /* Key-only lookup. Ambiguous numeric aliases (for example 1-2.png and
  * 00000001-2.png) deliberately return AMBIGUOUS instead of selecting by
  * directory enumeration order. */
@@ -142,6 +152,50 @@ size_t hd_texture_pack_tracking_upload_count(const HdTexturePack* pack);
 int hd_texture_pack_match(HdTexturePack* pack,
                           const HdTextureDrawQuery* query,
                           HdTextureMatch* out_match);
+
+/* Temporary stage-by-stage match diagnostics (see hd_texture_pack.cpp's
+ * comment above hd_texture_pack_match): out[] = {no_candidates (broad-phase
+ * spatial index found no overlapping upload at all), no_hash_match (had
+ * candidates, but none had this exact (upload_hash, palette_hash) key in the
+ * pack), not_covered (a key matched, but covered_by_upload rejected full
+ * coverage)}. Global counters, not per-pack -- fine for single-pack-instance
+ * diagnosis, not meant to ship long-term. */
+void hd_texture_pack_diag_stats(uint64_t out[3]);
+/* Raw (x,y,width,height) of the first query rect and first tracked upload's
+ * bounds, in the same word/row units both are supposed to share -- read this
+ * directly when the aggregate counts above point at a coordinate-space
+ * mismatch between tracking and matching. out[] = {query_x, query_y,
+ * query_w, query_h, query_captured, upload_x, upload_y, upload_w, upload_h,
+ * upload_captured}; a *_captured of 0 means neither has happened yet. */
+void hd_texture_pack_diag_first_rects(unsigned out[10]);
+/* Rolling snapshot of the most recent successful match (overwritten every
+ * match, not just the first), so the exact replacement file backing a
+ * suspect on-screen texture can be identified while it is still visible.
+ * out_info[] = {texture_hash, palette_hash, query_x, query_y, query_w,
+ * query_h, upload_serial}. */
+void hd_texture_pack_diag_last_match(char* out_path, size_t path_capacity,
+                                     unsigned out_info[7]);
+/* Dumps the last ~24 successful matches (oldest to newest) as a JSON array
+ * body of {path,texhash,palhash,qx,qy,qw,qh,serial} objects -- a snapshot of
+ * the SET of replacement images a single on-screen frame is drawing from
+ * right now, not just whichever draw happened to run last. See
+ * hd_texture_pack_diag_last_match's header comment for why "last match
+ * only" wasn't enough to see a frame that mixes correct and wrong images
+ * across its own draws. */
+int hd_texture_pack_diag_dump_ring(char* out, size_t out_capacity);
+/* 2026-09-07 investigation: out[] = {font_hash_seen (track_upload calls
+ * whose hash was the known-good font atlas 0xF98B3634), region_touches
+ * (track_upload calls intersecting the shared VRAM word-region
+ * (320,0,64,48) where a stale boot-time upload keeps winning every match),
+ * region_last_hash, region_last_serial, reserved}. */
+void hd_texture_pack_diag_font_region_stats(uint64_t out[5]);
+/* Dumps every currently-tracked upload as a JSON array body (no brackets) of
+ * {serial,hash,x,y,w,h} objects into out. Only meant for a small number of
+ * uploads (this session's whole-run investigation never exceeded a few
+ * dozen); truncates silently if out_capacity is too small. Returns 0 only
+ * for a null pack/out. */
+int hd_texture_pack_diag_dump_uploads(const HdTexturePack* pack, char* out,
+                                      size_t out_capacity);
 
 /* Live GP0 draw adapter: derives page_x/page_y/depth from the PS1 texpage word
  * and applies the same deterministic residency/CLUT/UV match above. This keeps

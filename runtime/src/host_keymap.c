@@ -101,6 +101,10 @@ static void apply_defaults(void) {
         add_bind(HOST_KEYMAP_SCANLINES, (int)SDLK_F6, (int)SDL_SCANCODE_F6, 0);
     if (s_actions[HOST_KEYMAP_TURBO_TOGGLE].count == 0)
         add_bind(HOST_KEYMAP_TURBO_TOGGLE, (int)SDLK_F9, (int)SDL_SCANCODE_F9, 0);
+    if (s_actions[HOST_KEYMAP_TEXPACK_MENU].count == 0)
+        add_bind(HOST_KEYMAP_TEXPACK_MENU, (int)SDLK_F10, (int)SDL_SCANCODE_F10, 0);
+    if (s_actions[HOST_KEYMAP_RESTART_GAME].count == 0)
+        add_bind(HOST_KEYMAP_RESTART_GAME, (int)SDLK_ESCAPE, (int)SDL_SCANCODE_ESCAPE, KMOD_SHIFT);
 }
 
 /* Parse one "Ctrl+Alt+PageUp" token into key+mods. */
@@ -160,6 +164,8 @@ static HostKeymapAction action_for_key(const char *name) {
     if (ieq(name, "SaveStateMenu")) return HOST_KEYMAP_SAVE_STATE_MENU;
     if (ieq(name, "Scanlines")) return HOST_KEYMAP_SCANLINES;
     if (ieq(name, "TurboToggle")) return HOST_KEYMAP_TURBO_TOGGLE;
+    if (ieq(name, "TexturePackMenu")) return HOST_KEYMAP_TEXPACK_MENU;
+    if (ieq(name, "RestartGame")) return HOST_KEYMAP_RESTART_GAME;
     return HOST_KEYMAP_ACTION_COUNT;
 }
 
@@ -211,10 +217,32 @@ void host_keymap_load(const char *config_ini_path) {
     apply_defaults();
 }
 
+/* KMOD_CTRL/ALT/SHIFT are each an L|R *combined* mask (e.g. KMOD_SHIFT =
+ * KMOD_LSHIFT|KMOD_RSHIFT), but a real key event only ever sets the ONE side
+ * bit for whichever physical key is actually held -- never both at once for
+ * an ordinary single-key press. Comparing (mod & relevant) against a bind's
+ * stored combined mask with == therefore only matches when BOTH left and
+ * right of a required modifier are held simultaneously, so a plain single
+ * Shift/Ctrl/Alt press against a default bind like KMOD_SHIFT never matches.
+ * Compare per-family presence (any L or R) instead, still requiring an exact
+ * required-vs-not match so a bind with no modifier still rejects a keypress
+ * that happens to have an unrelated modifier held. */
+static int mods_match(int event_mod, int bind_mods) {
+    static const int kFamilies[3] = {
+        (int)KMOD_CTRL, (int)KMOD_ALT, (int)KMOD_SHIFT
+    };
+    int i;
+    for (i = 0; i < 3; i++) {
+        const int fam = kFamilies[i];
+        if (((event_mod & fam) != 0) != ((bind_mods & fam) != 0))
+            return 0;
+    }
+    return 1;
+}
+
 int host_keymap_match_event(HostKeymapAction action, int keycode,
                             int scancode, int mod) {
     const HostKeyAction *a;
-    const int relevant = (int)(KMOD_CTRL | KMOD_ALT | KMOD_SHIFT);
     int i;
     if (action < 0 || action >= HOST_KEYMAP_ACTION_COUNT) return 0;
     a = &s_actions[action];
@@ -222,7 +250,7 @@ int host_keymap_match_event(HostKeymapAction action, int keycode,
         if (a->binds[i].keycode != keycode &&
             (scancode <= 0 || a->binds[i].scancode != scancode))
             continue;
-        if ((mod & relevant) == a->binds[i].mods) return 1;
+        if (mods_match(mod, a->binds[i].mods)) return 1;
     }
     return 0;
 }
@@ -233,7 +261,6 @@ int host_keymap_match(HostKeymapAction action, int keycode, int mod) {
 
 int host_keymap_down(HostKeymapAction action, const uint8_t *keys, int mod) {
     const HostKeyAction *a;
-    const int relevant = (int)(KMOD_CTRL | KMOD_ALT | KMOD_SHIFT);
     int i;
     if (!keys || action < 0 || action >= HOST_KEYMAP_ACTION_COUNT) return 0;
     a = &s_actions[action];
@@ -241,7 +268,7 @@ int host_keymap_down(HostKeymapAction action, const uint8_t *keys, int mod) {
         const int sc = a->binds[i].scancode;
         if (sc <= 0 || sc >= SDL_NUM_SCANCODES) continue;
         if (!keys[sc]) continue;
-        if ((mod & relevant) == a->binds[i].mods) return 1;
+        if (mods_match(mod, a->binds[i].mods)) return 1;
     }
     return 0;
 }
@@ -309,6 +336,10 @@ const char *host_keymap_label(HostKeymapAction action, char *out, size_t cap) {
 #endif
         if (action == HOST_KEYMAP_SAVE_STATE_MENU)
             snprintf(out, cap, "F7");
+        else if (action == HOST_KEYMAP_TEXPACK_MENU)
+            snprintf(out, cap, "F10");
+        else if (action == HOST_KEYMAP_RESTART_GAME)
+            snprintf(out, cap, "Shift+Escape");
         return out;
     }
     b = &a->binds[0];

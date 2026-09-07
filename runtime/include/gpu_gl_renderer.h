@@ -61,6 +61,15 @@ uint64_t gl_renderer_hd_draws_issued(void);  /* draw_hd_replacement_triangle cal
 uint64_t gl_renderer_hd_matches_seen(void);  /* gpu_hd_texture_dump_match hits */
 int      gl_renderer_hd_prog_ready(void);    /* 1 = HD shader built OK */
 int      gl_renderer_hd_tex_cache_count(void); /* distinct replacement textures decoded */
+/* Hot-reload N replacement PNGs that changed on disk (e.g. a regenerated
+ * font pack) without relaunching: drops their on-disk raw-decode cache and
+ * evicts them from the in-memory GL texture cache so the next draw call
+ * that references each one re-decodes and re-uploads from scratch.
+ * GL-context-thread-only. entry_ids[i] must be the same cache_key formula
+ * gpu_hd_texture_pack_match/preload_entry use for png_paths[i]. Returns the
+ * number processed (== count; never fails outright, a path that was never
+ * cached this session is simply a no-op). */
+int      gl_renderer_hd_tex_reload(const uint32_t *entry_ids, const char *const *png_paths, int count);
 /* 1 if PSXRECOMP_HD_TEXTURE_DEBUG_MISSING is set -- unreplaced opaque prims
  * render solid violet instead of falling through to native, so replacement
  * coverage gaps are visible while playing instead of only inferable from

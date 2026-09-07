@@ -70,6 +70,8 @@
 #include "frame_interpolation.h"
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
+#include "psx_texpack_menu.h"
+#include "psx_font_picker_menu.h"
 #include "host_time.h"
 #include "latency_ring.h"
 #include "frame_pacing.h"
@@ -131,7 +133,13 @@
 
 #define VRAM_W 1024
 #define VRAM_H 512
-#define GL_MAX_INTERNAL_SCALE 4
+/* Nominal ceiling. DuckStation-style high-res support goes up to 16x, but
+ * that's 256x the native pixel count (16384x8192 in the hi-res FBO below) --
+ * user-chosen 8x as a less impractical top end (64x native, 8192x4096).
+ * init_gpu_raster() additionally clamps to what GL_MAX_TEXTURE_SIZE can
+ * actually hold on THIS GPU, since the hi-res FBO is a real
+ * VRAM_W*scale x VRAM_H*scale texture, not a fixed-size buffer. */
+#define GL_MAX_INTERNAL_SCALE 8
 
 /* ---- Loaded modern-GL entry points ------------------------------------- */
 typedef GLuint (APIENTRY *PFN_glCreateShader)(GLenum);
@@ -2063,9 +2071,20 @@ static const char *HD_FS =
      * see-through -- exactly the "transparency between textures" the user
      * spotted looking wrong. A hard discard (not real alpha blending)
      * matches the original PS1 behavior for this prim class faithfully. */
+    /* Below a near-zero floor the pixel is a true PS1-style hole (see the
+     * comment above): discard so nothing writes to depth/stencil there.
+     * Anything above that floor is blended by real alpha (GL_BLEND enabled
+     * below) rather than snapped to fully opaque -- a hand-drawn PNG's own
+     * anti-aliased edges (soft partial-alpha pixels the pack author drew,
+     * distinct from the hole cutout) need actual blending against whatever
+     * is already in the framebuffer or they show as a jagged, gap-toothed
+     * silhouette instead of a smooth edge (confirmed live: the credits-
+     * screen replacement's anti-aliased text looked broken/full of holes
+     * with a hard 0.5 cutoff, while its own solid-alpha watermark text,
+     * which has no soft edges, looked fine either way). */
     "void main(){\n"
     "  vec4 c = texture(u_tex, v_uv);\n"
-    "  if (c.a < 0.5) discard;\n"
+    "  if (c.a < 0.02) discard;\n"
     /* Per-vertex Gouraud shading (ambient/room lighting), same formula and
      * *2.0 scale as TEX_FS's "rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0)"
      * -- PS1 vertex colors are stored so 0x80 (0.5 normalized) means neutral
@@ -2156,10 +2175,221 @@ static void hd_gl_init(void) {
     }
 }
 
-static GLuint hd_gl_get_texture(uint32_t entry_id, const char *png_path) {
-    for (int i = 0; i < s_hd_tex_cache_count; i++)
-        if (s_hd_tex_cache[i].entry_id == entry_id)
-            return s_hd_tex_cache[i].failed ? 0 : s_hd_tex_cache[i].tex;
+/* Decoding a replacement PNG here is a synchronous fopen+fread+stbi_load on
+ * the render thread (see below) -- fine for the odd new texture appearing
+ * mid-scene, but walking into an area where MANY entries are still uncached
+ * (e.g. entering a battle for the first time this session, or switching HD
+ * backends) previously decoded all of them back-to-back in one frame,
+ * visibly freezing the game for a few seconds (confirmed live: enabling the
+ * Beetle backend and reaching a fresh scene). Fixed by preloading every
+ * entry of the active backend up front (see gpu_hd_texture_preload_active
+ * below, called once at boot and again on every live backend switch) so
+ * this function's cache is already warm by the time gameplay can reach
+ * those textures -- no per-call budget needed here. */
+#ifdef _WIN32
+#include <direct.h>
+#define HD_CACHE_MKDIR(path) _mkdir(path)
+#else
+#include <sys/stat.h>
+#define HD_CACHE_MKDIR(path) mkdir(path, 0755)
+#endif
+
+/* Raw-decode disk cache: <dir-of-png>/processed/<same-basename>.bin holds
+ * {magic, width, height, compressed size, RLE-compressed RGBA8 bytes} for
+ * one already-decoded PNG, so a later boot can skip PNG inflate entirely
+ * (a plain fread + RLE expand, far cheaper than a full DEFLATE decode)
+ * instead of re-decoding every replacement texture from scratch every
+ * single launch. Invalidation is manual and file-granular by design:
+ * editing/replacing a PNG in the pack does nothing on its own -- delete
+ * that PNG's .bin (or the whole processed/ folder) and this regenerates
+ * just the ones that are missing on the next boot. No mtime/hash staleness
+ * check on purpose, to keep the cache-hit path simple. */
+#define HD_CACHE_MAGIC 0x32434448u /* "HDC2" LE (v2: RLE-compressed) */
+
+static void hd_cache_paths_for(const char *png_path, char *out_dir, size_t dir_cap,
+                               char *out_file, size_t file_cap) {
+    const char *slash = strrchr(png_path, '/');
+    const char *bslash = strrchr(png_path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    const int dirlen = slash ? (int)(slash - png_path) : 0;
+    const char *base = slash ? slash + 1 : png_path;
+    const char *dot = strrchr(base, '.');
+    const int baselen = dot ? (int)(dot - base) : (int)strlen(base);
+    snprintf(out_dir, dir_cap, "%.*s/processed", dirlen, png_path);
+    snprintf(out_file, file_cap, "%.*s/processed/%.*s.bin", dirlen, png_path, baselen, base);
+}
+
+/* Cheap existence probe for the boot-time "how many are missing" scan --
+ * no read/decompress, just "does the file open." */
+static int hd_cache_exists(const char *cache_path) {
+    FILE *f = fopen(cache_path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+/* TGA-style byte-oriented RLE over whole 4-byte RGBA pixels: simple enough
+ * to get exactly right, and fast to decode (memcpy/fill, no bit-level
+ * Huffman) -- self-contained rather than reaching for a new library
+ * dependency for this one file. Packet = 1 header byte + payload:
+ *   header bit7 set   -> RLE run: (header&0x7F)+1 copies of the ONE pixel
+ *                        that follows (4 bytes).
+ *   header bit7 clear -> raw run: (header&0x7F)+1 DISTINCT pixels follow
+ *                        verbatim ((count)*4 bytes).
+ * Compresses well on the large flat/transparent regions common in UI and
+ * font-atlas textures (confirmed firsthand investigating this pack's own
+ * font atlas this session); less effective on photo-real content, but
+ * always correct and always smaller-or-equal... in the worst case slightly
+ * larger than raw (worst case ~129/128 raw size), which hd_rle_max_size
+ * accounts for. */
+static size_t hd_rle_max_size(size_t pixel_count) {
+    return pixel_count * 4 + (pixel_count + 127) / 128 + 16;
+}
+
+static size_t hd_rle_encode(const unsigned char *px, size_t n, unsigned char *out) {
+    size_t i = 0, o = 0;
+    while (i < n) {
+        size_t run = 1;
+        while (i + run < n && run < 128 && memcmp(px + i * 4, px + (i + run) * 4, 4) == 0)
+            run++;
+        if (run >= 2) {
+            out[o++] = (unsigned char)(0x80u | (run - 1));
+            memcpy(out + o, px + i * 4, 4);
+            o += 4;
+            i += run;
+        } else {
+            size_t raw = 1;
+            while (i + raw < n && raw < 128) {
+                if (i + raw + 1 < n && memcmp(px + (i + raw) * 4, px + (i + raw + 1) * 4, 4) == 0)
+                    break; /* next pair starts a real RLE run; end the raw run here */
+                raw++;
+            }
+            out[o++] = (unsigned char)(raw - 1);
+            memcpy(out + o, px + i * 4, raw * 4);
+            o += raw * 4;
+            i += raw;
+        }
+    }
+    return o;
+}
+
+static int hd_rle_decode(const unsigned char *in, size_t in_len, unsigned char *out,
+                         size_t out_pixels) {
+    size_t ii = 0, oi = 0;
+    while (ii < in_len && oi < out_pixels) {
+        const unsigned char h = in[ii++];
+        const size_t count = (size_t)(h & 0x7Fu) + 1;
+        if (h & 0x80u) {
+            if (ii + 4 > in_len || oi + count > out_pixels) return 0;
+            for (size_t k = 0; k < count; k++) memcpy(out + (oi + k) * 4, in + ii, 4);
+            ii += 4;
+            oi += count;
+        } else {
+            if (ii + count * 4 > in_len || oi + count > out_pixels) return 0;
+            memcpy(out + oi * 4, in + ii, count * 4);
+            ii += count * 4;
+            oi += count;
+        }
+    }
+    return oi == out_pixels;
+}
+
+static unsigned char *hd_cache_load(const char *cache_path, int *out_w, int *out_h) {
+    FILE *cf = fopen(cache_path, "rb");
+    if (!cf) return NULL;
+    uint32_t hdr[4] = {0, 0, 0, 0};
+    unsigned char *buf = NULL;
+    if (fread(hdr, sizeof(uint32_t), 4, cf) == 4 && hdr[0] == HD_CACHE_MAGIC &&
+        hdr[1] > 0 && hdr[2] > 0 &&
+        (uint64_t)hdr[1] * hdr[2] <= (uint64_t)(64 * 1024 * 1024) / 4) {
+        const size_t pixel_count = (size_t)hdr[1] * (size_t)hdr[2];
+        const size_t comp_size = hdr[3];
+        unsigned char *comp = (unsigned char *)malloc(comp_size ? comp_size : 1);
+        buf = (unsigned char *)malloc(pixel_count * 4);
+        if (comp && buf && fread(comp, 1, comp_size, cf) == comp_size &&
+            hd_rle_decode(comp, comp_size, buf, pixel_count)) {
+            *out_w = (int)hdr[1];
+            *out_h = (int)hdr[2];
+        } else {
+            free(buf);
+            buf = NULL;
+        }
+        free(comp);
+    }
+    fclose(cf);
+    return buf;
+}
+
+static void hd_cache_save(const char *cache_dir, const char *cache_path,
+                          const unsigned char *pixels, int w, int h) {
+    const size_t pixel_count = (size_t)w * (size_t)h;
+    unsigned char *comp = (unsigned char *)malloc(hd_rle_max_size(pixel_count));
+    if (!comp) return;
+    const size_t comp_size = hd_rle_encode(pixels, pixel_count, comp);
+
+    HD_CACHE_MKDIR(cache_dir); /* best-effort; EEXIST (already there) is fine */
+    FILE *wf = fopen(cache_path, "wb");
+    if (!wf) { free(comp); return; }
+    const uint32_t hdr[4] = {HD_CACHE_MAGIC, (uint32_t)w, (uint32_t)h, (uint32_t)comp_size};
+    if (fwrite(hdr, sizeof(uint32_t), 4, wf) != 4 ||
+        fwrite(comp, 1, comp_size, wf) != comp_size) {
+        /* Partial write (e.g. disk full) -- remove rather than leave a
+         * truncated cache file that would fail hd_cache_load's checks
+         * anyway, but do it cleanly instead of relying on that. */
+        fclose(wf);
+        remove(cache_path);
+        free(comp);
+        return;
+    }
+    fclose(wf);
+    free(comp);
+}
+
+/* Reads and decodes one replacement PNG into an RGBA8 buffer, going through
+ * the on-disk raw-decode cache above first. Pure CPU work, no GL calls --
+ * safe to run off the main/GL thread, which is exactly why this is split
+ * out of hd_gl_get_texture (used directly there) and also called from the
+ * preload worker threads below. Caller owns the returned buffer
+ * (stbi_image_free -- safe for a cache-loaded malloc() buffer too, since
+ * this build's stb_image uses the default malloc/free, not a custom
+ * allocator). */
+static unsigned char *hd_decode_png_file(const char *png_path, int *out_w, int *out_h) {
+    *out_w = *out_h = 0;
+    char cache_dir[1024], cache_path[1024];
+    hd_cache_paths_for(png_path, cache_dir, sizeof(cache_dir), cache_path, sizeof(cache_path));
+
+    unsigned char *cached = hd_cache_load(cache_path, out_w, out_h);
+    if (cached) return cached;
+
+    /* The shared stb_image implementation (psx_window_icon.cpp) is built
+     * with STBI_NO_STDIO -- no stbi_load(path, ...) -- so the file is read
+     * into memory here and handed to stbi_load_from_memory instead. */
+    unsigned char *pixels = NULL;
+    int comp = 0;
+    FILE *f = fopen(png_path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (len > 0) {
+            unsigned char *filebuf = (unsigned char *)malloc((size_t)len);
+            if (filebuf && fread(filebuf, 1, (size_t)len, f) == (size_t)len)
+                pixels = stbi_load_from_memory(filebuf, (int)len, out_w, out_h, &comp, 4);
+            free(filebuf);
+        }
+        fclose(f);
+    }
+    if (pixels && *out_w > 0 && *out_h > 0)
+        hd_cache_save(cache_dir, cache_path, pixels, *out_w, *out_h);
+    return pixels;
+}
+
+/* GL-context-thread-only: inserts a new cache slot for entry_id and, if
+ * pixels is non-NULL, uploads it as a GL texture. Caller still owns pixels
+ * (stbi_image_free after this returns either way). Assumes entry_id is not
+ * already cached (both call sites already checked). */
+static GLuint hd_gl_cache_insert(uint32_t entry_id, const unsigned char *pixels,
+                                 int w, int h) {
     if (s_hd_tex_cache_count == s_hd_tex_cache_cap) {
         int new_cap = s_hd_tex_cache_cap ? s_hd_tex_cache_cap * 2 : 64;
         HdGlTexEntry *grown = (HdGlTexEntry *)realloc(
@@ -2172,28 +2402,7 @@ static GLuint hd_gl_get_texture(uint32_t entry_id, const char *png_path) {
     slot->entry_id = entry_id;
     slot->tex = 0;
     slot->failed = 1;
-    /* The shared stb_image implementation (psx_window_icon.cpp) is built
-     * with STBI_NO_STDIO -- no stbi_load(path, ...) -- so the file is read
-     * into memory here and handed to stbi_load_from_memory instead. */
-    unsigned char *pixels = NULL;
-    int w = 0, h = 0, comp = 0;
-    FILE *f = fopen(png_path, "rb");
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        long len = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        if (len > 0) {
-            unsigned char *filebuf = (unsigned char *)malloc((size_t)len);
-            if (filebuf && fread(filebuf, 1, (size_t)len, f) == (size_t)len)
-                pixels = stbi_load_from_memory(filebuf, (int)len, &w, &h, &comp, 4);
-            free(filebuf);
-        }
-        fclose(f);
-    }
-    if (!pixels) {
-        fprintf(stdout, "psxrecomp: HD texture decode failed: %s\n", png_path);
-        return 0;
-    }
+    if (!pixels) return 0;
     GLuint tex = 0;
     glGenTextures(1, &tex);
     if (tex) {
@@ -2209,8 +2418,211 @@ static GLuint hd_gl_get_texture(uint32_t entry_id, const char *png_path) {
         slot->tex = tex;
         slot->failed = 0;
     }
-    stbi_image_free(pixels);
     return slot->failed ? 0 : slot->tex;
+}
+
+static GLuint hd_gl_get_texture(uint32_t entry_id, const char *png_path) {
+    for (int i = 0; i < s_hd_tex_cache_count; i++)
+        if (s_hd_tex_cache[i].entry_id == entry_id)
+            return s_hd_tex_cache[i].failed ? 0 : s_hd_tex_cache[i].tex;
+    int w = 0, h = 0;
+    unsigned char *pixels = hd_decode_png_file(png_path, &w, &h);
+    if (!pixels)
+        fprintf(stdout, "psxrecomp: HD texture decode failed: %s\n", png_path);
+    GLuint result = hd_gl_cache_insert(entry_id, pixels, w, h);
+    if (pixels) stbi_image_free(pixels);
+    return result;
+}
+
+/* Hot-reload one replacement PNG that changed on disk since it was last
+ * decoded (e.g. a regenerated font pack, see generate_font_pack.py) without
+ * needing to relaunch the game. GL-context-thread-only (glDeleteTextures).
+ *
+ * Deletes the on-disk raw-decode cache (hd_cache_save's target) so a stale
+ * compressed copy of the OLD pixels doesn't get served instead of
+ * re-decoding the new PNG, then drops entry_id's slot from the in-memory
+ * GL cache entirely (not just resetting it in place) so hd_gl_get_texture's
+ * linear scan falls through to the decode-and-insert path on the very next
+ * draw call that references it, exactly as if this entry had never been
+ * cached this session. */
+static void hd_gl_reload_one(uint32_t entry_id, const char *png_path) {
+    char cache_dir[1024], cache_path[1024];
+    hd_cache_paths_for(png_path, cache_dir, sizeof(cache_dir), cache_path, sizeof(cache_path));
+    remove(cache_path);
+
+    for (int i = 0; i < s_hd_tex_cache_count; i++) {
+        if (s_hd_tex_cache[i].entry_id != entry_id) continue;
+        if (s_hd_tex_cache[i].tex) glDeleteTextures(1, &s_hd_tex_cache[i].tex);
+        s_hd_tex_cache[i] = s_hd_tex_cache[s_hd_tex_cache_count - 1];
+        s_hd_tex_cache_count--;
+        break;
+    }
+}
+
+int gl_renderer_hd_tex_reload(const uint32_t *entry_ids, const char *const *png_paths, int count) {
+    int reloaded = 0;
+    for (int i = 0; i < count; i++) {
+        hd_gl_reload_one(entry_ids[i], png_paths[i]);
+        reloaded++;
+    }
+    return reloaded;
+}
+
+/* One "make sure the cache file for this PNG exists" job for the worker
+ * pool below: decode-and-write only, no GL calls and no returned pixel
+ * buffer (freed immediately after the cache write) -- this is what keeps
+ * this pass's memory footprint small regardless of pack size, unlike the
+ * earlier version of this function which additionally kept every decoded
+ * texture resident as a permanent GL texture (thousands of them for a
+ * pack this size genuinely exhausted GPU memory and took the whole host
+ * down, confirmed live -- see PLAN.md/HD_TEXTURE_BEETLE_INVESTIGATION.md).
+ * The runtime GL texture cache (hd_gl_get_texture) stays lazy/on-demand,
+ * bounded by whatever the game actually draws -- this pass only exists so
+ * that path's cache reads are fast (RLE fread) instead of a PNG inflate. */
+typedef struct HdCacheJob {
+    const char *path; /* borrowed; valid for the pack's lifetime; NULL = entry lookup failed */
+    char cache_dir[1024];
+    char cache_path[1024];
+} HdCacheJob;
+
+typedef struct HdCacheWorkerArgs {
+    HdCacheJob *jobs;
+    uint32_t first, count;
+    SDL_AtomicInt *done; /* shared; each processed job (hit or generated) increments once */
+} HdCacheWorkerArgs;
+
+static int hd_cache_ensure_worker(void *ud) {
+    HdCacheWorkerArgs *args = (HdCacheWorkerArgs *)ud;
+    for (uint32_t i = 0; i < args->count; i++) {
+        HdCacheJob *job = &args->jobs[args->first + i];
+        if (job->path && !hd_cache_exists(job->cache_path)) {
+            int w = 0, h = 0;
+            unsigned char *pixels = hd_decode_png_file(job->path, &w, &h);
+            if (!pixels)
+                fprintf(stdout, "psxrecomp: HD texture decode failed: %s\n", job->path);
+            /* hd_decode_png_file already wrote the cache on a fresh decode
+             * (it only reaches the decode path because hd_cache_exists just
+             * said this file is missing), so nothing further to do here. */
+            if (pixels) stbi_image_free(pixels);
+        }
+        SDL_AddAtomicInt(args->done, 1);
+    }
+    return 0;
+}
+
+/* Minimal progress bar: a plain glClear + glScissor fill, no shaders/VAOs/
+ * fonts needed -- robust regardless of whatever GL state happens to be
+ * bound, since nothing else has run yet at the point this is first called
+ * (right after context creation). Percent/counts go on the window title
+ * instead of into the frame, which needs no text rendering at all. */
+static void hd_draw_progress_frame(float pct) {
+    if (!s_win) return;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 1.0f) pct = 1.0f;
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
+    glViewport(0, 0, ww, wh);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0.05f, 0.05f, 0.07f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    const int bar_w = (int)(ww * 0.6f), bar_h = (int)(wh * 0.04f) + 1;
+    const int bar_x = (ww - bar_w) / 2, bar_y = (int)(wh * 0.5f);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(bar_x, bar_y, bar_w, bar_h);
+    glClearColor(0.20f, 0.20f, 0.25f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT); /* track */
+    const int fill_w = (int)(bar_w * pct);
+    if (fill_w > 0) {
+        glScissor(bar_x, bar_y, fill_w, bar_h);
+        glClearColor(0.25f, 0.65f, 0.95f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT); /* fill */
+    }
+    glDisable(GL_SCISSOR_TEST);
+    SDL_GL_SwapWindow(s_win);
+}
+
+void gpu_hd_texture_preload_active(void) {
+    const int backend = gpu_hd_texture_get_backend();
+    uint32_t count = 0;
+    if (backend == 0) count = gpu_hd_texture_dump_preload_count();
+    else if (backend == 1) count = gpu_hd_texture_pack_preload_count();
+    else return; /* "none": nothing to cache */
+    if (count == 0) return;
+
+    HdCacheJob *jobs = (HdCacheJob *)calloc(count, sizeof(HdCacheJob));
+    if (!jobs) return;
+    uint32_t missing = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t id = 0;
+        const char *path = NULL;
+        int got = (backend == 0) ? gpu_hd_texture_dump_preload_entry(i, &id, &path)
+                                  : gpu_hd_texture_pack_preload_entry(i, &id, &path);
+        if (!got) continue;
+        jobs[i].path = path;
+        hd_cache_paths_for(path, jobs[i].cache_dir, sizeof(jobs[i].cache_dir),
+                           jobs[i].cache_path, sizeof(jobs[i].cache_path));
+        if (!hd_cache_exists(jobs[i].cache_path)) missing++;
+    }
+
+    if (missing == 0) { free(jobs); return; } /* already fully cached: no UI, no threads, instant */
+
+    fprintf(stdout, "psxrecomp: HD texture cache: %u/%u missing, processing...\n", missing, count);
+    fflush(stdout);
+    const uint64_t t0 = SDL_GetPerformanceCounter();
+
+    SDL_AtomicInt done_counter;
+    SDL_SetAtomicInt(&done_counter, 0);
+    int nthreads = SDL_GetNumLogicalCPUCores();
+    if (nthreads < 1) nthreads = 4;
+    if (nthreads > 16) nthreads = 16;
+    if ((uint32_t)nthreads > count) nthreads = (int)count;
+    HdCacheWorkerArgs *wargs = (HdCacheWorkerArgs *)calloc((size_t)nthreads, sizeof(*wargs));
+    SDL_Thread **threads = (SDL_Thread **)calloc((size_t)nthreads, sizeof(*threads));
+    char *saved_title = NULL;
+    if (wargs && threads) {
+        const char *cur_title = s_win ? SDL_GetWindowTitle(s_win) : NULL;
+        if (cur_title) { saved_title = strdup(cur_title); }
+        const uint32_t per = count / (uint32_t)nthreads, rem = count % (uint32_t)nthreads;
+        uint32_t off = 0;
+        for (int t = 0; t < nthreads; t++) {
+            const uint32_t c = per + ((uint32_t)t < rem ? 1u : 0u);
+            wargs[t].jobs = jobs; wargs[t].first = off; wargs[t].count = c;
+            wargs[t].done = &done_counter;
+            threads[t] = SDL_CreateThread(hd_cache_ensure_worker, "hd_cache", &wargs[t]);
+            off += c;
+        }
+        /* Main thread: pump events and present a progress frame while the
+         * workers run, so the OS never flags the window as unresponsive and
+         * the player sees real feedback instead of a frozen splash. */
+        for (;;) {
+            const int d = SDL_GetAtomicInt(&done_counter);
+            if ((uint32_t)d >= count) break;
+            char title[192];
+            snprintf(title, sizeof(title),
+                     "Processing Textures... %d%% (%d/%u)",
+                     (int)((int64_t)d * 100 / (int64_t)count), d, count);
+            if (s_win) SDL_SetWindowTitle(s_win, title);
+            hd_draw_progress_frame((float)d / (float)count);
+            SDL_Event ev;
+            while (SDL_PollEvent(&ev)) { /* discard: input is ignored during this pass */ }
+            SDL_Delay(16);
+        }
+        for (int t = 0; t < nthreads; t++)
+            if (threads[t]) SDL_WaitThread(threads[t], NULL);
+        if (s_win) SDL_SetWindowTitle(s_win, saved_title ? saved_title : "VagrantStory Recompiled");
+        free(saved_title);
+    }
+    free(threads);
+    free(wargs);
+    free(jobs);
+
+    const double secs = (double)(SDL_GetPerformanceCounter() - t0) /
+                        (double)SDL_GetPerformanceFrequency();
+    fprintf(stdout,
+        "psxrecomp: HD texture cache ready (%s): %u processed, %u total, %d threads, %.2fs\n",
+        backend == 0 ? "DuckStation" : "Beetle", missing, count, nthreads, secs);
+    fflush(stdout);
 }
 
 /* Draws ONE textured triangle through the HD replacement pipeline. xs/ys are
@@ -2248,12 +2660,36 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
     p_glUseProgram(s_hd_prog);
     p_glUniform3f(s_hd_uTint, tint_r, tint_g, tint_b);
     p_glUniform1i(s_hd_uRaw, rawtex);
-    glDisable(GL_BLEND);
+    /* Standard "over" blend for the replacement PNG's OWN anti-aliased edge
+     * pixels (see HD_FS's comment) -- not a PS1 blend-equation replication;
+     * the original native prim this replaces had no blending at all (semi <
+     * 0 gated this whole pipeline), so there is no PS1 mode to match here. */
+    glEnable(GL_BLEND);
+    p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
     mask_stencil(s_mask_set);
     p_glBindVertexArray(s_hd_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_hd_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    /* Native-wide mirror (see flush_tex_batch/gpu_geometry for the pattern
+     * this mirrors): without this, an HD-replaced triangle never contributes
+     * to the revealed 16:9 margins -- s_hd_uXoff/s_hd_uXhalf stay pinned at
+     * the canonical (0, 512) values set once at init, so a scene where most
+     * textured geometry gets HD-matched (any pack loaded, once past a few
+     * frames) effectively drops out of native-wide entirely, presenting as
+     * plain 4:3 with black bars even though native-wide is engaged. The HD
+     * shader has no backdrop-stretch uniforms (u_xscale/u_xcenter) unlike
+     * s_geo_prog/s_tex_prog -- HD replacement only ever applies to textured
+     * triangles, never the flat-backdrop special case those exist for. */
+    if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+        !mirror_geo_center_only(xs, 3)) {
+        int dx = wide_dx();
+        gl_perf_mirror_begin();
+        wide_target_begin(dx, s_hd_uXoff, s_hd_uXhalf);
+        if (s_ws_ablate != 2) glDrawArrays(GL_TRIANGLES, 0, 3);
+        wide_target_end(s_hd_uXoff, s_hd_uXhalf);
+        gl_perf_mirror_end();
+    }
     hr_end();
     s_hd_draws_issued++;
 }
@@ -2300,18 +2736,52 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
      * overwhelming common case, and every semi-transparent prim regardless)
      * falls through unchanged to the native path below. lim[] is
      * {u_first, v_first, u_last, v_last} (see gpu_uv.h's psx_uv_tri_limits);
-     * gpu_hd_texture_dump_match wants u_first,u_last,v_first,v_last. */
-    if (semi < 0 && s_hd_prog) {
+     * gpu_hd_texture_dump_match wants u_first,u_last,v_first,v_last.
+     *
+     * Skip entirely when a texture window (GP0 0xE2) is active: the native
+     * path's TEX_FS masks/wraps u,v through it per-texel (u_twin uniform,
+     * see its shader source above) to tile a small region across a larger
+     * quad -- e.g. a stretchable UI element's fill pattern, a real PS1
+     * technique. HD_FS has no equivalent (it linearly stretches u_first..
+     * u_last across the WHOLE matched upload with no wrap), so a windowed
+     * draw's reported u_first/v_first..u_last/v_last is wider than the true
+     * tiled sub-region and the HD path samples past it into whatever is
+     * adjacent in the replacement image -- confirmed live: a battle-mode
+     * speech-bubble fill bleeding into unrelated "STR INT AGL" stat-label
+     * text packed in the same shared upload. Falling back to native for
+     * these is safe and correct (that path already handles windowing). */
+    if (semi < 0 && s_hd_prog && (s_tw_mask_x | s_tw_mask_y) == 0) {
         uint32_t hd_entry_id = 0;
         const char *hd_png_path = NULL;
         float hd_u_scale = 0, hd_u_offset = 0, hd_v_scale = 0, hd_v_offset = 0;
         float hd_tint_r = 1.0f, hd_tint_g = 1.0f, hd_tint_b = 1.0f;
         GLuint hd_tex = 0;
-        if (gpu_hd_texture_dump_match(base_x, base_y, depth, lim[0], lim[2], lim[1], lim[3],
-                                      clut_x, clut_y,
-                                      &hd_entry_id, &hd_png_path, &hd_u_scale, &hd_u_offset,
-                                      &hd_v_scale, &hd_v_offset,
-                                      &hd_tint_r, &hd_tint_g, &hd_tint_b)) {
+        int hd_hit;
+        /* Three mutually exclusive HD-replacement modes (see gpu.h's
+         * gpu_hd_texture_set_backend): DuckStation-format packs (XXH3-64,
+         * sub-region entries), Beetle-format packs (CRC32-32, whole-upload
+         * entries), and "none" (original PS1 textures, no replacement --
+         * a safety net when a pack has a bad/mislabeled entry). Both
+         * trackers stay fed every frame regardless (gp0_commit_cpu_to_vram),
+         * so this is the only place that needs to know which mode is
+         * active. */
+        const int hd_backend = gpu_hd_texture_get_backend();
+        if (hd_backend == 2) {
+            hd_hit = 0;
+        } else if (hd_backend == 1) {
+            hd_hit = gpu_hd_texture_pack_match(texpage, clut_x, clut_y,
+                                               lim[0], lim[2], lim[1], lim[3],
+                                               &hd_entry_id, &hd_png_path,
+                                               &hd_u_scale, &hd_u_offset,
+                                               &hd_v_scale, &hd_v_offset);
+        } else {
+            hd_hit = gpu_hd_texture_dump_match(base_x, base_y, depth, lim[0], lim[2], lim[1], lim[3],
+                                               clut_x, clut_y,
+                                               &hd_entry_id, &hd_png_path, &hd_u_scale, &hd_u_offset,
+                                               &hd_v_scale, &hd_v_offset,
+                                               &hd_tint_r, &hd_tint_g, &hd_tint_b);
+        }
+        if (hd_hit) {
             s_hd_matches_seen++;
             hd_tex = hd_gl_get_texture(hd_entry_id, hd_png_path);
         }
@@ -3046,6 +3516,29 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
 
 static int init_gpu_raster(void) {
     s_scale = s_req_scale;
+
+    /* The hi-res FBO below is a real VRAM_W*scale x VRAM_H*scale texture (plus
+     * a same-sized depth/stencil renderbuffer), not pre-allocated at a fixed
+     * max -- so at scale 16 that's 16384x8192, which needs the driver to
+     * actually support a 16384 texture. Clamp to what THIS GPU reports rather
+     * than let glTexImage2D/glRenderbufferStorage fail (or silently truncate
+     * on some drivers) partway through init. Comfortably above every scale
+     * this UI offers (1-16) on any GL 3.3+ desktop GPU from the last decade;
+     * only matters on older/mobile parts with a lower real limit. */
+    {
+        GLint max_tex = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+        if (max_tex > 0) {
+            int fits = max_tex / VRAM_W;   /* VRAM_W > VRAM_H, so it's the binding axis */
+            if (fits < 1) fits = 1;
+            if (s_scale > fits) {
+                fprintf(stdout,
+                    "psxrecomp: supersampling %dx exceeds this GPU's GL_MAX_TEXTURE_SIZE "
+                    "(%d) -- clamping to %dx\n", s_scale, (int)max_tex, fits);
+                s_scale = fits;
+            }
+        }
+    }
 
     s_geo_prog  = build_program(GEO_VS, GEO_FS);
     s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
@@ -4412,6 +4905,10 @@ static void gl_swap_with_osd(void) {
                 gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
             }
             if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
+                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+            if (psx_texpack_menu_overlay_image(&px, &ow, &oh) && px)
+                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+            if (psx_font_picker_menu_overlay_image(&px, &ow, &oh) && px)
                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
         }
     }

@@ -1269,6 +1269,24 @@ struct UserSettings {
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
     bool has_audio_freq     = false; int  audio_freq     = 44100;
+    // [textures] hd_pack_dir: DuckStation-format HD texture-replacement pack
+    // root (a directory with config.ini + replacements/, or the replacements/
+    // dir itself). An absolute, machine-specific path, so it lives here
+    // rather than game.toml -- same reasoning as [bios] path just below.
+    bool has_hd_pack_dir    = false; std::filesystem::path hd_pack_dir;
+    // [textures] hd_pack_dir_beetle: Beetle PSX HW-format HD texture-
+    // replacement pack root (a "<name>-texture-replacements" directory, or
+    // its parent containing Hashes.ini). Independent of hd_pack_dir above --
+    // the two formats use different hash schemes (XXH3-64 vs CRC32-32) and
+    // are not interchangeable, so both may be configured at once; hd_backend
+    // below picks which one the renderer actually consults.
+    bool has_hd_pack_dir_beetle = false; std::filesystem::path hd_pack_dir_beetle;
+    // [textures] hd_backend: "duckstation" (default), "beetle", or "none" --
+    // which loaded pack gpu_gl_renderer.c's HD-replacement call site
+    // consults; "none" disables HD replacement entirely (original PS1
+    // textures), a safety net when a pack has a bad/mislabeled entry.
+    // Switching live (both trackers stay fed regardless) needs no reload.
+    bool has_hd_backend     = false; std::string hd_backend;
     // [bios] / [disc] / [memcard]
     bool has_bios_path      = false; std::filesystem::path bios_path;
     bool has_disc_path      = false; std::filesystem::path disc_path;

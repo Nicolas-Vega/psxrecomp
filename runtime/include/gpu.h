@@ -7,6 +7,7 @@
 #ifndef PSXRECOMP_GPU_H
 #define PSXRECOMP_GPU_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct CPUState CPUState;
@@ -127,6 +128,102 @@ int gpu_hd_texture_dump_match(int page_x, int page_y, int depth,
                               float* u_scale, float* u_offset,
                               float* v_scale, float* v_offset,
                               float* tint_r, float* tint_g, float* tint_b);
+
+/* Second, independent HD texture-replacement backend: Beetle PSX HW's own
+ * pack format (runtime/include/hd_texture_pack.h, framework-owned, was built
+ * and unit-tested but never wired into a live renderer until now). Two
+ * different community texture packs for the same game are commonly built for
+ * these two different emulators' hash schemes (XXH3-64 upload+range vs
+ * CRC32-32 upload+full-CLUT) and are NOT interchangeable -- this lets a
+ * player load either (or both, and flip between them live) rather than
+ * requiring a conversion step that cannot exist without the original PS1
+ * VRAM content neither pack format retains on its own. Loads a pack rooted
+ * at `root_dir` (a `<name>-texture-replacements` directory, or its parent
+ * containing Hashes.ini; NULL/empty = disabled). */
+void gpu_hd_texture_pack_init(const char* root_dir);
+void gpu_hd_texture_pack_info(uint32_t* entry_count, uint32_t* unique_key_count,
+                              uint32_t* ambiguous_key_count);
+
+/* Which backend gpu_gl_renderer.c's HD-replacement call site actually
+ * consults: 0 = hd_texture_dump (DuckStation format, default), 1 =
+ * hd_texture_pack (Beetle format). Both trackers stay fed regardless (see
+ * gp0_commit_cpu_to_vram), so switching live re-matches immediately without
+ * reloading either pack. */
+void gpu_hd_texture_set_backend(int backend);
+int  gpu_hd_texture_get_backend(void);
+
+/* Beetle-format counterpart to gpu_hd_texture_dump_match, called instead of
+ * it when gpu_hd_texture_get_backend() == 1. Takes the raw texpage word
+ * directly (hd_texture_pack_match_draw decodes page_x/page_y/depth itself,
+ * exactly as the real GPU would) rather than gpu_gl_renderer.c's already-
+ * split base_x/base_y/depth. No tint output: this backend has no shading-
+ * approximation fallback (a straight hash miss just falls back to native, no
+ * untinted-region-match analog yet). `cache_key` is a stable-for-this-pack
+ * combination of the entry's texture_hash/palette_hash, suitable as
+ * gpu_gl_renderer.c's hd_gl_get_texture cache key in place of hd_texture_dump's
+ * per-entry array index (Beetle's format has no such stable small integer). */
+int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
+                              int u_first, int u_last, int v_first, int v_last,
+                              uint32_t* cache_key, const char** png_path,
+                              float* u_scale, float* u_offset,
+                              float* v_scale, float* v_offset);
+
+/* Match-funnel diagnostics for the Beetle backend (mirrors
+ * gpu_hd_texture_dump_match_stats' purpose, different bucket layout to match
+ * hd_texture_pack.h's HdTextureLookupStatus). out[] = {attempts, none
+ * (no residency/pack-key hit), ambiguous, error (reserved texpage depth or a
+ * degenerate 0-sized upload), matched}. */
+void gpu_hd_texture_pack_match_stats(uint64_t out[5]);
+/* out[] = {track_upload calls, calls that returned success}. A big gap
+ * between them (or track_ok == 0 while match attempts are nonzero) points at
+ * the upload tracker itself, not the hash/palette lookup, as where matches
+ * are failing. */
+void gpu_hd_texture_pack_track_stats(uint64_t out[2]);
+/* Dumps every currently-tracked Beetle-backend upload (see
+ * hd_texture_pack_diag_dump_uploads) into out as a JSON array body. Returns
+ * 0 only if out is null. */
+int gpu_hd_texture_pack_dump_uploads(char* out, size_t out_capacity);
+/* Last ~24 successful Beetle-backend matches as a JSON array body (see
+ * hd_texture_pack_diag_dump_ring) -- the SET of replacement images the
+ * currently on-screen frame is drawing from, not just the most recent one. */
+int gpu_hd_texture_pack_dump_match_ring(char* out, size_t out_capacity);
+
+/* Enumeration for gpu_gl_renderer.c's boot-time / backend-switch preload
+ * pass (gpu_hd_texture_preload_active): count + indexed (entry_id/cache_key,
+ * png_path) access over every loaded entry of each backend, independent of
+ * which one is currently active. See gpu_hd_texture_pack_match's FOUND
+ * branch for why the Beetle entry point returns a cache_key, not the raw
+ * (texture_hash, palette_hash) pair -- it must be the exact same value the
+ * live match path will look the GL texture up by. */
+uint32_t gpu_hd_texture_dump_preload_count(void);
+int gpu_hd_texture_dump_preload_entry(uint32_t index, uint32_t* out_entry_id,
+                                      const char** out_png_path);
+uint32_t gpu_hd_texture_pack_preload_count(void);
+int gpu_hd_texture_pack_preload_entry(uint32_t index, uint32_t* out_cache_key,
+                                      const char** out_png_path);
+/* Decodes and GL-uploads every replacement PNG of the CURRENTLY ACTIVE
+ * backend (gpu_hd_texture_get_backend) up front, synchronously. Call once
+ * at boot right after the active backend is chosen, and again every time
+ * gpu_hd_texture_set_backend switches to a different backend live (the F10
+ * menu / hd_backend TCP command) -- without this, the first time gameplay
+ * draws each of those textures pays a synchronous fopen+stbi_load on the
+ * render thread; hitting many at once (a fresh scene, or a backend switch)
+ * visibly freezes the game for several seconds. A no-op for backend "none"
+ * or an unconfigured/empty pack. GL-only (the HD-replacement pipeline has
+ * no VK/SW implementation), defined in gpu_gl_renderer.c. */
+void gpu_hd_texture_preload_active(void);
+
+/* Hot-reload up to 8 replacement PNGs (by exact path, matched against each
+ * Beetle-format pack entry's replacement_path) that changed on disk since
+ * they were last decoded -- e.g. after generate_font_pack.py regenerates
+ * the font -- without relaunching the game. Deletes their raw-decode disk
+ * cache and evicts them from the GL texture cache so the next draw that
+ * references each one re-decodes and re-uploads from scratch. GL-context-
+ * thread-only; the in-game font picker menu (like every other menu overlay)
+ * already runs on that thread, so it can call this directly. Returns the
+ * number of paths actually found in the active pack (0 if the Beetle
+ * backend isn't the one loaded, or none matched). */
+int gpu_hd_texture_pack_reload_paths(const char *const *paths, int count);
 
 typedef struct {
     uint32_t left, top, right, bottom;

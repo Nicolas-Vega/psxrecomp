@@ -28,6 +28,7 @@
 #include "pgxp.h"
 #include "dma.h"
 #include "gpu.h"
+#include "hd_texture_pack.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
 #include "present_ring.h"
 #include "load_transition_ring.h"
@@ -5409,6 +5410,146 @@ static void handle_gpu_state(int id, const char *json)
  * hash matched a src_hash from the loaded replacement pack, so a live
  * session can be checked against a real community texture dump without
  * any rendering wiring yet. */
+/* hd_backend — live-switch which HD texture-replacement pack the renderer
+ * consults, no restart needed (see gpu.h's gpu_hd_texture_set_backend): both
+ * packs' trackers stay fed regardless of which is active. Optional "backend"
+ * field ("duckstation" or "beetle"); omit it to just read the current one.
+ * Reply also reports each pack's own load info so a "beetle" switch onto an
+ * unconfigured pack is visibly a no-op (entry_count 0) rather than silently
+ * doing nothing. */
+static void json_escape_string(char *dst, size_t dst_size, const char *src);
+
+/* hd_reload_paths -- evict up to 8 replacement PNGs (by exact path) from the
+ * GL texture cache and their raw-decode disk cache, so the next draw that
+ * references each one picks up whatever is on disk NOW instead of a
+ * relaunch-only stale copy. Built for testing generate_font_pack.py's
+ * hot-reload story before wiring it into an in-game menu; runs synchronously
+ * on this thread like every other debug command (debug_server_poll is
+ * called from the emu/GL thread at a safe point -- see handle_hd_backend's
+ * direct gpu_hd_texture_preload_active() call for precedent, no staging
+ * needed for a plain GL-cache-touching command).
+ * Request: {"cmd":"hd_reload_paths","paths":["C:\\...\\a.png","...b.png"]} */
+static void handle_hd_reload_paths(int id, const char *json)
+{
+    const char *arr = strstr(json, "\"paths\"");
+    if (!arr) { send_err(id, "missing 'paths' array"); return; }
+    arr = strchr(arr, '[');
+    if (!arr) { send_err(id, "missing 'paths' array"); return; }
+    arr++;
+
+    char storage[8][512];
+    const char *paths[8];
+    int count = 0;
+    while (count < 8) {
+        while (*arr == ' ' || *arr == ',' || *arr == '\n' || *arr == '\r' || *arr == '\t') arr++;
+        if (*arr != '"') break;
+        arr++;
+        size_t n = 0;
+        while (*arr && *arr != '"' && n + 1 < sizeof(storage[0])) {
+            if (*arr == '\\' && arr[1]) arr++;
+            storage[count][n++] = *arr++;
+        }
+        storage[count][n] = 0;
+        if (*arr == '"') arr++;
+        paths[count] = storage[count];
+        count++;
+    }
+    if (count == 0) { send_err(id, "empty 'paths' array"); return; }
+
+    int reloaded = gpu_hd_texture_pack_reload_paths(paths, count);
+    send_fmt("{\"id\":%d,\"ok\":true,\"requested\":%d,\"reloaded\":%d}",
+             id, count, reloaded);
+}
+
+static void handle_hd_backend(int id, const char *json)
+{
+    char want[16];
+    if (json_get_str(json, "backend", want, sizeof(want))) {
+        if (!strcmp(want, "beetle")) gpu_hd_texture_set_backend(1);
+        else if (!strcmp(want, "duckstation")) gpu_hd_texture_set_backend(0);
+        else if (!strcmp(want, "none") || !strcmp(want, "original"))
+            gpu_hd_texture_set_backend(2);
+        else { send_err(id, "backend must be duckstation|beetle|none"); return; }
+        /* See gpu_hd_texture_preload_active's comment: warm the newly-active
+         * backend's GL texture cache right away instead of the first
+         * gameplay frames that reach each texture paying for it piecemeal. */
+        gpu_hd_texture_preload_active();
+    }
+    uint32_t ds_entries = 0, ds_hashes = 0;
+    gpu_hd_texture_dump_info(&ds_entries, &ds_hashes);
+    uint32_t bt_entries = 0, bt_unique = 0, bt_ambiguous = 0;
+    gpu_hd_texture_pack_info(&bt_entries, &bt_unique, &bt_ambiguous);
+    uint64_t bt_stats[5];
+    gpu_hd_texture_pack_match_stats(bt_stats);
+    uint64_t bt_track[2];
+    gpu_hd_texture_pack_track_stats(bt_track);
+    uint64_t bt_diag[3];
+    hd_texture_pack_diag_stats(bt_diag);
+    unsigned bt_rects[10];
+    hd_texture_pack_diag_first_rects(bt_rects);
+    char last_path[512];
+    unsigned last_info[7];
+    hd_texture_pack_diag_last_match(last_path, sizeof(last_path), last_info);
+    char last_path_json[1024];
+    json_escape_string(last_path_json, sizeof(last_path_json), last_path);
+    uint64_t font_region[5];
+    hd_texture_pack_diag_font_region_stats(font_region);
+    const int active = gpu_hd_texture_get_backend();
+    const char *active_name = active == 1 ? "beetle" : active == 2 ? "none" : "duckstation";
+    send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\","
+             "\"duckstation\":{\"entries\":%u,\"unique_hashes\":%u},"
+             "\"beetle\":{\"entries\":%u,\"unique_keys\":%u,\"ambiguous_keys\":%u,"
+             "\"track_stats\":{\"calls\":%llu,\"ok\":%llu},"
+             "\"match_stats\":{\"attempts\":%llu,\"none\":%llu,\"ambiguous\":%llu,"
+             "\"error\":%llu,\"matched\":%llu},"
+             "\"diag\":{\"no_candidates\":%llu,\"no_hash_match\":%llu,\"not_covered\":%llu,"
+             "\"first_query\":{\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u,\"captured\":%u},"
+             "\"first_upload\":{\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u,\"captured\":%u}},"
+             "\"last_match\":{\"path\":\"%s\",\"texture_hash\":%u,\"palette_hash\":%u,"
+             "\"query_x\":%u,\"query_y\":%u,\"query_w\":%u,\"query_h\":%u,"
+             "\"upload_serial\":%u},"
+             "\"font_region_diag\":{\"font_hash_seen\":%llu,\"region_touches\":%llu,"
+             "\"region_last_hash\":%llu,\"region_last_serial\":%llu}}}",
+             id, active_name,
+             ds_entries, ds_hashes, bt_entries, bt_unique, bt_ambiguous,
+             (unsigned long long)bt_track[0], (unsigned long long)bt_track[1],
+             (unsigned long long)bt_stats[0], (unsigned long long)bt_stats[1],
+             (unsigned long long)bt_stats[2], (unsigned long long)bt_stats[3],
+             (unsigned long long)bt_stats[4],
+             (unsigned long long)bt_diag[0], (unsigned long long)bt_diag[1],
+             (unsigned long long)bt_diag[2],
+             bt_rects[0], bt_rects[1], bt_rects[2], bt_rects[3], bt_rects[4],
+             bt_rects[5], bt_rects[6], bt_rects[7], bt_rects[8], bt_rects[9],
+             last_path_json, last_info[0], last_info[1],
+             last_info[2], last_info[3], last_info[4], last_info[5], last_info[6],
+             (unsigned long long)font_region[0], (unsigned long long)font_region[1],
+             (unsigned long long)font_region[2], (unsigned long long)font_region[3]);
+}
+
+/* 2026-09-07 investigation: list every currently-tracked Beetle-backend
+ * upload (serial/hash/bounds). Only meant for the small handful of uploads
+ * a real session produces (CPU->VRAM DMA and VRAM->VRAM copies are rare --
+ * most PS1 texture data loads once from disc into the render pipeline
+ * directly). See hd_texture_pack_diag_dump_uploads. */
+static void handle_hd_uploads_dump(int id, const char *json)
+{
+    (void)json;
+    const size_t cap = 8 * 1024 * 1024;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    gpu_hd_texture_pack_dump_uploads(buf, cap);
+    send_fmt("{\"id\":%d,\"ok\":true,\"uploads\":[%s]}", id, buf);
+    free(buf);
+}
+
+static void handle_hd_match_ring(int id, const char *json)
+{
+    (void)json;
+    static char buf[131072];
+    gpu_hd_texture_pack_dump_match_ring(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"recent_matches\":[%s]}", id, buf);
+}
+
 static void handle_hdtex_recent(int id, const char *json)
 {
     int n = json_get_int(json, "count", 16);
@@ -13684,6 +13825,10 @@ static const CmdEntry s_commands[] = {
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
+    { "hd_backend",        handle_hd_backend },
+    { "hd_reload_paths",   handle_hd_reload_paths },
+    { "hd_uploads_dump",   handle_hd_uploads_dump },
+    { "hd_match_ring",     handle_hd_match_ring },
     { "hdtex_recent",      handle_hdtex_recent },
     { "geom_correction",   handle_geom_correction },
     { "ws_cull_diag",      handle_ws_cull_diag },

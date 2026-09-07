@@ -1,0 +1,226 @@
+/* psx_texpack_menu.c - HD texture-replacement pack switcher overlay.
+ * Sibling of psx_savestate_menu.c: same rasterize-to-ARGB8888 pattern (own
+ * tiny font + primitives, kept self-contained rather than sharing code with
+ * that module, matching its own existing convention). */
+
+#include "psx_texpack_menu.h"
+
+#include "gpu.h"
+#include "host_keymap.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#define TPM_W 640
+#define TPM_H 480
+#define TPM_ROW_H 108
+#define TPM_ROW_GAP 6
+#define TPM_ROWS_Y 58
+#define TPM_ROWS_X 28
+#define TPM_ROWS_W 584
+#define TPM_BACKEND_COUNT 3
+
+/* Public-domain 8x8 ASCII 32..90 subset from font8x8_basic -- same glyph
+ * data as psx_savestate_menu.c's FONT8, duplicated rather than shared (see
+ * the file comment above). */
+static const uint8_t FONT8[59][8] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
+    {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
+    {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
+    {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00},
+    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
+    {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00},
+    {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},
+    {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
+    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
+    {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
+    {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
+    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06},
+    {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00},
+    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00},
+    {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},
+    {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00},
+    {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, {0x7F,0x06,0x06,0x3E,0x06,0x06,0x7F,0x00},
+    {0x7F,0x06,0x06,0x3E,0x06,0x06,0x06,0x00}, {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00},
+    {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
+    {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00},
+    {0x06,0x06,0x06,0x06,0x06,0x06,0x7F,0x00}, {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00},
+    {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00},
+    {0x3F,0x66,0x66,0x3E,0x06,0x06,0x06,0x00}, {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00},
+    {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00},
+    {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00},
+    {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
+    {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00},
+    {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00},
+};
+
+static int s_open;
+static int s_selected;
+static int s_dirty = 1;
+static uint32_t s_panel[TPM_W * TPM_H];
+
+static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
+{
+    int x, y;
+    if (x0 < 0) { w += x0; x0 = 0; }
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (x0 + w > TPM_W) w = TPM_W - x0;
+    if (y0 + h > TPM_H) h = TPM_H - y0;
+    if (w <= 0 || h <= 0) return;
+    for (y = y0; y < y0 + h; y++)
+        for (x = x0; x < x0 + w; x++)
+            dst[y * TPM_W + x] = col;
+}
+
+static void stroke_rect(uint32_t *dst, int x, int y, int w, int h, uint32_t col)
+{
+    fill_rect(dst, x, y, w, 1, col);
+    fill_rect(dst, x, y + h - 1, w, 1, col);
+    fill_rect(dst, x, y, 1, h, col);
+    fill_rect(dst, x + w - 1, y, 1, h, col);
+}
+
+static void draw_char(uint32_t *dst, int x0, int y0, char c,
+                      uint32_t col, int scale)
+{
+    int x, y, sx, sy;
+    const uint8_t *g;
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    if (c < 32 || c > 90) c = '?';
+    g = FONT8[(int)c - 32];
+    for (y = 0; y < 8; y++) {
+        uint8_t row = g[y];
+        for (x = 0; x < 8; x++) {
+            if ((row & (1u << x)) == 0) continue;
+            for (sy = 0; sy < scale; sy++)
+                for (sx = 0; sx < scale; sx++) {
+                    int dx = x0 + x * scale + sx;
+                    int dy = y0 + y * scale + sy;
+                    if ((unsigned)dx < TPM_W && (unsigned)dy < TPM_H)
+                        dst[dy * TPM_W + dx] = col;
+                }
+        }
+    }
+}
+
+static void draw_text(uint32_t *dst, int x, int y, const char *s,
+                      uint32_t col, int scale)
+{
+    if (!s) return;
+    while (*s) {
+        draw_char(dst, x, y, *s++, col, scale);
+        x += 8 * scale;
+    }
+}
+
+static void rasterize_panel(void)
+{
+    int i;
+    char buf[96];
+    char key[32];
+    /* Indexed by gpu_hd_texture_set_backend() value (0=duckstation,
+     * 1=beetle, 2=none) -- see kSlotToBackend below for the menu's own
+     * display order, which lists Original first. */
+    static const char *const kNames[TPM_BACKEND_COUNT] = {
+        "DUCKSTATION FORMAT", "BEETLE PSX HW FORMAT", "ORIGINAL (NO HD PACK)"
+    };
+    /* Menu slot i (display/cursor order) -> backend value. Original first,
+     * matching main.cpp's texpack_menu_selected slot numbering. */
+    static const int kSlotToBackend[TPM_BACKEND_COUNT] = { 2, 0, 1 };
+
+    for (i = 0; i < TPM_W * TPM_H; i++)
+        s_panel[i] = 0xFF0F1118u;
+
+    fill_rect(s_panel, 0, 0, TPM_W, 46, 0xFF171B25u);
+    draw_text(s_panel, 24, 14, "HD TEXTURE PACK", 0xFFFFD24Du, 2);
+    host_keymap_label(HOST_KEYMAP_TEXPACK_MENU, key, sizeof(key));
+    snprintf(buf, sizeof(buf), "%s MENU", key[0] ? key : "F10");
+    draw_text(s_panel, 400, 18, buf, 0xFFB8BDC8u, 1);
+
+    for (i = 0; i < TPM_BACKEND_COUNT; i++) {
+        const int backend = kSlotToBackend[i];
+        int y = TPM_ROWS_Y + i * (TPM_ROW_H + TPM_ROW_GAP);
+        int sel = (i == s_selected);
+        uint32_t bg = sel ? 0xFF2B2830u : 0xFF191D27u;
+        uint32_t fg = sel ? 0xFFFFD24Du : 0xFFE2E5EBu;
+        uint32_t sub = sel ? 0xFFFFFFFFu : 0xFFB2B8C2u;
+        uint32_t entry_count = 0, hash_or_key_count = 0, ambiguous_count = 0;
+
+        fill_rect(s_panel, TPM_ROWS_X, y, TPM_ROWS_W, TPM_ROW_H, bg);
+        stroke_rect(s_panel, TPM_ROWS_X, y, TPM_ROWS_W, TPM_ROW_H,
+                    sel ? 0xFFFFD24Du : 0xFF303746u);
+        draw_text(s_panel, TPM_ROWS_X + 18, y + 18, kNames[backend], fg, 1);
+
+        if (backend == 0) {
+            gpu_hd_texture_dump_info(&entry_count, &hash_or_key_count);
+            snprintf(buf, sizeof(buf), "%u REPLACEMENT PNG(S), %u UNIQUE UPLOAD HASH(ES)",
+                     entry_count, hash_or_key_count);
+        } else if (backend == 1) {
+            gpu_hd_texture_pack_info(&entry_count, &hash_or_key_count, &ambiguous_count);
+            snprintf(buf, sizeof(buf), "%u REPLACEMENT PNG(S), %u UNIQUE KEY(S), %u AMBIGUOUS",
+                     entry_count, hash_or_key_count, ambiguous_count);
+        } else {
+            snprintf(buf, sizeof(buf), "NATIVE PS1 TEXTURES, NO HD REPLACEMENT");
+        }
+        draw_text(s_panel, TPM_ROWS_X + 18, y + 46, buf, sub, 1);
+        if (backend == 2)
+            draw_text(s_panel, TPM_ROWS_X + 18, y + 74, "ALWAYS AVAILABLE", 0xFF8BE28Bu, 1);
+        else
+            draw_text(s_panel, TPM_ROWS_X + 18, y + 74,
+                      entry_count ? "LOADED" : "NOT CONFIGURED (settings.toml [textures])",
+                      entry_count ? 0xFF8BE28Bu : 0xFFB2727Cu, 1);
+        if (sel && backend == 1)
+            draw_text(s_panel, TPM_ROWS_X + TPM_ROWS_W - 216, y + 82,
+                      "F: CHOOSE FONT", 0xFF8BE2E0u, 1);
+        if (sel)
+            draw_text(s_panel, TPM_ROWS_X + TPM_ROWS_W - 88, y + 82,
+                      "SELECT", 0xFFFFD24Du, 1);
+    }
+
+    fill_rect(s_panel, 0, 410, TPM_W, 70, 0xFF171B25u);
+    draw_text(s_panel, 32, 428,
+              "ACTIVE:", 0xFFE2E5EBu, 1);
+    draw_text(s_panel, 120, 428, kNames[gpu_hd_texture_get_backend()], 0xFFFFD24Du, 1);
+    draw_text(s_panel, 32, 454,
+              "KEYS: ARROWS SELECT  ENTER CONFIRM  ESC BACK",
+              0xFFB8BDC8u, 1);
+    s_dirty = 0;
+}
+
+void psx_texpack_menu_set_state(int open, int selected_backend)
+{
+    if (selected_backend < 0) selected_backend = 0;
+    if (selected_backend >= TPM_BACKEND_COUNT) selected_backend = TPM_BACKEND_COUNT - 1;
+    if (s_open != (open ? 1 : 0) || s_selected != selected_backend)
+        s_dirty = 1;
+    s_open = open ? 1 : 0;
+    s_selected = selected_backend;
+}
+
+int psx_texpack_menu_needs_present(void)
+{
+    return s_open;
+}
+
+int psx_texpack_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
+{
+    if (!s_open) {
+        if (pixels) *pixels = NULL;
+        if (w) *w = 0;
+        if (h) *h = 0;
+        return 0;
+    }
+    /* The active backend can change while the menu is open (SELECT applies
+     * immediately, see main.cpp's texpack_menu_submit) and the ACTIVE row at
+     * the bottom must track it, so repaint every frame while open rather
+     * than only on selection-cursor movement. Cheap: TPM_W*TPM_H fills, no
+     * decode/IO, same cost class as psx_savestate_menu's dirty repaint. */
+    (void)s_dirty;
+    rasterize_panel();
+    if (pixels) *pixels = s_panel;
+    if (w) *w = TPM_W;
+    if (h) *h = TPM_H;
+    return 1;
+}

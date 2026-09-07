@@ -235,6 +235,13 @@ def build_cmd(args):
         if len(args) < 2:
             return None, lambda _: "Usage: load_state <slot>"
         return {"cmd": "savestate", "op": "load", "slot": int(args[1])}, pretty_json
+    elif cmd == "hd_backend":
+        # Live-switch which HD texture-replacement pack is active
+        # (duckstation|beetle|none), or omit the arg to just read the current one.
+        d = {"cmd": "hd_backend"}
+        if len(args) > 1:
+            d["backend"] = args[1]
+        return d, pretty_json
     elif cmd == "ws_cull_diag":
         # Is [widescreen.cull] auto_screen_x's instruction-pattern detector
         # even seeing this title's screen-reject checks? seen vs qualified

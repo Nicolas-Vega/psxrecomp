@@ -23,6 +23,8 @@
 #include "savestate.h"
 #include "psx_rewind.h"
 #include "psx_savestate_menu.h"
+#include "psx_texpack_menu.h"
+#include "psx_font_picker_menu.h"
 #include "host_osd.h"
 #include "host_keymap.h"
 #include "png_write.h"       /* png_write_rgb — present_shot readback */
@@ -1150,6 +1152,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
     psx_smooth_60fps_set(enabled);
 }
 #endif
+
+/* [textures] hd_pack_dir / hd_pack_dir_beetle / hd_backend (settings.toml —
+ * local machine paths, so they live there rather than game.toml, same
+ * reasoning as [bios] path): two independent HD texture-replacement pack
+ * formats (DuckStation XXH3-64, Beetle PSX HW CRC32-32 -- not
+ * interchangeable, see gpu.h's gpu_hd_texture_set_backend) may both be
+ * configured; hd_backend picks which one is actually consulted.
+ * PSXRECOMP_HD_TEXTURE_DUMP_ROOT still overrides the DuckStation path when
+ * set, for a quick A/B without touching settings. */
+static std::string   g_hd_texture_pack_dir;
+static std::string   g_hd_texture_pack_dir_beetle;
+static std::string   g_hd_texture_backend_setting;  /* "duckstation" (default), "beetle", or "none" */
 
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
@@ -6223,6 +6237,565 @@ static void savestate_menu_poll_nav(uint32_t now_ms) {
     }
 }
 
+/* Shift+Escape (HOST_KEYMAP_RESTART_GAME): kill this process and launch a
+ * brand-new instance with the same command line -- a full "start from 0"
+ * that also resets the host process itself (fresh GL context, HD-texture
+ * trackers, rewind ring, ...), not just an in-emulator soft reset. Shift is
+ * required by the bind's default (see host_keymap.c) so a stray Escape
+ * (which the savestate/texpack menus already treat as "close") never nukes
+ * the session by accident. g_restart_argc/argv are captured once at the top
+ * of main() so a restart replays the exact args this instance was launched
+ * with. */
+static int g_restart_argc = 0;
+static char** g_restart_argv = nullptr;
+
+static void hard_restart_game(void) {
+    wchar_t exe_path[MAX_PATH * 4];
+    DWORD n = GetModuleFileNameW(NULL, exe_path,
+                                 (DWORD)(sizeof(exe_path) / sizeof(exe_path[0])));
+    if (n == 0 || n >= (DWORD)(sizeof(exe_path) / sizeof(exe_path[0]))) {
+        std::fprintf(stderr, "psxrecomp: restart failed: GetModuleFileNameW\n");
+        return;
+    }
+    std::wstring cmd = L"\"" + std::wstring(exe_path) + L"\"";
+    for (int i = 1; i < g_restart_argc; i++) {
+        if (!g_restart_argv || !g_restart_argv[i]) continue;
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, g_restart_argv[i], -1, nullptr, 0);
+        if (wlen <= 0) continue;
+        std::wstring warg(static_cast<size_t>(wlen), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, g_restart_argv[i], -1, warg.data(), wlen);
+        while (!warg.empty() && warg.back() == L'\0') warg.pop_back();
+        cmd += L" \"" + warg + L"\"";
+    }
+    std::fprintf(stderr, "psxrecomp: restarting game (Shift+Escape)\n");
+    std::fflush(stderr);
+
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    std::memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    std::memset(&pi, 0, sizeof(pi));
+    std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+    cmd_buf.push_back(L'\0');
+    if (!CreateProcessW(NULL, cmd_buf.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        std::fprintf(stderr, "psxrecomp: restart failed: CreateProcessW error %lu\n",
+                     (unsigned long)GetLastError());
+        return;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    debug_server_shutdown();  /* release the TCP port before the new instance rebinds it */
+    std::exit(0);
+}
+
+/* HD texture-replacement pack switcher (F10 default, HOST_KEYMAP_TEXPACK_MENU;
+ * see psx_texpack_menu.h). Simpler than the save-state menu above: only two
+ * fixed options (no slot numbers/thumbnails/save-vs-load distinction), and
+ * moving the cursor applies gpu_hd_texture_set_backend() IMMEDIATELY rather
+ * than needing a separate confirm step -- switching is cheap and instantly
+ * reversible, so there is no reason to make the user commit to see the
+ * result. The pause loop mirrors savestate_menu_host_pause_loop() (freezes
+ * simulation, keeps presenting) so the frozen scene is a clean side-by-side:
+ * the character/camera hold still while arrow keys flip the active pack and
+ * the very next presented frame already reflects it (PS1 rendering redraws
+ * the whole scene every frame; there is no persistent framebuffer region to
+ * explicitly invalidate). Keyboard-only for now, unlike the gamepad-capable
+ * save-state menu -- a gamepad binding can follow the same
+ * hotkey_pad_binding_down() pattern later if wanted. */
+static int texpack_menu_open = 0;
+/* Menu SLOT (display order: 0=Original, 1=DuckStation, 2=Beetle), not the
+ * gpu_hd_texture_set_backend() value (0=duckstation, 1=beetle, 2=none) --
+ * those two orderings differ on purpose (Original listed first in the menu
+ * while keeping the existing on-disk/wire backend numbering stable), so
+ * every read/write of the active backend goes through the slot<->backend
+ * maps right below instead of assuming they match. */
+static int texpack_menu_selected = 0;
+static SDL_Keycode texpack_menu_open_key = 0;
+
+static const int kTexpackSlotToBackend[3] = { 2, 0, 1 };
+static int texpack_backend_to_slot(int backend) {
+    for (int slot = 0; slot < 3; slot++)
+        if (kTexpackSlotToBackend[slot] == backend) return slot;
+    return 0;
+}
+
+static void texpack_menu_sync_overlay(void) {
+    psx_texpack_menu_set_state(texpack_menu_open, texpack_menu_selected);
+}
+
+static void texpack_menu_close(void) {
+    texpack_menu_open = 0;
+    texpack_menu_sync_overlay();
+    host_osd_push("Texture pack menu closed", 800);
+}
+
+static void texpack_menu_toggle(SDL_Keycode opened_by_key) {
+    if (psx_rewind_is_open() || savestate_menu_open)
+        return;
+    if (texpack_menu_open) {
+        texpack_menu_close();
+        return;
+    }
+    texpack_menu_selected = texpack_backend_to_slot(gpu_hd_texture_get_backend());
+    texpack_menu_open = 1;
+    texpack_menu_open_key = opened_by_key;
+    texpack_menu_sync_overlay();
+}
+
+static void texpack_menu_move(int delta) {
+    texpack_menu_selected = (texpack_menu_selected + delta + 3) % 3;
+    gpu_hd_texture_set_backend(kTexpackSlotToBackend[texpack_menu_selected]);
+    /* Warm the newly-active backend's GL texture cache right away rather
+     * than letting the first frames that reach each not-yet-seen texture
+     * pay a synchronous decode -- see gpu_hd_texture_preload_active's
+     * comment. The menu's own pause loop is already frozen/modal, so a
+     * brief stall here (worst case, the full Beetle pack) reads as part of
+     * "switching," not as an unexplained freeze during gameplay. */
+    gpu_hd_texture_preload_active();
+    texpack_menu_sync_overlay();
+    static const char *const kOsdNames[3] = {
+        "HD textures: off (original PS1 textures)",
+        "HD textures: DuckStation format",
+        "HD textures: Beetle PSX HW format",
+    };
+    host_osd_push(kOsdNames[texpack_menu_selected], 900);
+}
+
+/* Opens the font-picker overlay and blocks (its own nested pause loop,
+ * mirroring texpack_menu_host_pause_loop) until the user closes it, so
+ * control returns here with texpack_menu_open still 1 and the outer
+ * texpack_menu_host_pause_loop none the wiser -- exactly one handler ever
+ * owns keyboard input at a time. Defined below, after rewind_pause_present
+ * (font_picker_generate_selected needs it to force the "GENERATING..."
+ * frame to actually present before blocking on the child process). */
+static void font_picker_run(void);
+
+static void texpack_menu_handle_key(SDL_Keycode key, SDL_Scancode scancode,
+                                    int mod, int repeat) {
+    if (repeat) return;
+    if (texpack_menu_open_key && key == texpack_menu_open_key) return;
+    /* Beetle row only (slot 2, see kTexpackSlotToBackend): "choose a font"
+     * only makes sense for the Beetle-format pack, since that's the one
+     * generate_font_pack.py's f98b3634-*.png convention targets. */
+    if (key == SDLK_f && texpack_menu_selected == 2) {
+        font_picker_run();
+        return;
+    }
+    if (host_keymap_match_event(HOST_KEYMAP_TEXPACK_MENU, (int)key,
+                                (int)scancode, mod) ||
+        key == SDLK_ESCAPE || key == SDLK_BACKSPACE ||
+        key == SDLK_RETURN || key == SDLK_SPACE) {
+        texpack_menu_close();
+    } else if (key == SDLK_LEFT || key == SDLK_UP) {
+        texpack_menu_move(-1);
+    } else if (key == SDLK_RIGHT || key == SDLK_DOWN) {
+        texpack_menu_move(+1);
+    }
+}
+
+/* ---- HD font-pack generator (F key inside the texpack menu, Beetle row) ----
+ * Lists every TrueType font installed on the machine and, on ENTER, spawns
+ * generate_font_pack.py to regenerate the dialogue/menu font using it, then
+ * hot-reloads the 4 affected textures (gpu_hd_texture_pack_reload_paths) so
+ * the change is visible immediately -- no relaunch. See
+ * docs/HD_FONT_GENERATOR.md for the generator itself and the font page's
+ * layout; this is purely the in-game front end for it.
+ *
+ * Dev-machine paths (script location, pack directory) are hardcoded the
+ * same way generate_font_pack.py's own DEFAULT_PACK_DIR is -- this feature
+ * depends on a local python3+Pillow install and a known project layout, so
+ * it was never going to be portable to an arbitrary player's machine
+ * regardless; see the doc for why that trade was made deliberately rather
+ * than reimplementing TrueType rasterization natively. */
+/* One row in the picker per FONT FAMILY (not per file) -- Windows ships
+ * bold/italic/bold-italic weights as separate .ttf files (comic.ttf,
+ * comicbd.ttf, comici.ttf, comicz.ttf all being "Comic Sans MS"), which
+ * would otherwise bloat the list with near-duplicate entries. Grouping is
+ * by each file's own reported family name + macStyle bits (read straight
+ * from its 'name'/'head' sfnt tables, see ttf_read_family_and_style) --
+ * not filename heuristics, which vary by font vendor and would be wrong
+ * as often as right. */
+struct FontPickerEntry {
+    std::string display_name;
+    std::string regular_path, bold_path, italic_path, bold_italic_path;
+    /* Picks the best file for (want_bold, want_italic) and reports the
+     * ACTUAL style of whichever file it picked (out_file_is_bold/italic) --
+     * not just whether the request was satisfied exactly -- so the caller
+     * knows precisely which of bold/italic (if either) still needs to be
+     * FAKED on top (stroke-width / shear synthesis) versus is already
+     * genuinely that weight and needs no synthesis at all. Falls back to
+     * whatever file exists if the family doesn't ship the requested
+     * combination, rather than failing outright. */
+    const std::string *best_path(bool want_bold, bool want_italic,
+                                 bool *out_file_is_bold, bool *out_file_is_italic) const {
+        struct Candidate { const std::string *path; bool b, i; };
+        const Candidate exact_order[4] = {
+            {&bold_italic_path, true, true}, {&bold_path, true, false},
+            {&italic_path, false, true}, {&regular_path, false, false},
+        };
+        for (const auto &c : exact_order) {
+            if (c.b == want_bold && c.i == want_italic && !c.path->empty()) {
+                if (out_file_is_bold) *out_file_is_bold = c.b;
+                if (out_file_is_italic) *out_file_is_italic = c.i;
+                return c.path;
+            }
+        }
+        for (const auto &c : exact_order) {
+            if (!c.path->empty()) {
+                if (out_file_is_bold) *out_file_is_bold = c.b;
+                if (out_file_is_italic) *out_file_is_italic = c.i;
+                return c.path;
+            }
+        }
+        if (out_file_is_bold) *out_file_is_bold = false;
+        if (out_file_is_italic) *out_file_is_italic = false;
+        return &regular_path; /* unreachable in practice -- every entry has >=1 path */
+    }
+};
+static std::vector<FontPickerEntry> font_picker_entries;
+static int font_picker_open = 0;
+static int font_picker_cursor = 0;   /* absolute index into font_picker_entries */
+static int font_picker_scroll = 0;   /* index of the first visible row */
+static int font_picker_busy = 0;
+static int font_picker_want_bold = 0;
+static int font_picker_want_italic = 0;
+static char font_picker_status[128] = {0};
+static SDL_Keycode font_picker_open_key = 0;
+#define FONT_PICKER_VISIBLE_ROWS 16
+
+#ifdef _WIN32
+/* Minimal sfnt 'name'/'head' table reader: enough to get a font file's
+ * family name (nameID 1, falling back to 16 "typographic family" if
+ * present) and its bold/italic flags (head.macStyle bits 0/1) without a
+ * full font-parsing library. Windows-only, matching the rest of this
+ * feature's Windows-only scope. Returns 0 on any parse failure (caller
+ * treats such a file as unusable rather than guessing). */
+static uint16_t ttf_be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+static uint32_t ttf_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Looks up one codepoint in a 'cmap' subtable (format 4, the common BMP
+ * case, or format 12 for astral-plane-capable fonts) and returns whether
+ * it maps to a real (nonzero) glyph. Just enough to answer "does this font
+ * actually have basic Latin letters" -- symbol/icon fonts like Marlett
+ * mostly don't define anything outside a curated set of icon codepoints,
+ * so 'A' comes back unmapped. */
+static bool ttf_cmap_subtable_has_glyph(const uint8_t *d, size_t len, size_t sub_off,
+                                        uint32_t codepoint) {
+    if (sub_off + 2 > len) return false;
+    uint16_t format = ttf_be16(d + sub_off);
+    if (format == 4) {
+        if (sub_off + 14 > len) return false;
+        uint16_t seg_x2 = ttf_be16(d + sub_off + 6);
+        uint16_t seg_count = seg_x2 / 2;
+        size_t end_codes = sub_off + 14;
+        size_t start_codes = end_codes + seg_x2 + 2; /* +2 skips reservedPad */
+        size_t id_deltas = start_codes + seg_x2;
+        size_t id_range_offs = id_deltas + seg_x2;
+        if (id_range_offs + seg_x2 > len) return false;
+        for (uint16_t i = 0; i < seg_count; i++) {
+            uint16_t end = ttf_be16(d + end_codes + i * 2);
+            if (codepoint > end) continue;
+            uint16_t start = ttf_be16(d + start_codes + i * 2);
+            if (codepoint < start) return false;
+            uint16_t id_range_off = ttf_be16(d + id_range_offs + i * 2);
+            if (id_range_off == 0) {
+                int16_t delta = (int16_t)ttf_be16(d + id_deltas + i * 2);
+                return (uint16_t)(codepoint + delta) != 0;
+            }
+            size_t glyph_addr = id_range_offs + i * 2 + id_range_off +
+                                (size_t)(codepoint - start) * 2;
+            if (glyph_addr + 2 > len) return false;
+            uint16_t glyph = ttf_be16(d + glyph_addr);
+            if (glyph == 0) return false;
+            int16_t delta = (int16_t)ttf_be16(d + id_deltas + i * 2);
+            return (uint16_t)(glyph + delta) != 0;
+        }
+        return false;
+    }
+    if (format == 12) {
+        if (sub_off + 16 > len) return false;
+        uint32_t num_groups = ttf_be32(d + sub_off + 12);
+        size_t groups = sub_off + 16;
+        for (uint32_t i = 0; i < num_groups; i++) {
+            size_t g = groups + (size_t)i * 12;
+            if (g + 12 > len) break;
+            uint32_t start = ttf_be32(d + g), end = ttf_be32(d + g + 4);
+            if (codepoint >= start && codepoint <= end) return true;
+        }
+        return false;
+    }
+    return false; /* unsupported subtable format -- treat as "no glyph" */
+}
+
+static bool ttf_has_basic_latin(const uint8_t *d, size_t len, size_t cmap_off) {
+    if (cmap_off + 4 > len) return false;
+    uint16_t num_subtables = ttf_be16(d + cmap_off + 2);
+    size_t best_sub = 0;
+    int best_score = -1;
+    for (uint16_t i = 0; i < num_subtables; i++) {
+        size_t rec = cmap_off + 4 + (size_t)i * 8;
+        if (rec + 8 > len) break;
+        uint16_t platform_id = ttf_be16(d + rec), encoding_id = ttf_be16(d + rec + 2);
+        uint32_t sub_off = ttf_be32(d + rec + 4);
+        /* Prefer Windows Unicode BMP (3,1), then Windows Unicode full (3,10). */
+        int score = (platform_id == 3 && encoding_id == 1) ? 2
+                  : (platform_id == 3 && encoding_id == 10) ? 1 : 0;
+        if (score > best_score) { best_score = score; best_sub = cmap_off + sub_off; }
+    }
+    if (best_score < 0) return false;
+    return ttf_cmap_subtable_has_glyph(d, len, best_sub, 'A') &&
+           ttf_cmap_subtable_has_glyph(d, len, best_sub, 'a');
+}
+
+static int ttf_read_family_and_style(const char *path, std::string *out_family,
+                                     int *out_bold, int *out_italic, int *out_has_letters) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len < 12 || len > 64 * 1024 * 1024) { fclose(f); return 0; }
+    std::vector<uint8_t> buf((size_t)len);
+    size_t rd = fread(buf.data(), 1, (size_t)len, f);
+    fclose(f);
+    if (rd != (size_t)len) return 0;
+    const uint8_t *d = buf.data();
+
+    /* .ttc collections: use the first face's offset table. */
+    size_t sfnt_off = 0;
+    if (len >= 16 && memcmp(d, "ttcf", 4) == 0)
+        sfnt_off = ttf_be32(d + 12);
+    if (sfnt_off + 12 > (size_t)len) return 0;
+
+    uint16_t num_tables = ttf_be16(d + sfnt_off + 4);
+    size_t dir = sfnt_off + 12;
+    uint32_t name_off = 0, name_len = 0, head_off = 0, cmap_off = 0;
+    for (uint16_t i = 0; i < num_tables; i++) {
+        size_t rec = dir + (size_t)i * 16;
+        if (rec + 16 > (size_t)len) break;
+        if (memcmp(d + rec, "name", 4) == 0) {
+            name_off = ttf_be32(d + rec + 8);
+            name_len = ttf_be32(d + rec + 12);
+        } else if (memcmp(d + rec, "head", 4) == 0) {
+            head_off = ttf_be32(d + rec + 8);
+        } else if (memcmp(d + rec, "cmap", 4) == 0) {
+            cmap_off = ttf_be32(d + rec + 8);
+        }
+    }
+    if (!name_off || head_off + 46 > (size_t)len) return 0;
+
+    if (out_bold) *out_bold = (ttf_be16(d + head_off + 44) & 0x1) ? 1 : 0;
+    if (out_italic) *out_italic = (ttf_be16(d + head_off + 44) & 0x2) ? 1 : 0;
+    if (out_has_letters)
+        *out_has_letters = (cmap_off && ttf_has_basic_latin(d, (size_t)len, cmap_off)) ? 1 : 0;
+
+    if (name_off + 6 > (size_t)len) return 0;
+    uint16_t rec_count = ttf_be16(d + name_off + 2);
+    uint16_t storage_off = ttf_be16(d + name_off + 4);
+    std::string best;
+    int best_score = -1;
+    for (uint16_t i = 0; i < rec_count; i++) {
+        size_t rec = name_off + 6 + (size_t)i * 12;
+        if (rec + 12 > (size_t)len) break;
+        uint16_t platform_id = ttf_be16(d + rec + 0);
+        uint16_t lang_id     = ttf_be16(d + rec + 4);
+        uint16_t name_id     = ttf_be16(d + rec + 6);
+        uint16_t str_len     = ttf_be16(d + rec + 8);
+        uint16_t str_off     = ttf_be16(d + rec + 10);
+        if (name_id != 1 && name_id != 16) continue;   /* Family, or Typographic Family */
+        if (platform_id != 3) continue;                /* Windows platform, UTF-16BE strings */
+        size_t str_pos = (size_t)name_off + storage_off + str_off;
+        if (str_pos + str_len > (size_t)len || name_len == 0) continue;
+        std::string s;
+        s.reserve(str_len / 2);
+        for (uint16_t b = 0; b + 1 < str_len; b += 2) {
+            uint16_t cu = ttf_be16(d + str_pos + b);
+            s.push_back(cu < 128 ? (char)cu : '?');    /* ASCII only -- FONT8 can't render more */
+        }
+        /* Prefer nameID 16 (typographic family, e.g. groups "Arial Black"
+         * under "Arial" the way Windows' own font picker does) and en-US
+         * over other languages; ties keep the first match found. */
+        int score = (name_id == 16 ? 2 : 0) + (lang_id == 0x0409 ? 1 : 0);
+        if (score > best_score) {
+            best = s;
+            best_score = score;
+        }
+    }
+    if (best.empty()) return 0;
+    *out_family = best;
+    return 1;
+}
+#endif /* _WIN32 */
+static const char kFontPackDir[] =
+    "D:\\RecompWork\\Sources\\Vagrant Story (USA)-texture-replacements";
+static const char kFontPackGeneratorScript[] =
+    "D:\\RecompWork\\VagrantStoryRecomp\\psxrecomp\\tools\\generate_font_pack.py";
+static const char *const kFontPackVariantFiles[4] = {
+    "f98b3634-876b1c17.png", "f98b3634-4e0a4ea7.png",
+    "f98b3634-1443be53.png", "f98b3634-d4354028.png",
+};
+
+/* Classic Windows dingbat fonts that remap ordinary A-Z/a-z codepoints to
+ * icon glyphs instead of leaving them unmapped -- ttf_has_basic_latin's
+ * "does 'A' resolve to a real glyph" test can't tell those apart from an
+ * actual text font (the codepoint IS mapped, just to a picture), so they
+ * need a name-based denylist on top of that general check. Marlett itself
+ * doesn't need to be here (it leaves A-Z unmapped, so the cmap check alone
+ * already excludes it), but is listed anyway as a belt-and-suspenders
+ * safety net in case some system's copy differs. */
+static bool font_picker_is_denylisted(const std::string &family) {
+    static const char *const kDenylist[] = {
+        "wingdings", "wingdings 2", "wingdings 3", "webdings", "symbol", "marlett",
+    };
+    std::string key = family;
+    for (char &c : key) c = (char)tolower((unsigned char)c);
+    for (const char *deny : kDenylist)
+        if (key == deny) return true;
+    return false;
+}
+
+static void font_picker_scan_fonts(void) {
+    font_picker_entries.clear();
+#ifdef _WIN32
+    /* family name (lowercased) -> index into font_picker_entries, so files
+     * belonging to the same family (however many weight variants) collapse
+     * into one row instead of one-row-per-file. */
+    std::unordered_map<std::string, size_t> by_family;
+    static const char *const patterns[] = {
+        "C:\\Windows\\Fonts\\*.ttf", "C:\\Windows\\Fonts\\*.otf", "C:\\Windows\\Fonts\\*.ttc",
+    };
+    for (int p = 0; p < 3; p++) {
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(patterns[p], &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::string path = std::string("C:\\Windows\\Fonts\\") + fd.cFileName;
+            std::string family;
+            int is_bold = 0, is_italic = 0, has_letters = 0;
+            if (!ttf_read_family_and_style(path.c_str(), &family, &is_bold, &is_italic, &has_letters))
+                continue;   /* unparseable -- skip rather than guess a name */
+            if (!has_letters || font_picker_is_denylisted(family))
+                continue;   /* symbol/icon-only font -- would render blank/wrong for text */
+
+            std::string key = family;
+            for (char &c : key) c = (char)tolower((unsigned char)c);
+            auto it = by_family.find(key);
+            size_t idx;
+            if (it == by_family.end()) {
+                idx = font_picker_entries.size();
+                FontPickerEntry e;
+                e.display_name = family;
+                font_picker_entries.push_back(e);
+                by_family[key] = idx;
+            } else {
+                idx = it->second;
+            }
+            FontPickerEntry &e = font_picker_entries[idx];
+            std::string *slot = is_bold && is_italic ? &e.bold_italic_path
+                               : is_bold             ? &e.bold_path
+                               : is_italic            ? &e.italic_path
+                                                       : &e.regular_path;
+            if (slot->empty()) *slot = path;   /* first file for this slot wins */
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    std::sort(font_picker_entries.begin(), font_picker_entries.end(),
+              [](const FontPickerEntry &a, const FontPickerEntry &b) {
+                  return _stricmp(a.display_name.c_str(), b.display_name.c_str()) < 0;
+              });
+#endif
+}
+
+static void font_picker_sync_overlay(void) {
+    if (!font_picker_open) {
+        psx_font_picker_menu_set_state(0, 0, 0, NULL, 0, 0, 0, 0, 0, NULL);
+        return;
+    }
+    const int total = (int)font_picker_entries.size();
+    int visible = total - font_picker_scroll;
+    if (visible > FONT_PICKER_VISIBLE_ROWS) visible = FONT_PICKER_VISIBLE_ROWS;
+    if (visible < 0) visible = 0;
+    const char *names[FONT_PICKER_VISIBLE_ROWS];
+    for (int i = 0; i < visible; i++)
+        names[i] = font_picker_entries[font_picker_scroll + i].display_name.c_str();
+    const int cursor_in_view = font_picker_cursor - font_picker_scroll;
+    psx_font_picker_menu_set_state(1, font_picker_busy, cursor_in_view, names, visible,
+                                   font_picker_scroll, total,
+                                   font_picker_want_bold, font_picker_want_italic,
+                                   font_picker_status[0] ? font_picker_status : NULL);
+}
+
+static void font_picker_move(int delta) {
+    const int total = (int)font_picker_entries.size();
+    if (total == 0) return;
+    font_picker_cursor += delta;
+    if (font_picker_cursor < 0) font_picker_cursor = 0;
+    if (font_picker_cursor >= total) font_picker_cursor = total - 1;
+    if (font_picker_cursor < font_picker_scroll)
+        font_picker_scroll = font_picker_cursor;
+    if (font_picker_cursor >= font_picker_scroll + FONT_PICKER_VISIBLE_ROWS)
+        font_picker_scroll = font_picker_cursor - FONT_PICKER_VISIBLE_ROWS + 1;
+    font_picker_status[0] = 0;
+    font_picker_sync_overlay();
+}
+
+static void font_picker_close(void) {
+    font_picker_open = 0;
+    font_picker_sync_overlay();
+}
+
+static void font_picker_open_menu(void) {
+    font_picker_scan_fonts();
+    font_picker_cursor = 0;
+    font_picker_scroll = 0;
+    font_picker_busy = 0;
+    font_picker_want_bold = 0;
+    font_picker_want_italic = 0;
+    font_picker_status[0] = 0;
+    font_picker_open = 1;
+    font_picker_open_key = SDLK_f;
+    font_picker_sync_overlay();
+}
+
+static void font_picker_toggle_bold(void) {
+    font_picker_want_bold = !font_picker_want_bold;
+    font_picker_status[0] = 0;
+    font_picker_sync_overlay();
+}
+
+static void font_picker_toggle_italic(void) {
+    font_picker_want_italic = !font_picker_want_italic;
+    font_picker_status[0] = 0;
+    font_picker_sync_overlay();
+}
+
+static void font_picker_generate_selected(void); /* defined below, after rewind_pause_present */
+
+static void font_picker_handle_key(SDL_Keycode key, SDL_Scancode scancode,
+                                   int mod, int repeat) {
+    (void)scancode; (void)mod;
+    if (font_picker_open_key && key == font_picker_open_key) return;
+    if (font_picker_busy) return;
+    if (!repeat && (key == SDLK_ESCAPE || key == SDLK_BACKSPACE)) {
+        font_picker_close();
+    } else if (!repeat && (key == SDLK_RETURN || key == SDLK_KP_ENTER)) {
+        font_picker_generate_selected();
+    } else if (key == SDLK_UP) {
+        font_picker_move(-1);
+    } else if (key == SDLK_DOWN) {
+        font_picker_move(+1);
+    } else if (!repeat && key == SDLK_PAGEUP) {
+        font_picker_move(-FONT_PICKER_VISIBLE_ROWS);
+    } else if (!repeat && key == SDLK_PAGEDOWN) {
+        font_picker_move(+FONT_PICKER_VISIBLE_ROWS);
+    } else if (!repeat && key == SDLK_b) {
+        font_picker_toggle_bold();
+    } else if (!repeat && key == SDLK_i) {
+        font_picker_toggle_italic();
+    }
+}
+
 static int rewind_toggle_buttons_down(void) {
     return hotkey_pad_binding_down(g_hotkey_pad_rewind);
 }
@@ -6420,6 +6993,168 @@ static void savestate_menu_host_pause_loop(void) {
     }
     /* Swallow the close press; a just-queued save must not snapshot it. */
     savestate_input_guard_arm();
+}
+
+static void texpack_menu_host_pause_loop(void) {
+    while (texpack_menu_open) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                psx_crash_trace_set_exit_origin("sdl_window_close");
+                shutdown_runtime();
+                std::exit(0);
+            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+                refresh_player_devices();
+            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                close_controller();
+                refresh_player_devices();
+            } else if (ev.type == SDL_KEYDOWN) {
+#if defined(PSX_SDL3)
+                const SDL_Keymod mod = ev.key.mod;
+                const SDL_Keycode key = ev.key.key;
+                const SDL_Scancode scancode = ev.key.scancode;
+                const int repeat = ev.key.repeat ? 1 : 0;
+#else
+                const Uint16 mod = ev.key.keysym.mod;
+                const SDL_Keycode key = ev.key.keysym.sym;
+                const SDL_Scancode scancode = ev.key.keysym.scancode;
+                const int repeat = ev.key.repeat ? 1 : 0;
+#endif
+                texpack_menu_handle_key(key, scancode, (int)mod, repeat);
+            } else if (ev.type == SDL_KEYUP) {
+#if defined(PSX_SDL3)
+                const SDL_Keycode key = ev.key.key;
+#else
+                const SDL_Keycode key = ev.key.keysym.sym;
+#endif
+                if (texpack_menu_open_key == key)
+                    texpack_menu_open_key = 0;
+            }
+        }
+        rewind_pause_present();
+        starvation_watchdog_heartbeat();
+        SDL_Delay(8);
+    }
+    savestate_input_guard_arm();
+}
+
+/* Spawns generate_font_pack.py for the currently-selected font and blocks
+ * (this whole menu is already modal, so a synchronous wait here reads as
+ * part of "generating," not as an unexplained freeze -- same reasoning as
+ * texpack_menu_move's preload call). Forces one present with busy=1 first
+ * so "GENERATING..." is actually visible instead of the game looking
+ * frozen for the ~1-2s a run takes.
+ *
+ * On success, hot-reloads the 4 affected textures live (no relaunch) via
+ * gpu_hd_texture_pack_reload_paths -- see gpu_gl_renderer.c's GL texture
+ * cache eviction and docs/HD_FONT_GENERATOR.md for how that works. */
+static void font_picker_generate_selected(void) {
+    if (font_picker_entries.empty()) return;
+    const FontPickerEntry entry = font_picker_entries[font_picker_cursor];
+    const bool want_bold = font_picker_want_bold != 0;
+    const bool want_italic = font_picker_want_italic != 0;
+    bool file_is_bold = false, file_is_italic = false;
+    const std::string resolved_path =
+        *entry.best_path(want_bold, want_italic, &file_is_bold, &file_is_italic);
+    /* Only fake (stroke-width bold / whole-page shear) whichever of the two
+     * the resolved file doesn't already genuinely have -- e.g. checking
+     * Bold for a family that ships a real bold .ttf needs zero synthesis,
+     * while checking Bold for a single-weight font (Ink Free) still fakes
+     * it via stroke width exactly as before this toggle existed. */
+    const int bold_stroke = (want_bold && !file_is_bold) ? 2 : 0;
+    const bool force_italic = want_italic && !file_is_italic;
+
+    font_picker_busy = 1;
+    font_picker_status[0] = 0;
+    font_picker_sync_overlay();
+    rewind_pause_present();
+
+    int exit_ok = 0;
+#ifdef _WIN32
+    char cmdline[2048];
+    snprintf(cmdline, sizeof(cmdline),
+             "cmd.exe /C \"python \"%s\" --font \"%s\" --bold %d %s--pack-dir \"%s\"\"",
+             kFontPackGeneratorScript, resolved_path.c_str(), bold_stroke,
+             force_italic ? "--force-italic " : "", kFontPackDir);
+    STARTUPINFOA si; memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    PROCESS_INFORMATION pi; memset(&pi, 0, sizeof(pi));
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (ok) {
+        WaitForSingleObject(pi.hProcess, 30000); /* 30s safety timeout */
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        exit_ok = (code == 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+#endif
+
+    if (exit_ok) {
+        char full_paths[4][512];
+        const char *path_ptrs[4];
+        for (int i = 0; i < 4; i++) {
+            snprintf(full_paths[i], sizeof(full_paths[i]), "%s\\%s",
+                     kFontPackDir, kFontPackVariantFiles[i]);
+            path_ptrs[i] = full_paths[i];
+        }
+        gpu_hd_texture_pack_reload_paths(path_ptrs, 4);
+        snprintf(font_picker_status, sizeof(font_picker_status),
+                 "FONT UPDATED: %s%s%s", entry.display_name.c_str(),
+                 want_bold ? " BOLD" : "", want_italic ? " ITALIC" : "");
+    } else {
+        snprintf(font_picker_status, sizeof(font_picker_status),
+                 "GENERATION FAILED (python3+Pillow installed? see console)");
+    }
+    font_picker_busy = 0;
+    font_picker_sync_overlay();
+}
+
+static void font_picker_host_pause_loop(void) {
+    while (font_picker_open) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                psx_crash_trace_set_exit_origin("sdl_window_close");
+                shutdown_runtime();
+                std::exit(0);
+            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+                refresh_player_devices();
+            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                close_controller();
+                refresh_player_devices();
+            } else if (ev.type == SDL_KEYDOWN) {
+#if defined(PSX_SDL3)
+                const SDL_Keymod mod = ev.key.mod;
+                const SDL_Keycode key = ev.key.key;
+                const SDL_Scancode scancode = ev.key.scancode;
+                const int repeat = ev.key.repeat ? 1 : 0;
+#else
+                const Uint16 mod = ev.key.keysym.mod;
+                const SDL_Keycode key = ev.key.keysym.sym;
+                const SDL_Scancode scancode = ev.key.keysym.scancode;
+                const int repeat = ev.key.repeat ? 1 : 0;
+#endif
+                font_picker_handle_key(key, scancode, (int)mod, repeat);
+            } else if (ev.type == SDL_KEYUP) {
+#if defined(PSX_SDL3)
+                const SDL_Keycode key = ev.key.key;
+#else
+                const SDL_Keycode key = ev.key.keysym.sym;
+#endif
+                if (font_picker_open_key == key)
+                    font_picker_open_key = 0;
+            }
+        }
+        rewind_pause_present();
+        starvation_watchdog_heartbeat();
+        SDL_Delay(8);
+    }
+}
+
+static void font_picker_run(void) {
+    font_picker_open_menu();
+    font_picker_host_pause_loop();
 }
 
 /* Epilogue for netplay admit/pace AFTER all C++ RAII in the present body
@@ -6635,6 +7370,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                                  (int)mod)) {
                     savestate_menu_toggle(key);
                 }
+                else if (!key_repeat &&
+                         host_keymap_match_event(HOST_KEYMAP_TEXPACK_MENU,
+                                                 (int)key, (int)scancode,
+                                                 (int)mod)) {
+                    texpack_menu_toggle(key);
+                }
+                else if (!key_repeat &&
+                         host_keymap_match_event(HOST_KEYMAP_RESTART_GAME,
+                                                 (int)key, (int)scancode,
+                                                 (int)mod)) {
+                    hard_restart_game();
+                }
                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                     debug_force_cd_reinsert();
@@ -6710,6 +7457,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
         if (savestate_menu_open)
             savestate_menu_host_pause_loop();
+        if (texpack_menu_open)
+            texpack_menu_host_pause_loop();
         if (psx_rewind_is_open())
             rewind_host_pause_loop();
     }
@@ -11004,6 +11753,8 @@ namespace {
 #endif
 
 int main(int argc, char** argv) {
+    g_restart_argc = argc;
+    g_restart_argv = argv;
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
     std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
@@ -11902,6 +12653,9 @@ int main(int argc, char** argv) {
             if (us.has_deadzone) resolved_deadzone = us.deadzone;
         }
         apply_offline_pad_count(game_players, multitap_enabled);
+        if (us.has_hd_pack_dir) g_hd_texture_pack_dir = us.hd_pack_dir.string();
+        if (us.has_hd_pack_dir_beetle) g_hd_texture_pack_dir_beetle = us.hd_pack_dir_beetle.string();
+        if (us.has_hd_backend) g_hd_texture_backend_setting = us.hd_backend;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
         if (us.has_frame_interpolation)
@@ -13367,12 +14121,41 @@ session_reboot:
                      g_video_renderer == 1 ? "opengl" : "software");
     }
     gpu_init();
-    /* HD texture-replacement dump (DuckStation-compatible, Stage 1: hash +
-     * lookup verification only, see src/textures/hd_texture_dump.h). Env-var
-     * gated for now rather than a game.toml/mod key -- this is still being
-     * verified against the live game before it grows a real config surface. */
-    if (const char* hd_texture_root = std::getenv("PSXRECOMP_HD_TEXTURE_DUMP_ROOT"))
-        gpu_hd_texture_dump_init(hd_texture_root);
+    /* HD texture-replacement: two independent backends, both loaded (when
+     * configured) so a player can flip between them live via the "hd_backend"
+     * setting/TCP verb without restarting -- see gpu.h's
+     * gpu_hd_texture_set_backend for why switching needs no reload. */
+    {
+        /* DuckStation-format pack (src/textures/hd_texture_dump.h).
+         * settings.toml [textures] hd_pack_dir is the normal path now that
+         * the pipeline is verified against the live game; the env var still
+         * wins when set, for a quick A/B without touching settings. */
+        std::string hd_texture_root;
+        if (const char* env = std::getenv("PSXRECOMP_HD_TEXTURE_DUMP_ROOT"))
+            hd_texture_root = env;
+        else
+            hd_texture_root = g_hd_texture_pack_dir;
+        if (!hd_texture_root.empty())
+            gpu_hd_texture_dump_init(hd_texture_root.c_str());
+
+        /* Beetle PSX HW-format pack (runtime/include/hd_texture_pack.h).
+         * hd_texture_pack_create already falls back to its own
+         * PSXRECOMP_HD_TEXTURE_ROOT env var internally when passed NULL, so
+         * only call it explicitly when settings.toml actually configured a
+         * path -- avoids loading an unconfigured pack from a stale env var
+         * left over from testing. */
+        if (!g_hd_texture_pack_dir_beetle.empty())
+            gpu_hd_texture_pack_init(g_hd_texture_pack_dir_beetle.c_str());
+
+        gpu_hd_texture_set_backend(
+            g_hd_texture_backend_setting == "beetle" ? 1 :
+            g_hd_texture_backend_setting == "none" ? 2 : 0);
+        /* NOT gpu_hd_texture_preload_active() here: no GL context exists yet
+         * at this point in boot (SDL_CreateWindow/gl_renderer_init_context
+         * run much later, after the whole main() setup below) -- every
+         * glGenTextures call would silently fail. See the real preload call
+         * site after the GL context is confirmed up. */
+    }
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init.
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
@@ -13869,6 +14652,17 @@ session_reboot:
                                           ? 1000.0 / g_frame_period_ms
                                           : 59.94,
                                       g_frame_interpolation_blend);
+        /* Now that the GL context genuinely exists, decode/upload every
+         * replacement PNG of the active HD-texture backend up front instead
+         * of paying that cost piecemeal the first time gameplay draws each
+         * one -- see gpu_hd_texture_preload_active's comment for why (a
+         * fresh scene or backend switch hitting many uncached textures at
+         * once visibly froze the game for several seconds otherwise,
+         * confirmed live). An earlier attempt at the settings-load call site
+         * ran before SDL_CreateWindow/gl_renderer_init_context above, so
+         * every glGenTextures call silently failed (0 ok, all "failed") --
+         * this is the corrected location. */
+        if (g_gl_active) gpu_hd_texture_preload_active();
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init

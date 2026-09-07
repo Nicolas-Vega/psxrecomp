@@ -2461,6 +2461,21 @@ UserSettings load_user_settings(const fs::path& path) {
             if (!v.empty()) { s.netplay_lobby_url = v; s.has_netplay_lobby_url = true; }
         });
     }
+    if (doc.contains("textures")) {
+        const toml::value& t = toml::find(doc, "textures");
+        if (t.contains("hd_pack_dir")) try_get([&]{
+            const auto p = toml::find<std::string>(t, "hd_pack_dir");
+            if (!p.empty()) { s.hd_pack_dir = fs::path(p); s.has_hd_pack_dir = true; }
+        });
+        if (t.contains("hd_pack_dir_beetle")) try_get([&]{
+            const auto p = toml::find<std::string>(t, "hd_pack_dir_beetle");
+            if (!p.empty()) { s.hd_pack_dir_beetle = fs::path(p); s.has_hd_pack_dir_beetle = true; }
+        });
+        if (t.contains("hd_backend")) try_get([&]{
+            const auto v = toml::find<std::string>(t, "hd_backend");
+            if (!v.empty()) { s.hd_backend = v; s.has_hd_backend = true; }
+        });
+    }
     if (doc.contains("bios")) {
         const toml::value& b = toml::find(doc, "bios");
         if (b.contains("path")) try_get([&]{
@@ -2709,6 +2724,15 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "player_name = \"" << s.netplay_player_name << "\"\n";
         if (s.has_netplay_lobby_url && !s.netplay_lobby_url.empty())
             f << "lobby_url = \"" << s.netplay_lobby_url << "\"\n";
+    }
+    if (s.has_hd_pack_dir || s.has_hd_pack_dir_beetle || s.has_hd_backend) {
+        f << "\n[textures]\n";
+        if (s.has_hd_pack_dir)
+            f << "hd_pack_dir = \"" << fwd(s.hd_pack_dir) << "\"\n";
+        if (s.has_hd_pack_dir_beetle)
+            f << "hd_pack_dir_beetle = \"" << fwd(s.hd_pack_dir_beetle) << "\"\n";
+        if (s.has_hd_backend)
+            f << "hd_backend = \"" << s.hd_backend << "\"\n";
     }
     if (s.has_bios_path)
         f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";

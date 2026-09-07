@@ -661,6 +661,12 @@ struct HdTexturePack {
      * only cause extra work, never a missed invalidation. */
     Rect upload_bounds{};
     DecodeCache decode;
+    /* Lazily-built stable ordering over entries, for indexed enumeration
+     * (hd_texture_pack_get_entry) -- a boot-time preload pass walking every
+     * loaded entry needs index-based access an unordered_map doesn't give
+     * directly. Rebuilt whenever the entry count changes (only happens
+     * during hd_texture_pack_create, before any indexed access). */
+    mutable std::vector<uint64_t> entry_keys_cache;
 };
 
 unsigned upload_index_cell(unsigned tx, unsigned ty) {
@@ -899,6 +905,24 @@ void hd_texture_pack_get_info(const HdTexturePack* pack,
     out_info->logical_mapping_count = pack->logical_mapping_count;
 }
 
+size_t hd_texture_pack_entry_count(const HdTexturePack* pack) {
+    return pack ? pack->entries.size() : 0;
+}
+
+int hd_texture_pack_get_entry(const HdTexturePack* pack, size_t index,
+                              HdTexturePackEntry* out_entry) {
+    if (!pack || index >= pack->entries.size()) return 0;
+    if (pack->entry_keys_cache.size() != pack->entries.size()) {
+        pack->entry_keys_cache.clear();
+        pack->entry_keys_cache.reserve(pack->entries.size());
+        for (const auto& kv : pack->entries) pack->entry_keys_cache.push_back(kv.first);
+    }
+    const auto found = pack->entries.find(pack->entry_keys_cache[index]);
+    if (found == pack->entries.end()) return 0;
+    if (out_entry) fill_entry(found->second, out_entry);
+    return 1;
+}
+
 int hd_texture_pack_lookup(const HdTexturePack* pack,
                            uint32_t texture_hash,
                            uint32_t palette_hash,
@@ -1000,6 +1024,68 @@ void hd_texture_pack_invalidate(HdTexturePack* pack,
     if (erased_upload) upload_index_rebuild(pack);
 }
 
+/* Temporary stage-by-stage diagnostics (2026-09-07): a live A/B against real
+ * game data measured 0 matches out of 80k+ attempts despite successful
+ * uploads and a loaded pack, with no way to tell from outside which of the
+ * three sequential filters below (broad-phase / hash-key / full-coverage)
+ * was the one rejecting everything. See gpu_hd_texture_pack_diag_stats. */
+uint64_t g_hd_pack_diag_no_candidates = 0;     /* upload_index_collect found nothing */
+uint64_t g_hd_pack_diag_no_hash_match = 0;     /* had candidates, none had this (hash,palette) key */
+uint64_t g_hd_pack_diag_not_covered = 0;       /* key matched, covered_by_upload rejected it */
+/* Raw numeric snapshot of the first query + first tracked upload, so a
+ * suspected coordinate-space mismatch between the two can be read directly
+ * instead of inferred from aggregate pass/fail counts. */
+unsigned g_hd_pack_diag_query_x = 0, g_hd_pack_diag_query_y = 0,
+        g_hd_pack_diag_query_w = 0, g_hd_pack_diag_query_h = 0;
+int g_hd_pack_diag_query_captured = 0;
+unsigned g_hd_pack_diag_upload_x = 0, g_hd_pack_diag_upload_y = 0,
+        g_hd_pack_diag_upload_w = 0, g_hd_pack_diag_upload_h = 0;
+int g_hd_pack_diag_upload_captured = 0;
+/* Rolling "last successful match" snapshot: which replacement file and query
+ * rect a real draw resolved to, overwritten every match so it can be read
+ * while a suspect texture is on screen right now instead of only at boot. */
+/* Ring of the last N successful matches (not just the most recent one), so
+ * a single static on-screen frame that mixes correct and wrong replacement
+ * images across its several glyph/quad draws (confirmed live: a dialogue
+ * text bubble showing some correct characters and some from an unrelated
+ * screen at the same time) can be inspected as a SET instead of only ever
+ * seeing whichever draw happened to run last. The frame keeps re-drawing
+ * every refresh while on screen, so querying this at any moment reflects a
+ * stable, representative sample of that frame's actual draws. */
+#define HD_PACK_DIAG_RING_CAP 400
+struct HdPackDiagRingEntry {
+    char path[256];
+    unsigned texhash = 0, palhash = 0;
+    unsigned qx = 0, qy = 0, qw = 0, qh = 0;
+    uint64_t upload_serial = 0;
+    unsigned upload_w = 0, upload_h = 0, upload_fragments = 0;
+    unsigned anchor_x = 0, anchor_y = 0, anchor_found = 0;
+    unsigned source_word_x = 0, source_y = 0;
+    unsigned clut_x = 0, clut_y = 0, depth = 0;
+};
+HdPackDiagRingEntry g_hd_pack_diag_ring[HD_PACK_DIAG_RING_CAP];
+int g_hd_pack_diag_ring_pos = 0;
+uint64_t g_hd_pack_diag_ring_total = 0;
+
+char g_hd_pack_diag_last_path[512] = {0};
+unsigned g_hd_pack_diag_last_texhash = 0, g_hd_pack_diag_last_palhash = 0;
+unsigned g_hd_pack_diag_last_qx = 0, g_hd_pack_diag_last_qy = 0,
+        g_hd_pack_diag_last_qw = 0, g_hd_pack_diag_last_qh = 0;
+uint64_t g_hd_pack_diag_last_upload_serial = 0;
+
+/* 2026-09-07 investigation: is the game's real font atlas (known-good
+ * texture_hash 0xF98B3634, confirmed against the pack's own documented
+ * bubble/menu-text replacements) EVER tracked as an upload at all, and does
+ * anything ever touch the shared VRAM word-region (320,0)-(384,48) where a
+ * stale boot-time credits-screen upload (0xF4F1A2B4) keeps winning every
+ * match? Two independent counters so "never tracked at all" (a write path
+ * we don't hook) can be told apart from "tracked but never wins the match"
+ * (a residency/candidate-selection bug). */
+uint64_t g_hd_pack_diag_font_hash_seen = 0;      /* track_upload calls whose hash == 0xF98B3634 */
+uint64_t g_hd_pack_diag_font_region_touches = 0; /* track_upload calls intersecting (320,0,64,48) */
+uint32_t g_hd_pack_diag_font_region_last_hash = 0;
+uint64_t g_hd_pack_diag_font_region_last_serial = 0;
+
 int hd_texture_pack_track_upload(HdTexturePack* pack,
                                  uint16_t x,
                                  uint16_t y,
@@ -1035,6 +1121,19 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
         pack->upload_bounds.y = std::min(pack->upload_bounds.y, upload.bounds.y);
         pack->upload_bounds.width = right - pack->upload_bounds.x;
         pack->upload_bounds.height = bottom - pack->upload_bounds.y;
+    }
+    if (!g_hd_pack_diag_upload_captured) {
+        g_hd_pack_diag_upload_x = upload.bounds.x;
+        g_hd_pack_diag_upload_y = upload.bounds.y;
+        g_hd_pack_diag_upload_w = upload.bounds.width;
+        g_hd_pack_diag_upload_h = upload.bounds.height;
+        g_hd_pack_diag_upload_captured = 1;
+    }
+    if (hash == 0xF98B3634u) ++g_hd_pack_diag_font_hash_seen;
+    if (intersects(upload.bounds, Rect{320, 0, 64, 48})) {
+        ++g_hd_pack_diag_font_region_touches;
+        g_hd_pack_diag_font_region_last_hash = hash;
+        g_hd_pack_diag_font_region_last_serial = upload.serial;
     }
     pack->uploads.push_back(std::move(upload));
     /* A push may reallocate the vector, so refresh all broad-phase pointers
@@ -1178,8 +1277,17 @@ int hd_texture_pack_match(HdTexturePack* pack,
         query->vram, query->vram_word_count, query->clut_x, query->clut_y,
         query->depth);
 
+    if (!g_hd_pack_diag_query_captured && !wanted.empty()) {
+        g_hd_pack_diag_query_x = wanted[0].x;
+        g_hd_pack_diag_query_y = wanted[0].y;
+        g_hd_pack_diag_query_w = wanted[0].width;
+        g_hd_pack_diag_query_h = wanted[0].height;
+        g_hd_pack_diag_query_captured = 1;
+    }
     std::vector<uint64_t> candidate_serials;
     upload_index_collect(pack, wanted, &candidate_serials);
+    if (candidate_serials.empty()) ++g_hd_pack_diag_no_candidates;
+    bool diag_saw_hash_match = false;
     const Upload* candidate = nullptr;
     const EntryRecord* candidate_entry = nullptr;
     for (const uint64_t serial : candidate_serials) {
@@ -1189,37 +1297,182 @@ int hd_texture_pack_match(HdTexturePack* pack,
         const Upload& upload = *indexed->second;
         const auto record = pack->entries.find(make_key(upload.hash, palette_hash));
         if (record == pack->entries.end()) continue;
+        diag_saw_hash_match = true;
         if (!covered_by_upload(upload, wanted)) continue;
         if (record->second.ambiguous) return HD_TEXTURE_LOOKUP_AMBIGUOUS;
         if (candidate) return HD_TEXTURE_LOOKUP_AMBIGUOUS;
         candidate = &upload;
         candidate_entry = &record->second;
     }
+    if (!candidate_serials.empty() && !diag_saw_hash_match) ++g_hd_pack_diag_no_hash_match;
+    if (diag_saw_hash_match && !candidate) ++g_hd_pack_diag_not_covered;
     if (!candidate || !candidate_entry) return HD_TEXTURE_LOOKUP_NONE;
 
+    const unsigned pixels_per_word = query->depth == HD_TEXTURE_DEPTH_4BPP ? 4u :
+                                     query->depth == HD_TEXTURE_DEPTH_8BPP ? 2u : 1u;
+    const unsigned first_x = (unsigned{query->page_x} +
+                              query->u_first / pixels_per_word) &
+                             (kVramWidth - 1);
+    const unsigned first_y = (unsigned{query->page_y} + query->v_first) &
+                             (kVramHeight - 1);
+    uint16_t source_word_x = 0, source_y = 0;
+    bool anchor_found = false;
+    for (const Fragment& fragment : candidate->fragments) {
+        if (contains_point(fragment.rect, first_x, first_y)) {
+            source_word_x = static_cast<uint16_t>(fragment.source_x + first_x - fragment.rect.x);
+            source_y = static_cast<uint16_t>(fragment.source_y + first_y - fragment.rect.y);
+            anchor_found = true;
+            break;
+        }
+    }
+
+    {
+        std::snprintf(g_hd_pack_diag_last_path, sizeof(g_hd_pack_diag_last_path),
+                      "%s", candidate_entry->replacement_path.c_str());
+        g_hd_pack_diag_last_texhash = candidate->hash;
+        g_hd_pack_diag_last_palhash = palette_hash;
+        g_hd_pack_diag_last_qx = wanted[0].x;
+        g_hd_pack_diag_last_qy = wanted[0].y;
+        g_hd_pack_diag_last_qw = wanted[0].width;
+        g_hd_pack_diag_last_qh = wanted[0].height;
+        g_hd_pack_diag_last_upload_serial = candidate->serial;
+
+        HdPackDiagRingEntry& ring = g_hd_pack_diag_ring[g_hd_pack_diag_ring_pos];
+        std::snprintf(ring.path, sizeof(ring.path), "%s", candidate_entry->replacement_path.c_str());
+        ring.texhash = candidate->hash;
+        ring.palhash = palette_hash;
+        ring.qx = wanted[0].x; ring.qy = wanted[0].y;
+        ring.qw = wanted[0].width; ring.qh = wanted[0].height;
+        ring.upload_serial = candidate->serial;
+        ring.upload_w = candidate->width; ring.upload_h = candidate->height;
+        ring.upload_fragments = static_cast<unsigned>(candidate->fragments.size());
+        ring.anchor_x = first_x; ring.anchor_y = first_y;
+        ring.anchor_found = anchor_found ? 1u : 0u;
+        ring.source_word_x = source_word_x; ring.source_y = source_y;
+        ring.clut_x = query->clut_x; ring.clut_y = query->clut_y; ring.depth = query->depth;
+        g_hd_pack_diag_ring_pos = (g_hd_pack_diag_ring_pos + 1) % HD_PACK_DIAG_RING_CAP;
+        ++g_hd_pack_diag_ring_total;
+    }
     if (out_match) {
         fill_entry(*candidate_entry, &out_match->entry);
         out_match->upload_serial = candidate->serial;
         out_match->upload_width_words = candidate->width;
         out_match->upload_height = candidate->height;
-        const unsigned pixels_per_word = query->depth == HD_TEXTURE_DEPTH_4BPP ? 4u :
-                                         query->depth == HD_TEXTURE_DEPTH_8BPP ? 2u : 1u;
-        const unsigned first_x = (unsigned{query->page_x} +
-                                  query->u_first / pixels_per_word) &
-                                 (kVramWidth - 1);
-        const unsigned first_y = (unsigned{query->page_y} + query->v_first) &
-                                 (kVramHeight - 1);
-        for (const Fragment& fragment : candidate->fragments) {
-            if (contains_point(fragment.rect, first_x, first_y)) {
-                out_match->source_word_x = static_cast<uint16_t>(
-                    fragment.source_x + first_x - fragment.rect.x);
-                out_match->source_y = static_cast<uint16_t>(
-                    fragment.source_y + first_y - fragment.rect.y);
-                break;
-            }
-        }
+        out_match->source_word_x = source_word_x;
+        out_match->source_y = source_y;
     }
     return HD_TEXTURE_LOOKUP_FOUND;
+}
+
+int hd_texture_pack_diag_dump_uploads(const HdTexturePack* pack, char* out,
+                                      size_t out_capacity) {
+    if (!out || out_capacity == 0) return 0;
+    out[0] = '\0';
+    if (!pack) return 0;
+    size_t pos = 0;
+    for (const Upload& upload : pack->uploads) {
+        const int n = std::snprintf(
+            out + pos, pos < out_capacity ? out_capacity - pos : 0,
+            "%s{\"serial\":%llu,\"hash\":%u,\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u}",
+            pos == 0 ? "" : ",",
+            (unsigned long long)upload.serial, upload.hash,
+            upload.bounds.x, upload.bounds.y, upload.bounds.width,
+            upload.bounds.height);
+        if (n < 0) break;
+        pos += static_cast<size_t>(n);
+        if (pos >= out_capacity) break;
+    }
+    return 1;
+}
+
+void hd_texture_pack_diag_font_region_stats(uint64_t out[5]) {
+    out[0] = g_hd_pack_diag_font_hash_seen;
+    out[1] = g_hd_pack_diag_font_region_touches;
+    out[2] = g_hd_pack_diag_font_region_last_hash;
+    out[3] = g_hd_pack_diag_font_region_last_serial;
+    out[4] = 0;
+}
+
+/* Minimal JSON string escaping (backslash + quote only -- Windows paths are
+ * the only untrusted-ish content here, and never contain control chars or
+ * other JSON-special bytes in practice). */
+static void hd_diag_json_escape(const char* in, char* out, size_t out_cap) {
+    size_t o = 0;
+    for (const char* p = in; *p && o + 2 < out_cap; ++p) {
+        if (*p == '\\' || *p == '"') out[o++] = '\\';
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+}
+
+int hd_texture_pack_diag_dump_ring(char* out, size_t out_capacity) {
+    if (!out || out_capacity == 0) return 0;
+    out[0] = '\0';
+    size_t pos = 0;
+    const int n = g_hd_pack_diag_ring_total < HD_PACK_DIAG_RING_CAP
+                      ? static_cast<int>(g_hd_pack_diag_ring_total)
+                      : HD_PACK_DIAG_RING_CAP;
+    /* Oldest-to-newest: if the ring hasn't wrapped yet, start at 0; once it
+     * has, the oldest surviving entry is right where the next write will
+     * land. */
+    const int start = g_hd_pack_diag_ring_total < HD_PACK_DIAG_RING_CAP
+                           ? 0
+                           : g_hd_pack_diag_ring_pos;
+    for (int k = 0; k < n; k++) {
+        const HdPackDiagRingEntry& e = g_hd_pack_diag_ring[(start + k) % HD_PACK_DIAG_RING_CAP];
+        char escaped_path[512];
+        hd_diag_json_escape(e.path, escaped_path, sizeof(escaped_path));
+        const int written = std::snprintf(
+            out + pos, pos < out_capacity ? out_capacity - pos : 0,
+            "%s{\"path\":\"%s\",\"texhash\":%u,\"palhash\":%u,"
+            "\"qx\":%u,\"qy\":%u,\"qw\":%u,\"qh\":%u,\"serial\":%llu,"
+            "\"upload_w\":%u,\"upload_h\":%u,\"upload_fragments\":%u,"
+            "\"anchor_x\":%u,\"anchor_y\":%u,\"anchor_found\":%u,"
+            "\"source_word_x\":%u,\"source_y\":%u}",
+            pos == 0 ? "" : ",", escaped_path, e.texhash, e.palhash,
+            e.qx, e.qy, e.qw, e.qh, (unsigned long long)e.upload_serial,
+            e.upload_w, e.upload_h, e.upload_fragments,
+            e.anchor_x, e.anchor_y, e.anchor_found,
+            e.source_word_x, e.source_y);
+        if (written < 0) break;
+        pos += static_cast<size_t>(written);
+        if (pos >= out_capacity) break;
+    }
+    return 1;
+}
+
+void hd_texture_pack_diag_last_match(char* out_path, size_t path_capacity,
+                                     unsigned out_info[7]) {
+    if (out_path && path_capacity)
+        std::snprintf(out_path, path_capacity, "%s", g_hd_pack_diag_last_path);
+    if (out_info) {
+        out_info[0] = g_hd_pack_diag_last_texhash;
+        out_info[1] = g_hd_pack_diag_last_palhash;
+        out_info[2] = g_hd_pack_diag_last_qx;
+        out_info[3] = g_hd_pack_diag_last_qy;
+        out_info[4] = g_hd_pack_diag_last_qw;
+        out_info[5] = g_hd_pack_diag_last_qh;
+        out_info[6] = static_cast<unsigned>(g_hd_pack_diag_last_upload_serial);
+    }
+}
+
+void hd_texture_pack_diag_stats(uint64_t out[3]) {
+    out[0] = g_hd_pack_diag_no_candidates;
+    out[1] = g_hd_pack_diag_no_hash_match;
+    out[2] = g_hd_pack_diag_not_covered;
+}
+
+void hd_texture_pack_diag_first_rects(unsigned out[10]) {
+    out[0] = g_hd_pack_diag_query_x;
+    out[1] = g_hd_pack_diag_query_y;
+    out[2] = g_hd_pack_diag_query_w;
+    out[3] = g_hd_pack_diag_query_h;
+    out[4] = (unsigned)g_hd_pack_diag_query_captured;
+    out[5] = g_hd_pack_diag_upload_x;
+    out[6] = g_hd_pack_diag_upload_y;
+    out[7] = g_hd_pack_diag_upload_w;
+    out[8] = g_hd_pack_diag_upload_h;
+    out[9] = (unsigned)g_hd_pack_diag_upload_captured;
 }
 
 int hd_texture_pack_match_draw(HdTexturePack* pack,
