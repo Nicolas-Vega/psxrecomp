@@ -487,6 +487,14 @@ uint32_t gpu_texture_correction_hits(void);
 void gpu_ws_set_gte_game_mode(int on);
 void gpu_ws_set_precise_nclip(int on);
 void psx_ws_note_gte_project(int nverts);
+/* Menu-framework PC detector: memory.c's store paths call this
+ * unconditionally (NOT gated behind PSX_NO_DEBUG_TOOLS -- this decides
+ * presentation correctness, not just debugging) with the writing
+ * instruction's PC. A frame-stamp + hysteresis overrides ws_game_mode's GTE
+ * heuristic for screens (Vagrant Story's Status/World Map) that render a
+ * live 3D preview inside what should otherwise present as a full-2D menu.
+ * See the WS_MENU_PC_LO/HI comment in gpu.c for how the range was found. */
+void gpu_ws_note_store_pc(uint32_t pc);
 /* Optional authoritative gameplay-state gate. When configured, it replaces
  * heuristic gameplay classification for native-wide presentation. */
 void gpu_ws_set_gameplay_state_gate(uint32_t addr,
@@ -592,6 +600,9 @@ typedef struct {
     uint64_t cur_frame;
     uint32_t last_tag_frame;    /* frame of newest tagged prim */
     uint32_t last_3d_frame;     /* frame of newest shaded prim (diagnostic) */
+    uint32_t last_menu_pc_frame;/* frame of newest store whose PC hit
+                                   WS_MENU_PC_LO/HI (Status/Map menu-framework
+                                   detector, see gpu.c) */
     uint32_t gte_verts;         /* RTPS/RTPT verts in the last completed frame */
     uint32_t last_world3d_frame;/* newest SUSTAINED world-scale projection frame */
     uint32_t ovh_prims;         /* overhanging polys in the last completed frame */

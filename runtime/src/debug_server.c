@@ -5353,6 +5353,7 @@ static void handle_gpu_state(int id, const char *json)
              "\"activation_margin\":%d,\"squash\":[%d,%d],"
              "\"mode\":%d,\"nw_extra\":%d,"
              "\"cur_frame\":%llu,\"last_tag_frame\":%u,\"last_3d_frame\":%u,"
+             "\"last_menu_pc_frame\":%u,"
              "\"gte_verts\":%u,\"last_world3d_frame\":%u,"
              "\"ovh_prims\":%u,\"last_ovh_frame\":%u,"
              "\"auto_ui\":{\"configured\":%d,\"dense\":%d,\"ot_rank\":%u,"
@@ -5383,7 +5384,8 @@ static void handle_gpu_state(int id, const char *json)
              ws.xnum, ws.xden,
              ws.mode, ws.nw_extra,
              (unsigned long long)ws.cur_frame, ws.last_tag_frame,
-              ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
+              ws.last_3d_frame, ws.last_menu_pc_frame,
+              ws.gte_verts, ws.last_world3d_frame,
               ws.ovh_prims, ws.last_ovh_frame,
               ws.auto_ui_squash, ws.auto_ui_dense, ws.auto_ui_ot_rank,
               (unsigned long long)ws.auto_ui_candidates,

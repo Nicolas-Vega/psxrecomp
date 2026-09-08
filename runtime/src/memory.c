@@ -1681,6 +1681,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         }
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
+        gpu_ws_note_store_pc(effective_store_pc());
         parity_trace_note_write(phys, 4, effective_store_pc());
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
@@ -1719,6 +1720,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
           | ((uint32_t)scratchpad[off + 2] << 16)
           | ((uint32_t)scratchpad[off + 3] << 24),
             val, 4);
+        gpu_ws_note_store_pc(effective_store_pc());
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         scratchpad[off + 2] = (uint8_t)(val >> 16);
@@ -1809,6 +1811,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+        gpu_ws_note_store_pc(effective_store_pc());
         parity_trace_note_write(phys, 2, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
@@ -1843,6 +1846,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off] | ((uint32_t)scratchpad[off + 1] << 8),
             (uint32_t)val, 2);
+        gpu_ws_note_store_pc(effective_store_pc());
         scratchpad[off]     = (uint8_t)(val);
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         return;
@@ -2144,6 +2148,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+        gpu_ws_note_store_pc(effective_store_pc());
         parity_trace_note_write(phys, 1, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
@@ -2173,6 +2178,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
                                        (uint32_t)val, 1);
+        gpu_ws_note_store_pc(effective_store_pc());
         scratchpad[phys - 0x1F800000u] = val;
         return;
     }

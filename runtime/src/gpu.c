@@ -663,9 +663,68 @@ static int ws_full_2d_mode(void) {
     if (env < 0) { const char *e = getenv("PSX_WS_FORCE_2D"); env = (e && e[0] == '1') ? 1 : 0; }
     return ws_full_2d || env;
 }
+
+/* Vagrant Story's Status and World Map screens both render a live GTE-
+ * projected 3D preview (rotating character model / map terrain) alongside
+ * their 2D UI, which trips the ws_gte_game_mode hysteresis below into
+ * treating the whole screen as 3D gameplay -- so it gets squashed/stretched
+ * like a field scene instead of getting a clean 4:3 pillarbox, and the UI's
+ * screen-space text/lines end up duplicated/wrapped into the reveal margins
+ * (reported live: "Status/Map menu shows ghosted text in the widescreen side
+ * bars instead of black").
+ *
+ * Found empirically (live wtrace_all_dump sampling + set-difference against
+ * normal field-gameplay writes, then intersecting the Status-only and
+ * Map-only PC sets) rather than from any known symbol: these exact PCs are
+ * touched by a store on every sampled frame of BOTH menus and never during
+ * field play, making them plausible call/return sites of a shared "menu
+ * framework" routine. An EXACT SET match, not a range: the first version of
+ * this used [0x8010111C, 0x80101FB0) as a range and it covered unrelated
+ * code too (0x80101E44 alone fired on every frame of the Options menu, which
+ * should NOT force native-4:3 -- it renders the live field behind a
+ * translucent overlay and must keep stretching with it), regressing that
+ * screen. Confirmed via the same live sampling that none of the addresses
+ * below fire during Options. Wired the same way ws_last_gte_stamp is (a
+ * frame-stamp + hysteresis, updated from gpu_ws_note_store_pc which
+ * memory.c's store paths call unconditionally -- NOT gated behind
+ * PSX_NO_DEBUG_TOOLS like the write-trace diagnostics used to originally
+ * find it, since this one actually decides presentation correctness, not
+ * just debugging). Re-verify against other menus (Command/Inventory) if
+ * they turn out to need the same treatment -- widening this set is safe
+ * (a false positive here only costs a native-4:3 pillarbox instead of a
+ * widescreen stretch on a screen that has no world geometry of its own),
+ * but ONLY after confirming each new address the same way: sampled on every
+ * frame of the target menu AND absent from both field play and any OTHER
+ * menu (like Options) that must keep stretching. */
+static const uint32_t WS_MENU_PCS[] = {
+    0x8001F77Cu, 0x8010111Cu, 0x8010113Cu, 0x80101144u, 0x80101148u,
+    0x8010114Cu, 0x80101150u, 0x801011A0u, 0x801011C4u, 0x801011CCu,
+    0x801011D0u, 0x801011DCu, 0x801011E4u, 0x80101FACu,
+};
+/* Much shorter than WS_GTE_GAME_MODE_HYSTERESIS (45): that one exists to
+ * ride out sparse/intermittent GTE activity during real 3D gameplay
+ * cutscenes without flickering. This menu-framework code runs every single
+ * frame the menu stays open, so there is no intermittency to ride out --
+ * a few frames of grace is enough to bridge the one frame between the
+ * closing menu's last note and the field resuming, without leaving the
+ * pillarbox visibly stuck for up to 3/4 second after closing (reported
+ * live: "queda la barra negra 1 segundo hasta que vuelve a renderizarse"). */
+#define WS_MENU_PC_HYSTERESIS 4u
+static uint32_t ws_last_menu_pc_stamp = (uint32_t)-1000;
+
+void gpu_ws_note_store_pc(uint32_t pc) {
+    for (size_t i = 0; i < sizeof(WS_MENU_PCS) / sizeof(WS_MENU_PCS[0]); i++) {
+        if (WS_MENU_PCS[i] == pc) {
+            ws_last_menu_pc_stamp = (uint32_t)s_frame_count;
+            return;
+        }
+    }
+}
+
 static int ws_game_mode(void) {
     int state_match = ws_gameplay_state_matches();
     if (state_match >= 0) return state_match;
+    if ((uint32_t)s_frame_count - ws_last_menu_pc_stamp <= WS_MENU_PC_HYSTERESIS) return 0;
     if (ws_full_2d_mode()) return 1;
     if (ws_gte_game_mode_cfg &&
         (uint32_t)s_frame_count - ws_last_gte_stamp <= WS_GTE_GAME_MODE_HYSTERESIS) return 1;
@@ -2079,6 +2138,7 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->cur_frame         = s_frame_count;
     out->last_tag_frame    = ws_last_tag_stamp;
     out->last_3d_frame     = ws_last_3d_stamp;
+    out->last_menu_pc_frame = ws_last_menu_pc_stamp;
     out->gte_verts         = ws_gte_prev_verts;
     out->last_world3d_frame = ws_sust_world3d_stamp;
     out->ovh_prims         = ws_ovh_prev;
