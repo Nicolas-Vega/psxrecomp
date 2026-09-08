@@ -2070,21 +2070,28 @@ static const char *HD_FS =
      * on it the same way or those areas render as solid blocks instead of
      * see-through -- exactly the "transparency between textures" the user
      * spotted looking wrong. A hard discard (not real alpha blending)
-     * matches the original PS1 behavior for this prim class faithfully. */
-    /* Below a near-zero floor the pixel is a true PS1-style hole (see the
-     * comment above): discard so nothing writes to depth/stencil there.
-     * Anything above that floor is blended by real alpha (GL_BLEND enabled
-     * below) rather than snapped to fully opaque -- a hand-drawn PNG's own
-     * anti-aliased edges (soft partial-alpha pixels the pack author drew,
-     * distinct from the hole cutout) need actual blending against whatever
-     * is already in the framebuffer or they show as a jagged, gap-toothed
-     * silhouette instead of a smooth edge (confirmed live: the credits-
-     * screen replacement's anti-aliased text looked broken/full of holes
-     * with a hard 0.5 cutoff, while its own solid-alpha watermark text,
-     * which has no soft edges, looked fine either way). */
+     * matches the original PS1 behavior for this prim class faithfully.
+     *
+     * Hard 0.5 cutoff, forced-opaque above it -- matches real Beetle PSX
+     * HW's Vulkan/GL command_fragment shader exactly (`if (opacity < 0.5)
+     * discard;`, same threshold, applied even to its own HD-texture-
+     * replacement path; confirmed by reading its actual GLSL source,
+     * 2026-09-08). Real alpha blending here (GL_SRC_ALPHA/ONE_MINUS_SRC_ALPHA,
+     * `frag = vec4(rgb, c.a)`) was added earlier this session specifically to
+     * fix the credits-screen replacement's anti-aliased text looking jagged
+     * under the OLD 0.5 cutoff -- but that was BEFORE this session's
+     * hd_normalize_alpha fix (gpu_gl_renderer.c's hd_decode_png_file), which
+     * discovered this pack's alpha channel commonly caps out well below 255
+     * (as low as ~128-140) and stretches it back out per-texture. With that
+     * fix in place, re-tested: the credits screen's soft edges no longer
+     * need real blending to look smooth (their now-correctly-stretched alpha
+     * crosses 0.5 gradually enough that supersampling alone anti-aliases the
+     * cutoff), and reverting to Beetle's real behavior removes a source of
+     * divergence (framebuffer-order-dependent partial blending at any
+     * texture's edge) without reintroducing the original jagged-text bug. */
     "void main(){\n"
     "  vec4 c = texture(u_tex, v_uv);\n"
-    "  if (c.a < 0.02) discard;\n"
+    "  if (c.a < 0.5) discard;\n"
     /* Per-vertex Gouraud shading (ambient/room lighting), same formula and
      * *2.0 scale as TEX_FS's "rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0)"
      * -- PS1 vertex colors are stored so 0x80 (0.5 normalized) means neutral
@@ -2095,7 +2102,7 @@ static const char *HD_FS =
      * visibly darker/shaded than this recomp's in the identical room). */
     "  vec3 rgb = c.rgb * u_tint;\n"
     "  if (u_raw == 0) rgb = clamp(rgb * v_col * 2.0, 0.0, 1.0);\n"
-    "  frag = vec4(rgb, c.a);\n"
+    "  frag = vec4(rgb, 1.0);\n"
     "}\n";
 
 /* entry_id -> decoded/uploaded GL texture. Small in practice (one entry per
@@ -2175,6 +2182,34 @@ static void hd_gl_init(void) {
     }
 }
 
+/* Some pack PNGs (confirmed so far in a subset of Beetle-format assets, e.g.
+ * f13a6170-7475314b.png) bake a flat ~50% layer opacity into their alpha
+ * channel instead of exporting fully-opaque (255) content for what is
+ * visually solid geometry -- an authoring mistake in the source PNG, not a
+ * deliberate translucency cue: draw_hd_replacement_triangle only ever runs
+ * for originally-opaque PS1 primitives (semi < 0, see its call site in
+ * gpu_textured_triangle), so this alpha channel has no PS1 blend mode it
+ * could legitimately be signaling in the first place. Confirmed via
+ * histogram on the affected files: alpha caps at exactly 128 with nothing
+ * above it, everywhere content isn't fully transparent. Stretching each
+ * texture's OWN alpha range so its max value maps to 255 fixes the flat
+ * case (128 -> 255) and is a no-op shape-wise for legitimate anti-aliased
+ * edges (e.g. the credits-screen text fix), which vary continuously and
+ * just get uniformly brighter/more opaque -- not clamped/binarized. */
+static void hd_normalize_alpha(unsigned char *pixels, int w, int h) {
+    const size_t n = (size_t)w * (size_t)h;
+    unsigned char max_a = 0;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char a = pixels[i * 4 + 3];
+        if (a > max_a) max_a = a;
+    }
+    if (max_a == 0 || max_a == 255) return; /* all-transparent, or already fine */
+    for (size_t i = 0; i < n; i++) {
+        unsigned char *a = &pixels[i * 4 + 3];
+        *a = (unsigned char)(((unsigned)*a * 255u + max_a / 2) / max_a);
+    }
+}
+
 /* Decoding a replacement PNG here is a synchronous fopen+fread+stbi_load on
  * the render thread (see below) -- fine for the odd new texture appearing
  * mid-scene, but walking into an area where MANY entries are still uncached
@@ -2204,7 +2239,7 @@ static void hd_gl_init(void) {
  * that PNG's .bin (or the whole processed/ folder) and this regenerates
  * just the ones that are missing on the next boot. No mtime/hash staleness
  * check on purpose, to keep the cache-hit path simple. */
-#define HD_CACHE_MAGIC 0x32434448u /* "HDC2" LE (v2: RLE-compressed) */
+#define HD_CACHE_MAGIC 0x33434448u /* "HDC3" LE (v3: alpha-normalized, see hd_normalize_alpha) */
 
 static void hd_cache_paths_for(const char *png_path, char *out_dir, size_t dir_cap,
                                char *out_file, size_t file_cap) {
@@ -2373,8 +2408,10 @@ static unsigned char *hd_decode_png_file(const char *png_path, int *out_w, int *
         fseek(f, 0, SEEK_SET);
         if (len > 0) {
             unsigned char *filebuf = (unsigned char *)malloc((size_t)len);
-            if (filebuf && fread(filebuf, 1, (size_t)len, f) == (size_t)len)
+            if (filebuf && fread(filebuf, 1, (size_t)len, f) == (size_t)len) {
                 pixels = stbi_load_from_memory(filebuf, (int)len, out_w, out_h, &comp, 4);
+                if (pixels) hd_normalize_alpha(pixels, *out_w, *out_h);
+            }
             free(filebuf);
         }
         fclose(f);
@@ -2694,6 +2731,233 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
     s_hd_draws_issued++;
 }
 
+/* ---- Fused-page compositing (opt-in, see gpu_hd_texture_fusion_set) -----
+ * gpu_hd_texture_pack_match_fused (gpu.c) reports the HD-covered and
+ * native-fallback pieces of a query that gpu_hd_texture_pack_match already
+ * rejected as "not fully covered". This composites them into ONE texture
+ * (native pieces uploaded from their already-decoded RGBA, HD pieces drawn
+ * from the SAME cached GL texture the normal path uses, cropped to their
+ * fragment) so draw_hd_replacement_triangle can draw the primitive with a
+ * single GL draw call instead of the seam that splitting it across the HD
+ * and native pipelines produces at their boundary -- see the header comment
+ * on gpu_hd_texture_pack_match_fused (gpu.h) and hd_texture_pack.cpp's
+ * comment above its implementation for the exact scope and the real-Beetle
+ * precedent ("fused page", HD_TEXTURE_CACHE.md). No caching: this path is
+ * only reached for the (rare, opt-in-only) partial-coverage case, and each
+ * composite is a handful of small textures/draws into a small FBO. */
+static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type); /* fwd, defined below */
+
+#define FUSED_COMPOSITE_SCALE 8   /* texels-per-native-texel target resolution -- higher
+                                    * softens the detail-mismatch between a native piece
+                                    * (real native-res content, GL_LINEAR-upscaled) and the
+                                    * HD piece(s) beside it (far more detail baked in); at a
+                                    * low scale (4) that contrast reads as a seam even with
+                                    * no actual gap between the pieces (confirmed live:
+                                    * padding piece destinations, which would close a real
+                                    * gap, changed nothing at scale 4). Not a bug to fix
+                                    * further -- a native fallback patch will always be
+                                    * lower-detail than its HD neighbours; this just keeps
+                                    * that transition soft instead of stark. Confirmed live
+                                    * (2026-09-08) clean at both 8 and 16 (1080p and a real
+                                    * 3840x2160 window, [video] supersampling 4, the config
+                                    * cap); 16 looked identical to 8 there, so 8 stays the
+                                    * default -- 16's 4x extra composite-texture memory buys
+                                    * nothing visible. */
+#define FUSED_COMPOSITE_MAX_DIM 2048
+
+static GLuint s_fused_fbo = 0, s_fused_tex = 0;
+static int    s_fused_tex_w = 0, s_fused_tex_h = 0;
+static GLuint s_fused_blit_prog = 0;
+static GLint  s_fused_blit_uTex = -1, s_fused_blit_uTargetSize = -1;
+static GLuint s_fused_blit_vao = 0, s_fused_blit_vbo = 0;
+
+static const char *FUSED_BLIT_VS =
+    "#version 330\n"
+    "layout(location=0) in vec2 a_pos;\n" /* destination pixel pos within the composite */
+    "layout(location=1) in vec2 a_uv;\n"  /* source UV (0..1) into the bound texture */
+    "uniform vec2 u_target_size;\n"
+    "out vec2 v_uv;\n"
+    "void main(){ v_uv = a_uv;\n"
+    "  vec2 ndc = (a_pos / u_target_size) * 2.0 - 1.0;\n"
+    "  gl_Position = vec4(ndc, 0.0, 1.0); }\n";
+static const char *FUSED_BLIT_FS =
+    "#version 330\n"
+    "in vec2 v_uv; out vec4 frag;\n"
+    "uniform sampler2D u_tex;\n"
+    "void main(){ frag = texture(u_tex, v_uv); }\n";
+
+static void fused_blit_init(void) {
+    if (s_fused_blit_prog) return;
+    s_fused_blit_prog = build_program(FUSED_BLIT_VS, FUSED_BLIT_FS);
+    if (!s_fused_blit_prog) return;
+    s_fused_blit_uTex = p_glGetUniformLocation(s_fused_blit_prog, "u_tex");
+    s_fused_blit_uTargetSize = p_glGetUniformLocation(s_fused_blit_prog, "u_target_size");
+    p_glGenVertexArrays(1, &s_fused_blit_vao);
+    p_glBindVertexArray(s_fused_blit_vao);
+    p_glGenBuffers(1, &s_fused_blit_vbo);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_fused_blit_vbo);
+    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+    p_glEnableVertexAttribArray(0);
+    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+    p_glEnableVertexAttribArray(1);
+    p_glBindVertexArray(0);
+}
+
+/* Draws one destination rect [dx,dy,dw,dh] (composite pixel space) sampling
+ * source UV rect [su,sv,sw,sh] (normalized 0..1) from `tex`, into whatever
+ * FBO/viewport is currently bound. Two triangles, immediate VBO upload --
+ * this only ever draws a handful of quads per fused composite. */
+static void fused_blit_quad(GLuint tex, float dx, float dy, float dw, float dh,
+                            float su, float sv, float sw, float sh) {
+    const float verts[6 * 4] = {
+        dx,      dy,      su,      sv,
+        dx + dw, dy,      su + sw, sv,
+        dx,      dy + dh, su,      sv + sh,
+        dx + dw, dy,      su + sw, sv,
+        dx + dw, dy + dh, su + sw, sv + sh,
+        dx,      dy + dh, su,      sv + sh,
+    };
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    p_glBindVertexArray(s_fused_blit_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_fused_blit_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+/* Builds the fused composite texture for one query's pieces and returns it
+ * (0 on any failure -- caller falls back to native). u_scale_out/v_scale_out/
+ * u_offset_out/v_offset_out are filled the same way gpu_hd_texture_pack_match
+ * fills them for a normal match, mapping this triangle's own us[]/vs[]
+ * (texel-space, u_first..u_last/v_first..v_last) onto the composite: the
+ * composite covers exactly [0, want_w) x [0, want_h) in TEXEL space relative
+ * to (u_first, v_first) -- i.e. its own origin is (u_first, v_first), not 0.
+ * Only u_scale/v_scale come back from here; the caller (gpu_textured_triangle)
+ * already has lim[0]/lim[1] (u_first/v_first) in scope and computes
+ * u_offset/v_offset the same way it would for any other origin shift:
+ * u_offset = -u_first * u_scale, v_offset = -v_first * v_scale. */
+static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
+                                    uint32_t hd_cache_key, const char *hd_png_path,
+                                    float hd_upload_w_texels, float hd_upload_h,
+                                    float *u_scale_out, float *v_scale_out) {
+    fused_blit_init();
+    if (!s_fused_blit_prog) return 0;
+
+    float want_w = 0.0f, want_h = 0.0f;
+    for (int i = 0; i < count; i++) {
+        if (pieces[i].x + pieces[i].width > want_w) want_w = pieces[i].x + pieces[i].width;
+        if (pieces[i].y + pieces[i].height > want_h) want_h = pieces[i].y + pieces[i].height;
+    }
+    if (want_w <= 0.0f || want_h <= 0.0f) return 0;
+    int comp_w = (int)(want_w * FUSED_COMPOSITE_SCALE + 0.5f);
+    int comp_h = (int)(want_h * FUSED_COMPOSITE_SCALE + 0.5f);
+    if (comp_w < 1) comp_w = 1;
+    if (comp_h < 1) comp_h = 1;
+    if (comp_w > FUSED_COMPOSITE_MAX_DIM || comp_h > FUSED_COMPOSITE_MAX_DIM) return 0;
+
+    if (comp_w != s_fused_tex_w || comp_h != s_fused_tex_h || !s_fused_tex) {
+        if (s_fused_tex) glDeleteTextures(1, &s_fused_tex);
+        if (s_fused_fbo) p_glDeleteFramebuffers(1, &s_fused_fbo);
+        s_fused_tex = make_tex(GL_RGBA8, comp_w, comp_h, GL_RGBA, GL_UNSIGNED_BYTE);
+        p_glGenFramebuffers(1, &s_fused_fbo);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fused_fbo);
+        p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_fused_tex, 0);
+        if (p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER) != PSXGL_FRAMEBUFFER_COMPLETE) {
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+            glDeleteTextures(1, &s_fused_tex);
+            p_glDeleteFramebuffers(1, &s_fused_fbo);
+            s_fused_tex = 0; s_fused_fbo = 0; s_fused_tex_w = s_fused_tex_h = 0;
+            return 0;
+        }
+        s_fused_tex_w = comp_w; s_fused_tex_h = comp_h;
+    } else {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fused_fbo);
+    }
+
+    glViewport(0, 0, comp_w, comp_h);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    p_glUseProgram(s_fused_blit_prog);
+    p_glUniform1i(s_fused_blit_uTex, 0);
+    p_glUniform2f(s_fused_blit_uTargetSize, (float)comp_w, (float)comp_h);
+
+    GLuint hd_tex = 0;
+    int need_hd = 0;
+    for (int i = 0; i < count; i++) if (pieces[i].has_hd) { need_hd = 1; break; }
+    if (need_hd) hd_tex = hd_gl_get_texture(hd_cache_key, hd_png_path);
+
+    /* Pieces exactly tile `want` in the LOGICAL layout (computed via exact
+     * rectangle subtraction in hd_texture_pack.cpp, no gaps or overlaps by
+     * construction) -- but they are drawn here as SEPARATE textured quads,
+     * each sampling a DIFFERENT source (the shared HD texture cropped to its
+     * fragment, or a piece's own tiny native-decode texture). Padding each
+     * piece's DESTINATION rect outward by one composite pixel (source UV
+     * left unchanged -- GL_CLAMP_TO_EDGE naturally extends the edge texel's
+     * colour into the pad instead of introducing new content) is cheap
+     * insurance against any genuine sub-pixel rasterization "cracking"
+     * between independently drawn quads. NOT what FUSED_COMPOSITE_SCALE is
+     * compensating for, though: an A/B at scale 8 vs 4 (2026-09-08, same
+     * scene, this padding already applied both times) showed the seam
+     * return at scale 4 and disappear at scale 8/16 either way -- see
+     * FUSED_COMPOSITE_SCALE's own comment for the actual explanation (a
+     * detail-mismatch between the native piece and its HD neighbours, not a
+     * gap). Kept anyway since it costs nothing and covers a real class of
+     * bug even though it was not this one. Only the NATIVE side is padded:
+     * a native piece gets its own dedicated
+     * small texture (CLAMP_TO_EDGE correctly extends ITS edge colour), but an
+     * HD piece is a CROP of the shared, possibly much larger replacement PNG
+     * -- padding its destination without also being careful about the source
+     * would sample past the crop into whatever unrelated content sits
+     * next to it in that PNG (a real bleeding risk, not a safe extension).
+     * Padding only the native side is enough to close the gap: the pad only
+     * needs to win the overlap on ONE side of the seam. */
+    const float kPiecePadPx = 1.0f;
+    int ok = 1;
+    GLuint native_tmp_texs[GPU_HD_FUSED_MAX_PIECES] = {0};
+    int native_tmp_count = 0;
+    for (int i = 0; i < count && ok; i++) {
+        const GpuHdFusedPiece *p = &pieces[i];
+        const float dx = p->x * FUSED_COMPOSITE_SCALE, dy = p->y * FUSED_COMPOSITE_SCALE;
+        const float dw = p->width * FUSED_COMPOSITE_SCALE, dh = p->height * FUSED_COMPOSITE_SCALE;
+        if (p->has_hd) {
+            if (!hd_tex || hd_upload_w_texels <= 0.0f || hd_upload_h <= 0.0f) { ok = 0; break; }
+            fused_blit_quad(hd_tex, dx, dy, dw, dh,
+                            p->hd_src_x / hd_upload_w_texels, p->hd_src_y / hd_upload_h,
+                            p->width / hd_upload_w_texels, p->height / hd_upload_h);
+        } else {
+            const float ndx = dx - kPiecePadPx, ndy = dy - kPiecePadPx;
+            const float ndw = dw + 2.0f * kPiecePadPx, ndh = dh + 2.0f * kPiecePadPx;
+            const int pw = (int)p->width, ph = (int)p->height;
+            if (pw <= 0 || ph <= 0 || (size_t)pw * (size_t)ph * 4u > sizeof(p->native_rgba)) { ok = 0; break; }
+            GLuint tmp = 0;
+            glGenTextures(1, &tmp);
+            if (!tmp) { ok = 0; break; }
+            p_glActiveTexture(PSXGL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tmp);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pw, ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, p->native_rgba);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            native_tmp_texs[native_tmp_count++] = tmp;
+            fused_blit_quad(tmp, ndx, ndy, ndw, ndh, 0.0f, 0.0f, 1.0f, 1.0f);
+        }
+    }
+
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    for (int i = 0; i < native_tmp_count; i++) glDeleteTextures(1, &native_tmp_texs[i]);
+    if (!ok) return 0;
+
+    if (u_scale_out) *u_scale_out = 1.0f / want_w;
+    if (v_scale_out) *v_scale_out = 1.0f / want_h;
+    return s_fused_tex;
+}
+
 /* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
  * implementation for GL/VK/SW, see gpu_uv.h. */
 #include "gpu_uv.h"
@@ -2792,6 +3056,39 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                          hd_u_scale, hd_u_offset, hd_v_scale, hd_v_offset,
                                          hd_tint_r, hd_tint_g, hd_tint_b);
             return;
+        }
+        /* Fused-page fallback (opt-in, off by default -- see
+         * gpu_hd_texture_fusion_set): only tried for Beetle-format when the
+         * plain match above (hd_hit) failed. See gpu_hd_texture_pack_match_fused's
+         * header comment (gpu.h) for the exact scope; anything outside it
+         * (including the feature being off) returns 0 and this whole block
+         * is a no-op, falling straight through to native like before. */
+        if (hd_backend == 1 && gpu_hd_texture_fusion_enabled()) {
+            uint32_t fused_cache_key = 0;
+            const char *fused_png_path = NULL;
+            float fused_upload_w = 0, fused_upload_h = 0;
+            GpuHdFusedPiece fused_pieces[GPU_HD_FUSED_MAX_PIECES];
+            int fused_count = 0;
+            if (gpu_hd_texture_pack_match_fused(
+                    texpage, clut_x, clut_y, lim[0], lim[2], lim[1], lim[3],
+                    &fused_cache_key, &fused_png_path, &fused_upload_w, &fused_upload_h,
+                    fused_pieces, GPU_HD_FUSED_MAX_PIECES, &fused_count)) {
+                float fused_u_scale = 0, fused_v_scale = 0;
+                GLuint fused_tex = build_fused_composite(
+                    fused_pieces, fused_count, fused_cache_key, fused_png_path,
+                    fused_upload_w, fused_upload_h, &fused_u_scale, &fused_v_scale);
+                if (fused_tex) {
+                    s_hd_matches_seen++;
+                    flush_flat_batch();
+                    flush_tex_batch();
+                    draw_hd_replacement_triangle(
+                        xs, ys, us, vs, col, rawtex, fused_tex,
+                        fused_u_scale, -(float)lim[0] * fused_u_scale,
+                        fused_v_scale, -(float)lim[1] * fused_v_scale,
+                        1.0f, 1.0f, 1.0f);
+                    return;
+                }
+            }
         }
         if (s_hd_debug_missing) {
             flush_flat_batch();

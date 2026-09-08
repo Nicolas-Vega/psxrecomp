@@ -443,6 +443,24 @@ struct RuntimeConfig {
     // [video] perspective_texturing = true.
     bool                  video_perspective_texturing = false;
 
+    // hd_texture_page_fusion: when a Beetle-format HD texture pack's replacement
+    // coverage is PARTIAL within one mesh (some triangles match an entry, the
+    // rest fall back to native VRAM rendering), composite the HD and native
+    // pieces into one texture and draw the primitive with a single GL draw call
+    // instead of drawing it split across the HD and native pipelines (two draws,
+    // two shaders/blend states) -- the latter produces a visible thin seam right
+    // where they meet (confirmed live: a character-face mesh with an
+    // incompletely-covered skin/hair patch, and separately a wall/door panel
+    // mesh). Real Beetle PSX HW's Vulkan renderer avoids this the same way (a
+    // "fused page", see its HD_TEXTURE_CACHE.md). Scoped to the dominant real
+    // case (one query rect, one partially-covering upload/entry) rather than a
+    // fully general compositor -- see hd_texture_pack_match_fused's comment in
+    // hd_texture_pack.cpp. Off by default: it only changes anything for titles
+    // using a Beetle-format pack with partial coverage, and per-title opt-in
+    // keeps it from ever affecting a title/pack combination it was not verified
+    // against. [video] hd_texture_page_fusion = true to enable for one title.
+    bool                  video_hd_texture_page_fusion = false;
+
     // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
     // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —
     // the same default as the reference implementations — because some games

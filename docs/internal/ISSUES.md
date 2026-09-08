@@ -704,4 +704,255 @@ post-dispatch IRQ pump shadow guard (already in tree).
 - `interrupts.c`: `g_exc_setjmp_epoch` + getter; fixup calls in
   deferred_exception_longjmp + psx_rfe_escape_check.
 - `traps.c`: fixup call at the deferred-honor longjmp site.
+
+## Issue #10 — Access-violation crash after ~6-7h continuous runtime (overnight session)
+
+**Status:** open, not yet investigated
+**Date opened:** 2026-09-08
+
+### Symptom
+
+`VagrantStory_Recompiled.exe` crashed overnight after being left running
+unattended for several hours (machine left on; game was idling, not
+under active input). `psx_last_run_report.json` (written by the SEH
+crash handler) recorded:
+
+- `reason: "seh"`, exit at `2026-09-08T09:30:03Z`
+- Guest frame counter at crash: **1,395,540** (~6-7h at 59.9 Hz)
+- `seh.code: 0xC0000005` (access violation), **write** access
+- `fault_addr: 0x00007FF4FCDC6EB4` — a large heap-range address, not
+  near the module base (`module_base: 0x00007FF6FAF40000`), consistent
+  with a dangling/corrupted pointer or an out-of-bounds write into a
+  large heap allocation rather than a null/near-null deref
+- Crash RIP: `module_offset 0x59EB1` in `VagrantStory_Recompiled.exe`
+- `stack_scan` shows the same handful of offsets recurring
+  (`0x83296`, `0x8C89C`/`0x8C6B8`, `0xBD70CE`/`0xBD6BF8`) — worth
+  symbolizing first since they repeat both directly and via the deeper
+  frames
+
+### What's already ruled out
+
+- Not a same-session regression from the alpha-normalization fix or
+  the widescreen menu-PC fix landed earlier the same day — the crash
+  happened many hours later, deep into idle overnight runtime, and
+  `frame: 1,395,540` is far beyond where either of those code paths
+  would misbehave on the first few thousand frames if they were wrong.
+
+### Suspected contributing factor (unconfirmed)
+
+`gpu_gl_renderer.c`'s HD-texture GL cache (`s_hd_tex_cache`, see
+`hd_gl_cache_insert`) is documented in-tree as "Never shrinks/evicts —
+a whole session's worth of HD textures for one game is not expected to
+be a meaningful budget concern." That assumption was scoped to a normal
+play session, not an unattended multi-hour idle run; worth checking
+whether cache growth (or some other unbounded per-frame allocation)
+correlates with the crash once the offsets above are symbolized.
+
+### Next steps
+
+- Symbolize `module_offset 0x59EB1` and the repeating `stack_scan`
+  offsets against a matching build (`nightly-2-g1d4646f3-dirty`,
+  2026-09-06 23:43:52 build) to identify the actual faulting function.
+- Try to reproduce with a long unattended/idle soak test rather than
+  active play, since that's the condition that triggered it.
+- Check whether HD-texture GL cache size (`gl_renderer_hd_tex_cache_count`)
+  or any other per-frame-growing structure correlates with uptime in a
+  long soak.
+
+## Issue #11 — Beetle-format HD pack: visible seam where partial mesh coverage meets native fallback
+
+**Status:** FIXED (opt-in) via fused-page compositing, 2026-09-08
+**Date opened:** 2026-09-08
+
+### Symptom
+
+A thin but clearly visible line/seam appears on the character's face (and
+was separately observed on wall/door panels and the game's opening
+cutscene backdrop) exactly where a mesh has PARTIAL Beetle-format HD
+coverage: some triangles of the mesh match a replacement PNG, the rest
+fall back to native rendering (confirmed via
+`PSXRECOMP_HD_TEXTURE_DEBUG_MISSING=1`, which paints unmatched opaque
+prims solid violet — the missing patch for the reproduction case is
+palette hash `fedcf2e0`, four small skin/hair fragments exported to
+`missing_textures/` and never added to the pack).
+
+### Confirmed via live A/B (`hd_backend none|beetle`, same static scene,
+same camera, same frame)
+
+- `hd_backend none` (100% native, no HD replacement at all): **no seam**.
+- `hd_backend beetle` (partial HD coverage + native fallback for the
+  missing patch): **seam visible**, right at the HD/native boundary.
+
+This conclusively ties the seam to mixing HD-replaced and native-rendered
+triangles within one mesh — it is not present when the whole mesh
+renders through a single path.
+
+### What was tried and ruled out (both isolated via live rebuild + A/B,
+same reproduction scene)
+
+1. **Geometric sub-pixel overdraw** — pushed each HD triangle's vertices
+   ~0.5 native-VRAM-px outward from its own centroid (cheap, safe given
+   this renderer has no depth test anywhere — painter's-order only) on
+   the theory that two independent GL draw calls (the immediate
+   single-triangle HD draw vs. the batched native draw) could leave a
+   sub-pixel rasterization gap at the shared edge despite using
+   bit-identical vertex coordinates. **No visible change at all** —
+   ruled out a geometric/coverage gap as the cause.
+2. **Force full opacity in `HD_FS`** (`frag = vec4(rgb, 1.0)` instead of
+   `vec4(rgb, c.a)`, blend left enabled) on the theory that the
+   replacement PNG's own edge alpha (soft/anti-aliased border, real
+   blending enabled since the earlier alpha-normalization fix) was
+   bleeding into whatever was already in the framebuffer at that pixel.
+   **Made the seam MORE visible, not less** — this is informative: the
+   partial alpha blend that existed before was mildly *softening* a
+   harder discontinuity underneath, not causing one. Ruled out
+   edge-alpha framebuffer bleeding as the primary cause.
+
+### Current best explanation (unconfirmed, not yet fixed)
+
+Given both a geometry-level and a blend-level fix independently failed
+(one making things worse when the blend was removed), the seam is most
+likely a **color/brightness mismatch between the pack's replacement art
+and the native/original texture** at the exact boundary where coverage
+is incomplete — i.e. a content-authoring limitation of partial-coverage
+HD packs, not a rendering pipeline bug. The Beetle-format matcher
+(`gpu_hd_texture_pack_match`) is a plain exact `(texture_hash,
+palette_hash)` dictionary lookup with 0 ambiguous keys (confirmed via
+`hd_backend`'s live stats) — no approximate/cross-palette matching or
+tint-compensation path exists for it (unlike DuckStation-format's
+`hd_texture_dump_match`, which does derive a per-scene tint — see
+`u_tint` in `HD_FS` — specifically so a lighting change still shows
+correctly on an approximately-matched HD texture). Whether Beetle
+lacking that tint path is *also* a contributing factor here was not
+tested this session.
+
+### Also checked: UV crop/off-by-one in `gpu_hd_texture_pack_match`
+
+User hypothesis: a missing pixel in the HD texture's crop (`u_scale`/
+`u_offset`/`v_scale`/`v_offset`, `gpu.c` lines ~307-380) could leave a
+1-texel sliver unsampled at a panel edge. That formula already has an
+extensive comment documenting a prior fix for a related-sounding bug
+("sliver of a neighboring image in the same upload" from a truncating
+division). Checked 3 already-matched pack entries' PNG pixel
+dimensions against their native upload size reported by
+`hd_match_ring`: `66c22116-94c4440b.png` (native 64x128 -> PNG
+512x512), `24051f2c-d48e9846.png` (native 64x128 -> PNG 512x512),
+`6d7af0a0-27781d7c.png` (native 32x64 -> PNG 256x256) — all three are
+clean, consistent 8x-width/4x-height integer ratios with no fractional
+remainder, so no general off-by-one crop bug is evident from this
+sample. Could not check the actual file used at the Sydney-scene face
+seam itself (never pinned down live — see above), so this does not
+rule out an off-by-one specific to that file/fragment.
+
+### Next steps
+
+- Add the same derived-tint compensation Beetle format currently lacks
+  (`hd_tint_r/g/b` are hardcoded to `1.0,1.0,1.0` for `hd_backend==1` in
+  `gpu_textured_triangle`, see `gpu_gl_renderer.c`) and re-run the same
+  A/B to see if it narrows or removes the seam.
+- Failing that, the real fix is completing the pack's coverage for the
+  specific missing patch(es) rather than a renderer change — paint/add
+  the exported `missing_textures/*fedcf2e0*.png` fragments (and their
+  equivalents for the wall/door-panel and intro-backdrop cases) into the
+  active pack.
+- The opening-cutscene backdrop lines are a SEPARATE, already-confirmed
+  issue: `hd_backend none` removes them completely with FULL coverage
+  (not partial), meaning that specific artifact is baked directly into
+  one or more of the pack's own PNGs for that scene (see the session
+  notes; the exact file(s) were never pinned down — `hd_match_ring`'s
+  buffer is too small and evicts too fast under the intro's font-glyph
+  draw traffic to catch a rarely-redrawn backdrop texture live). Not
+  addressed by the fix below (it does not apply -- that scene has full
+  coverage, not partial).
+
+### The fix: fused-page compositing (opt-in, real-Beetle-inspired)
+
+Researched the actual Beetle PSX HW Vulkan renderer's source
+(`libretro/beetle-psx-libretro`, `HD_TEXTURE_CACHE.md`) for how it
+avoids this class of seam. It never draws a primitive split across two
+GL pipelines: when a draw's sample region spans multiple VRAM uploads
+with mixed HD/native coverage, it composites everything into one
+"fused page" texture first and draws the primitive once. Implemented
+the same idea here, scoped down to the dominant real case (one query
+rect, no UV wrap; one upload/entry whose fragments partially cover it)
+rather than a fully general multi-upload compositor:
+
+- `hd_texture_pack.cpp`: `hd_texture_pack_match_fused()` /
+  `_match_fused_draw()` — reports each covered (HD) and uncovered
+  (native) piece of a query hd_texture_pack_match already rejected as
+  not-fully-covered, via the same exact rectangle-subtraction
+  `covered_by_upload` uses (now keeping the remainder instead of
+  discarding it). `hd_texture_pack_decode_native_rgba()` — a
+  C-callable wrapper around the existing native-VRAM decode (shared
+  with the missing-texture exporter) for the uncovered pieces.
+- `gpu.c`: `gpu_hd_texture_pack_match_fused()` — texel-space wrapper,
+  decodes native pieces up front (`GpuHdFusedPiece.native_rgba`, capped
+  at `GPU_HD_FUSED_PIECE_MAX_DIM` 128px/axis — a piece bigger than that
+  just makes the whole call return 0, falling back to today's
+  behavior). `gpu_hd_texture_fusion_set/enabled()` — the opt-in flag.
+- `gpu_gl_renderer.c`: `build_fused_composite()` — builds the composite
+  in a dedicated small FBO (`FUSED_COMPOSITE_SCALE` 8 texels per native
+  texel; see its comment for why), each native piece uploaded as its
+  own tiny GL texture and drawn in, each HD piece drawn from the SAME
+  cached GL texture the normal path already uses (no duplicate
+  decode/upload), native pieces padded 1px into their neighbours as
+  cheap insurance against real cracking (see that code's comment — NOT
+  what fixed the actual reported seam; the composite scale did). No
+  caching of the composite itself: this path is opt-in and rare enough
+  (only partial-coverage triangles) that rebuilding it every draw was
+  fine in testing. Wired into `gpu_textured_triangle` right after the
+  plain HD match fails, before the `s_hd_debug_missing` violet-paint
+  fallback.
+- Config: `[video] hd_texture_page_fusion = true` in game.toml
+  (`config_loader.h/.cpp`, `RuntimeGameConfig`), or
+  `PSX_HD_TEXTURE_PAGE_FUSION=1` env override — off by default, exactly
+  the "depende del juego si se activa" the user asked for. Deliberately
+  NOT wired into the launcher's live-settings UI (seed/us/ls structs) —
+  boot-time/per-title only, to keep the change small.
+
+Confirmed live (2026-09-08): the "Have you found Sydney?" face seam is
+gone with the feature on, both at 1080p and a real 3840x2160 window (4x
+supersampling, the config's cap). A fainter artifact appeared when
+`FUSED_COMPOSITE_SCALE` was dropped to 4 for comparison, understood to
+be an inherent detail mismatch between the native piece (real
+native-resolution content) and its much-more-detailed HD neighbours,
+not a gap — see that constant's comment. 8 was kept as the shipped
+default (16 looked identical at 4K, just costs more texture memory).
+
+### Also done same day: matched real Beetle's hard alpha-cutoff behavior
+
+Read real Beetle PSX HW's actual `command_fragment.glsl.h` (GL RHI
+backend, `libretro/beetle-psx-libretro`) to look for other rendering
+differences. Confirmed it uses a hard `if (opacity < 0.5) discard;`
+with no real alpha blending anywhere, including for its own HD-texture-
+replacement path (`hd_sample_nearest`/`hd_sample_trilinear` feed the
+same opacity< 0.5 test). `HD_FS` here previously did real blending
+(`GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`, `frag = vec4(rgb, c.a)`) —
+added earlier the same session to fix the credits-screen replacement's
+anti-aliased text looking jagged under an 0.5 cutoff, but BEFORE the
+`hd_normalize_alpha` fix (this pack's alpha commonly capped at
+~128-140, not 255) landed. Re-tested with both fixes in place: reverted
+`HD_FS` to `if (c.a < 0.5) discard;` / `frag = vec4(rgb, 1.0)` (matches
+Beetle exactly) and confirmed live — no regression on the credits
+screen or the Sydney-face fused-composite scene. Kept as the new
+default: one less source of divergence from the reference renderer.
+
+### Noted, not investigated further: vertex/texture color scale mismatch
+
+While comparing against Beetle's shader, noticed this project's own
+GL renderer uses two different 5-bit-to-float conventions in the same
+color pipeline: texture colors (`col5()`, `gpu_gl_renderer.c`) scale by
+`/31.0` (proportional, reaches 1.0 at max); vertex/Gouraud shading
+colors (multiple call sites, e.g. lines building `cs[i]` vertex data)
+scale via `(v5 << 3) / 255.0` (never quite reaches 1.0 at max, ~0.973).
+These get multiplied together in `TEX_FS`/`HD_FS` (`rgb * v_col *
+2.0`). Pre-existing code, not touched this session, and NOT a
+candidate for today's HD-pack seam investigation specifically — it is
+shared by every rendering path (native, DuckStation-format, and
+Beetle-format all hit the same `v_col`/`col5` code), so it cannot
+explain a difference that only shows up on Beetle-format partial
+coverage. Left uninvestigated per the user's call — worth a live A/B
+(a scene with an obvious shading gradient) in a future session, but no
+evidence yet that it is visibly wrong.
+
 - All inert when diff mode is off; normal play unaffected. Builds clean.

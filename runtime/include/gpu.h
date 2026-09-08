@@ -168,6 +168,52 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
                               float* u_scale, float* u_offset,
                               float* v_scale, float* v_offset);
 
+/* Fused-page opt-in (title-configurable, [video] hd_texture_page_fusion in
+ * game.toml) -- off by default so no existing title's rendering changes.
+ * See gpu_hd_texture_pack_match_fused's header comment below. */
+void gpu_hd_texture_fusion_set(int on);
+int  gpu_hd_texture_fusion_enabled(void);
+
+#define GPU_HD_FUSED_MAX_PIECES 4
+#define GPU_HD_FUSED_PIECE_MAX_DIM 128 /* per-axis cap on a native piece's decoded size */
+#define GPU_HD_FUSED_PIECE_MAX_BYTES \
+    (GPU_HD_FUSED_PIECE_MAX_DIM * GPU_HD_FUSED_PIECE_MAX_DIM * 4)
+
+/* One piece of a fused composite, TEXEL-space (x/y/width/height, relative to
+ * the query's own u_first/v_first origin -- i.e. x=0,y=0 is the primitive's
+ * own UV origin, not a VRAM-absolute coordinate). has_hd selects which of
+ * hd_src_x/hd_src_y (into the shared replacement PNG named by
+ * gpu_hd_texture_pack_match_fused's png_path/upload_w_texels/upload_h_out)
+ * or native_rgba (already-decoded VRAM content, RGBA8, tightly packed rows
+ * of width*4 bytes, valid for width*height*4 <= GPU_HD_FUSED_PIECE_MAX_BYTES)
+ * fills it. */
+typedef struct GpuHdFusedPiece {
+    float x, y, width, height;
+    int has_hd;
+    float hd_src_x, hd_src_y;
+    uint8_t native_rgba[GPU_HD_FUSED_PIECE_MAX_BYTES];
+} GpuHdFusedPiece;
+
+/* Only meaningful (and only tried by gpu_gl_renderer.c) when
+ * gpu_hd_texture_fusion_enabled() and gpu_hd_texture_pack_match above
+ * already returned 0 for this exact query: composites the query's HD-covered
+ * and native-fallback pieces so the caller can build ONE texture and draw
+ * the primitive through a SINGLE GL draw call, instead of the seam that
+ * splitting it across the HD and native pipelines (two draws, two
+ * shaders/blend states) produces where they meet -- see
+ * hd_texture_pack_match_fused's comment in hd_texture_pack.cpp for the exact
+ * (narrow, common) scope and why real Beetle PSX HW's Vulkan renderer avoids
+ * this by the same technique ("fused page", HD_TEXTURE_CACHE.md). Returns 0
+ * for anything outside that scope (UV wrap, ambiguous/multi-upload overlap,
+ * a piece bigger than GPU_HD_FUSED_PIECE_MAX_DIM) so the caller falls back
+ * to plain native rendering unchanged. */
+int gpu_hd_texture_pack_match_fused(int texpage, int clut_x, int clut_y,
+                                    int u_first, int u_last, int v_first, int v_last,
+                                    uint32_t* cache_key, const char** png_path,
+                                    float* upload_w_texels_out, float* upload_h_out,
+                                    GpuHdFusedPiece* out_pieces, int max_pieces,
+                                    int* out_count);
+
 /* Match-funnel diagnostics for the Beetle backend (mirrors
  * gpu_hd_texture_dump_match_stats' purpose, different bucket layout to match
  * hd_texture_pack.h's HdTextureLookupStatus). out[] = {attempts, none

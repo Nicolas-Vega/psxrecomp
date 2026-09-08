@@ -1212,6 +1212,7 @@ static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
  * SXY readback are untouched. Default off = the faithful floor. */
 static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
+static int           g_video_hd_texture_page_fusion = 0; /* [video] hd_texture_page_fusion, see config_loader.h */
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
@@ -12148,6 +12149,8 @@ int main(int argc, char** argv) {
                 gc.runtime.video_geometry_correction ? 1 : 0;
             g_video_perspective_texturing =
                 gc.runtime.video_perspective_texturing ? 1 : 0;
+            g_video_hd_texture_page_fusion =
+                gc.runtime.video_hd_texture_page_fusion ? 1 : 0;
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
@@ -14198,10 +14201,13 @@ session_reboot:
         g_video_geometry_correction = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PERSPECTIVE_TEXTURING"))
         g_video_perspective_texturing = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_HD_TEXTURE_PAGE_FUSION"))
+        g_video_hd_texture_page_fusion = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PGXP_CPU_MODE"))
         g_video_pgxp_cpu_mode = (*e && *e != '0') ? 1 : 0;
     gte_geometry_correction_set(g_video_geometry_correction);
     gpu_texture_correction_set(g_video_perspective_texturing);
+    gpu_hd_texture_fusion_set(g_video_hd_texture_page_fusion);
     pgxp_set_cpu_mode(g_video_pgxp_cpu_mode);
     pgxp_set_tolerance(g_video_pgxp_tolerance);
     /* Scanlines: env override wins over config, same as the corrections above,

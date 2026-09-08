@@ -197,6 +197,71 @@ void hd_texture_pack_diag_font_region_stats(uint64_t out[5]);
 int hd_texture_pack_diag_dump_uploads(const HdTexturePack* pack, char* out,
                                       size_t out_capacity);
 
+/* Fused-page support (opt-in, see gpu_hd_texture_fusion_set): a piece of a
+ * partially-HD-covered query, in VRAM-absolute word(x)/texel(y) coordinates
+ * -- the same space HdTextureDrawQuery's page_x/page_y + u/v use. has_hd
+ * selects which of the two ways to fill it: the shared replacement PNG at
+ * (hd_src_x, hd_src_y) within the upload's own texel space (upload width in
+ * texels/height come back from hd_texture_pack_match_fused itself), or a
+ * hd_texture_pack_decode_native_rgba() call using this rect directly. */
+typedef struct HdFusedPiece {
+    uint16_t x, y, width, height;
+    int has_hd;
+    uint32_t hd_src_x, hd_src_y;
+} HdFusedPiece;
+
+/* See hd_texture_pack.cpp's comment above the implementation for the exact
+ * scope (one wanted rect, one partially-covering upload/entry -- the
+ * dominant real case; anything else returns 0 so the caller keeps today's
+ * single-shot hd_texture_pack_match/hd_texture_pack_match_draw behavior
+ * unchanged). On success (1), *out_count pieces are written to out_pieces
+ * (capacity max_pieces) and out_entry/out_upload_width_words/out_upload_height
+ * describe the ONE replacement PNG the has_hd pieces reference. */
+int hd_texture_pack_match_fused(HdTexturePack* pack,
+                                const HdTextureDrawQuery* query,
+                                HdTexturePackEntry* out_entry,
+                                uint16_t* out_upload_width_words,
+                                uint16_t* out_upload_height,
+                                HdFusedPiece* out_pieces,
+                                int max_pieces,
+                                int* out_count);
+
+/* Texpage-based convenience wrapper, same role as hd_texture_pack_match_draw
+ * for the fused-page path -- keeps the texpage decode in one place instead
+ * of duplicating it in gpu.c. out_query receives the HdTextureDrawQuery this
+ * built (page_x/page_y/depth/clut/vram) so the caller can pass it straight
+ * to hd_texture_pack_decode_native_rgba for each has_hd==0 piece without
+ * re-deriving page_x/page_y/depth from texpage itself. */
+int hd_texture_pack_match_fused_draw(HdTexturePack* pack,
+                                     uint16_t texpage,
+                                     uint16_t clut_x,
+                                     uint16_t clut_y,
+                                     uint8_t u_first,
+                                     uint8_t u_last,
+                                     uint8_t v_first,
+                                     uint8_t v_last,
+                                     const uint16_t* vram,
+                                     size_t vram_word_count,
+                                     HdTexturePackEntry* out_entry,
+                                     uint16_t* out_upload_width_words,
+                                     uint16_t* out_upload_height,
+                                     HdFusedPiece* out_pieces,
+                                     int max_pieces,
+                                     int* out_count,
+                                     HdTextureDrawQuery* out_query);
+
+/* Decodes native VRAM content for an arbitrary VRAM-absolute rect (an
+ * HdFusedPiece with has_hd == 0, or any other word/texel rect in the same
+ * space) straight from query->vram -- no upload/pack lookup involved.
+ * out_rgba must be at least rect_w*pixels_per_word(query->depth)*rect_h*4
+ * bytes; returns 0 (leaving out_rgba untouched) if out_capacity is too
+ * small. out_w/out_h report the actual decoded size in texels. */
+int hd_texture_pack_decode_native_rgba(const HdTextureDrawQuery* query,
+                                       uint16_t rect_x, uint16_t rect_y,
+                                       uint16_t rect_w, uint16_t rect_h,
+                                       uint8_t* out_rgba, uint32_t out_capacity,
+                                       uint32_t* out_w, uint32_t* out_h);
+
 /* Live GP0 draw adapter: derives page_x/page_y/depth from the PS1 texpage word
  * and applies the same deterministic residency/CLUT/UV match above. This keeps
  * the renderer's texpage interpretation in the focused unit-test surface. */

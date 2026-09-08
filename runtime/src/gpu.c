@@ -273,6 +273,13 @@ void gpu_hd_texture_set_backend(int backend) {
 }
 int  gpu_hd_texture_get_backend(void) { return g_hd_texture_backend; }
 
+/* Fused-page opt-in ([video] hd_texture_page_fusion in game.toml, see
+ * config_loader.cpp) -- off by default so no existing title's rendering
+ * changes. See gpu_hd_texture_pack_match_fused's header comment. */
+static int g_hd_fused_pages_enabled = 0;
+void gpu_hd_texture_fusion_set(int on) { g_hd_fused_pages_enabled = on ? 1 : 0; }
+int  gpu_hd_texture_fusion_enabled(void) { return g_hd_fused_pages_enabled; }
+
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
 
@@ -377,6 +384,88 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
     if (v_offset)
         *v_offset = ((float)m.source_y - (float)v_first) / (float)upload_h;
     ++g_hd_pack_matched;
+    return 1;
+}
+
+/* Fused-page path (opt-in, see gpu_hd_texture_fusion_set): reached only after
+ * gpu_hd_texture_pack_match above already returned 0 for this same query --
+ * see hd_texture_pack_match_fused's comment in hd_texture_pack.cpp for
+ * exactly which (narrow, common) case this covers and why. All coordinates
+ * here are TEXEL-space (x/y/width/height), already converted from
+ * hd_texture_pack.cpp's word-space x/width via `ppw` -- gpu_gl_renderer.c
+ * should not need to know about the word/texel distinction at all. */
+int gpu_hd_texture_pack_match_fused(int texpage, int clut_x, int clut_y,
+                                    int u_first, int u_last, int v_first, int v_last,
+                                    uint32_t* cache_key, const char** png_path,
+                                    float* upload_w_texels_out, float* upload_h_out,
+                                    GpuHdFusedPiece* out_pieces, int max_pieces,
+                                    int* out_count) {
+    if (out_count) *out_count = 0;
+    if (!g_hd_texture_pack || !out_pieces || max_pieces <= 0) return 0;
+    const int depth_bits = (texpage >> 7) & 3;
+    const unsigned ppw = depth_bits == 0 ? 4u : depth_bits == 1 ? 2u : 1u;
+
+    HdTexturePackEntry entry;
+    uint16_t upload_w_words = 0, upload_h = 0;
+    HdFusedPiece pieces[GPU_HD_FUSED_MAX_PIECES];
+    int count = 0;
+    HdTextureDrawQuery query;
+    const int cap = max_pieces < GPU_HD_FUSED_MAX_PIECES ? max_pieces : GPU_HD_FUSED_MAX_PIECES;
+    const int ok = hd_texture_pack_match_fused_draw(
+        g_hd_texture_pack, (uint16_t)texpage, (uint16_t)clut_x, (uint16_t)clut_y,
+        (uint8_t)u_first, (uint8_t)u_last, (uint8_t)v_first, (uint8_t)v_last,
+        vram, sizeof(vram) / sizeof(vram[0]),
+        &entry, &upload_w_words, &upload_h, pieces, cap, &count, &query);
+    if (!ok || count <= 0 || count > cap) return 0;
+
+    const unsigned upload_w_texels = (unsigned)upload_w_words * ppw;
+    if (upload_w_texels == 0 || upload_h == 0) return 0;
+    /* Same construction as gpu_hd_texture_pack_match's cache_key above --
+     * hd_gl_get_texture keys purely on this integer, so it must stay
+     * consistent with the plain (non-fused) match path for the same entry. */
+    if (cache_key)
+        *cache_key = 0x80000000u |
+                     (entry.texture_hash ^ (entry.palette_hash * 2654435761u));
+    if (png_path) *png_path = entry.replacement_path;
+    if (upload_w_texels_out) *upload_w_texels_out = (float)upload_w_texels;
+    if (upload_h_out) *upload_h_out = (float)upload_h;
+
+    /* Pieces exactly tile `want` (the query rect hd_texture_pack.cpp resolved
+     * u_first/v_first into), so its VRAM-absolute word/texel origin is just
+     * the min x/y across all of them -- make the pieces we hand back
+     * relative to that origin (0,0 = the primitive's own UV origin) since
+     * that's what gpu_gl_renderer.c actually wants to lay a composite out
+     * with, not a VRAM-absolute position. */
+    unsigned origin_wx = pieces[0].x, origin_y = pieces[0].y;
+    for (int i = 1; i < count; i++) {
+        if (pieces[i].x < origin_wx) origin_wx = pieces[i].x;
+        if (pieces[i].y < origin_y) origin_y = pieces[i].y;
+    }
+    for (int i = 0; i < count; i++) {
+        out_pieces[i].x = (float)((pieces[i].x - origin_wx) * ppw);
+        out_pieces[i].y = (float)(pieces[i].y - origin_y);
+        out_pieces[i].width = (float)(pieces[i].width * ppw);
+        out_pieces[i].height = (float)pieces[i].height;
+        out_pieces[i].has_hd = pieces[i].has_hd;
+        out_pieces[i].hd_src_x = (float)(pieces[i].hd_src_x * ppw);
+        out_pieces[i].hd_src_y = (float)pieces[i].hd_src_y;
+        /* Native pieces decode straight from VRAM here (cheap CPU work, done
+         * once per fused-composite cache miss -- see gpu_gl_renderer.c's
+         * cache) instead of handing gpu_gl_renderer.c the raw query struct,
+         * so it never needs to know about HdTextureDrawQuery at all. */
+        if (!pieces[i].has_hd) {
+            uint32_t w = 0, h = 0;
+            const uint32_t cap_bytes = (uint32_t)pieces[i].width * ppw *
+                                       (uint32_t)pieces[i].height * 4u;
+            if (cap_bytes == 0 || cap_bytes > sizeof(out_pieces[i].native_rgba)) return 0;
+            if (!hd_texture_pack_decode_native_rgba(
+                    &query, pieces[i].x, pieces[i].y, pieces[i].width, pieces[i].height,
+                    out_pieces[i].native_rgba, (uint32_t)sizeof(out_pieces[i].native_rgba),
+                    &w, &h))
+                return 0;
+        }
+    }
+    if (out_count) *out_count = count;
     return 1;
 }
 

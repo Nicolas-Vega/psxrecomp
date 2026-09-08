@@ -3,6 +3,7 @@
 #ifndef HD_TEXTURE_PACK_DISABLE_PNG_DECODE
 #include "../third_party/stb_image.h" /* declarations only; implementation is shared */
 #endif
+#include "../third_party/stb_image_write.h" /* declarations only; impl in psx_window_icon.cpp */
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1264,6 +1266,110 @@ size_t hd_texture_pack_tracking_upload_count(const HdTexturePack* pack) {
     return pack ? pack->uploads.size() : 0;
 }
 
+/* ---- Missing-texture export -----------------------------------------------
+ * When a draw's (texture_hash, palette_hash) has no entry in the active
+ * pack, dump the native VRAM content it WOULD need as a plain RGBA PNG named
+ * the same way the pack itself names replacements (<texhash>-<palhash>.png),
+ * so a later pass can eyeball what's missing, upscale/redraw it by hand, and
+ * drop the result straight into the pack under that exact filename. Purely
+ * an authoring aid -- never consulted for matching, and a decode/write
+ * failure here must never affect the native draw itself. */
+namespace {
+
+void hd_texture_rgba5551_to_rgba8(uint16_t c, uint8_t* out4) {
+    const unsigned r5 = c & 0x1Fu;
+    const unsigned g5 = (c >> 5) & 0x1Fu;
+    const unsigned b5 = (c >> 10) & 0x1Fu;
+    /* Hard cutout, matching hd_texture_hash_clut's own palette convention:
+     * the all-zero color (bits 0-14 AND the STP bit) is the one true
+     * "transparent" entry; every other color -- STP included -- is opaque
+     * for a plain reference-image export like this one. */
+    out4[0] = static_cast<uint8_t>((r5 * 255u + 15u) / 31u);
+    out4[1] = static_cast<uint8_t>((g5 * 255u + 15u) / 31u);
+    out4[2] = static_cast<uint8_t>((b5 * 255u + 15u) / 31u);
+    out4[3] = (c == 0) ? 0 : 255;
+}
+
+/* Decodes the query's exact WORD-space rect (as computed by
+ * query_rectangles/hd_texture_pack_match, same convention as first_x/first_y
+ * there) into a top-left-origin RGBA8 image. Output width is in TEXELS
+ * (rect.width words * pixels-per-word for the depth), height in scanlines. */
+void hd_texture_decode_query_rgba(const HdTextureDrawQuery& query, const Rect& rect,
+                                  std::vector<uint8_t>* out_rgba,
+                                  unsigned* out_w, unsigned* out_h) {
+    const unsigned pixels_per_word = query.depth == HD_TEXTURE_DEPTH_4BPP ? 4u :
+                                     query.depth == HD_TEXTURE_DEPTH_8BPP ? 2u : 1u;
+    const unsigned w = rect.width * pixels_per_word;
+    const unsigned h = rect.height;
+    *out_w = w; *out_h = h;
+    out_rgba->assign(size_t{w} * h * 4u, 0);
+    if (w == 0 || h == 0) return;
+
+    std::array<uint16_t, 256> palette{};
+    unsigned clut_count = 0;
+    if (query.depth != HD_TEXTURE_DEPTH_16BPP) {
+        clut_count = query.depth == HD_TEXTURE_DEPTH_4BPP ? 16u : 256u;
+        const unsigned cy = query.clut_y & (kVramHeight - 1);
+        for (unsigned i = 0; i < clut_count; ++i)
+            palette[i] = query.vram[cy * kVramWidth +
+                                    ((unsigned{query.clut_x} + i) & (kVramWidth - 1))];
+    }
+
+    for (unsigned row = 0; row < h; ++row) {
+        const unsigned vy = (rect.y + row) & (kVramHeight - 1);
+        for (unsigned col = 0; col < w; ++col) {
+            const unsigned word_x = (rect.x + col / pixels_per_word) & (kVramWidth - 1);
+            const uint16_t word = query.vram[vy * kVramWidth + word_x];
+            uint8_t* px = out_rgba->data() + (size_t{row} * w + col) * 4u;
+            if (query.depth == HD_TEXTURE_DEPTH_16BPP) {
+                hd_texture_rgba5551_to_rgba8(word, px);
+            } else if (query.depth == HD_TEXTURE_DEPTH_8BPP) {
+                const unsigned idx = (word >> ((col % 2u) * 8u)) & 0xFFu;
+                hd_texture_rgba5551_to_rgba8(idx < clut_count ? palette[idx] : 0, px);
+            } else {
+                const unsigned idx = (word >> ((col % 4u) * 4u)) & 0xFu;
+                hd_texture_rgba5551_to_rgba8(idx < clut_count ? palette[idx] : 0, px);
+            }
+        }
+    }
+}
+
+void hd_texture_pack_export_missing(const HdTexturePack* pack,
+                                    const HdTextureDrawQuery& query,
+                                    uint32_t texture_hash,
+                                    uint32_t palette_hash,
+                                    const Rect& rect) {
+    if (!pack || pack->replacement_root.empty()) return;
+    /* Per-process dedup: a missing texture gets queried again every frame
+     * it's drawn, but decode+encode+disk-existence-check on every one of
+     * those would be wasteful -- only the first sighting per session does
+     * any of that work. */
+    static std::mutex s_export_mutex;
+    static std::unordered_set<uint64_t> s_exported;
+    const uint64_t key = make_key(texture_hash, palette_hash);
+    {
+        std::lock_guard<std::mutex> lock(s_export_mutex);
+        if (!s_exported.insert(key).second) return;
+    }
+
+    std::error_code ec;
+    const fs::path dir = fs::path(pack->replacement_root) / "missing_textures";
+    fs::create_directories(dir, ec);
+    char name[64];
+    std::snprintf(name, sizeof(name), "%08x-%08x.png", texture_hash, palette_hash);
+    const fs::path path = dir / name;
+    if (fs::exists(path, ec)) return; /* already captured in an earlier session */
+
+    unsigned w = 0, h = 0;
+    std::vector<uint8_t> rgba;
+    hd_texture_decode_query_rgba(query, rect, &rgba, &w, &h);
+    if (w == 0 || h == 0) return;
+    stbi_write_png(path.string().c_str(), static_cast<int>(w), static_cast<int>(h),
+                   4, rgba.data(), static_cast<int>(w) * 4);
+}
+
+} // namespace
+
 int hd_texture_pack_match(HdTexturePack* pack,
                           const HdTextureDrawQuery* query,
                           HdTextureMatch* out_match) {
@@ -1306,7 +1412,22 @@ int hd_texture_pack_match(HdTexturePack* pack,
     }
     if (!candidate_serials.empty() && !diag_saw_hash_match) ++g_hd_pack_diag_no_hash_match;
     if (diag_saw_hash_match && !candidate) ++g_hd_pack_diag_not_covered;
-    if (!candidate || !candidate_entry) return HD_TEXTURE_LOOKUP_NONE;
+    if (!candidate || !candidate_entry) {
+        /* Missing-texture export: only worth the extra covered_by_upload
+         * pass on the (presumably rare) miss path -- the common matched
+         * path above never pays for it. Picks the first tracked upload that
+         * actually covers this query, so the exported PNG is named with
+         * the exact (hash, palette) pair the pack would need. */
+        for (const uint64_t serial : candidate_serials) {
+            const auto indexed = pack->upload_by_serial.find(serial);
+            if (indexed == pack->upload_by_serial.end() || !indexed->second) continue;
+            const Upload& upload = *indexed->second;
+            if (!covered_by_upload(upload, wanted)) continue;
+            hd_texture_pack_export_missing(pack, *query, upload.hash, palette_hash, wanted[0]);
+            break;
+        }
+        return HD_TEXTURE_LOOKUP_NONE;
+    }
 
     const unsigned pixels_per_word = query->depth == HD_TEXTURE_DEPTH_4BPP ? 4u :
                                      query->depth == HD_TEXTURE_DEPTH_8BPP ? 2u : 1u;
@@ -1362,6 +1483,155 @@ int hd_texture_pack_match(HdTexturePack* pack,
         out_match->source_y = source_y;
     }
     return HD_TEXTURE_LOOKUP_FOUND;
+}
+
+namespace {
+/* Out-parameter instead of returning Rect: this sits inside the file's
+ * extern "C" block, where a C++-only return type by value triggers
+ * -Wreturn-type-c-linkage (see hd_texture_rgba5551_to_rgba8 above for the
+ * same fix). *out is left zeroed when a/b do not intersect. */
+void rect_intersection(const Rect& a, const Rect& b, Rect* out) {
+    if (!intersects(a, b)) { *out = Rect{}; return; }
+    const unsigned x = std::max(a.x, b.x);
+    const unsigned y = std::max(a.y, b.y);
+    const unsigned right = std::min(a.x + a.width, b.x + b.width);
+    const unsigned bottom = std::min(a.y + a.height, b.y + b.height);
+    *out = Rect{x, y, right - x, bottom - y};
+}
+} // namespace
+
+/* Fused-page support (opt-in -- see gpu_hd_texture_fusion_set in gpu.c).
+ * hd_texture_pack_match above requires one upload's fragments to FULLY
+ * cover the query and gives up entirely otherwise (g_hd_pack_diag_not_covered),
+ * which is exactly the case that produces a visible seam live: some
+ * triangles of one mesh draw through the HD pipeline, the rest fall back to
+ * native, and the two are two separate GL draw calls with different
+ * shaders/blend state meeting at a hard edge. Real Beetle PSX HW's Vulkan
+ * renderer avoids this by compositing every upload a draw's sample region
+ * touches into one "fused page" texture before issuing a single draw (see
+ * HD_TEXTURE_CACHE.md's "Fused-page path"/FusedPage) -- this is the same
+ * idea, scoped down to the dominant real case instead of a fully general
+ * multi-upload compositor: exactly one wanted rect (no UV wrap) and exactly
+ * one upload/entry whose fragments partially cover it. Reports each covered
+ * (HD) and uncovered (native-VRAM) piece so gpu_gl_renderer.c can build the
+ * composite and draw once. Returns 0 (not applicable -- caller keeps today's
+ * behavior unchanged) for anything outside that scope: UV-wrapped queries,
+ * zero or more-than-one matching upload, ambiguous entries, or more pieces
+ * than max_pieces. */
+int hd_texture_pack_match_fused(HdTexturePack* pack,
+                                const HdTextureDrawQuery* query,
+                                HdTexturePackEntry* out_entry,
+                                uint16_t* out_upload_width_words,
+                                uint16_t* out_upload_height,
+                                HdFusedPiece* out_pieces,
+                                int max_pieces,
+                                int* out_count) {
+    if (out_count) *out_count = 0;
+    if (!pack || !query || !out_entry || !out_pieces || max_pieces <= 0 ||
+        query->depth > HD_TEXTURE_DEPTH_16BPP || !query->vram ||
+        query->vram_word_count < kVramWords)
+        return 0;
+    const std::vector<Rect> wanted = query_rectangles(*query);
+    if (wanted.size() != 1 || wanted[0].width == 0 || wanted[0].height == 0)
+        return 0; /* UV wrap or empty query: out of scope for v1 */
+    const Rect& want = wanted[0];
+    const uint32_t palette_hash = hd_texture_hash_clut(
+        query->vram, query->vram_word_count, query->clut_x, query->clut_y,
+        query->depth);
+
+    std::vector<uint64_t> candidate_serials;
+    upload_index_collect(pack, wanted, &candidate_serials);
+    const Upload* candidate = nullptr;
+    const EntryRecord* candidate_entry = nullptr;
+    for (const uint64_t serial : candidate_serials) {
+        const auto indexed = pack->upload_by_serial.find(serial);
+        if (indexed == pack->upload_by_serial.end() || !indexed->second) continue;
+        const Upload& upload = *indexed->second;
+        if (!intersects(upload.bounds, want)) continue;
+        const auto record = pack->entries.find(make_key(upload.hash, palette_hash));
+        if (record == pack->entries.end()) continue;
+        if (record->second.ambiguous) return 0;
+        if (covered_by_upload(upload, wanted)) return 0; /* fully covered: the plain matcher already handles this */
+        if (candidate) return 0; /* more than one candidate: stay out of scope */
+        candidate = &upload;
+        candidate_entry = &record->second;
+    }
+    if (!candidate || !candidate_entry) return 0;
+
+    int count = 0;
+    /* HD pieces: this upload's fragments intersected with the wanted rect. */
+    for (const Fragment& fragment : candidate->fragments) {
+        Rect piece;
+        rect_intersection(want, fragment.rect, &piece);
+        if (piece.width == 0 || piece.height == 0) continue;
+        if (count >= max_pieces) return 0;
+        out_pieces[count].x = static_cast<uint16_t>(piece.x);
+        out_pieces[count].y = static_cast<uint16_t>(piece.y);
+        out_pieces[count].width = static_cast<uint16_t>(piece.width);
+        out_pieces[count].height = static_cast<uint16_t>(piece.height);
+        out_pieces[count].has_hd = 1;
+        out_pieces[count].hd_src_x = fragment.source_x + (piece.x - fragment.rect.x);
+        out_pieces[count].hd_src_y = fragment.source_y + (piece.y - fragment.rect.y);
+        ++count;
+    }
+    /* Native (uncovered) pieces: same rectangle-subtraction covered_by_upload
+     * uses, but keeping the remainder instead of discarding it. */
+    std::vector<Rect> uncovered{want};
+    for (const Fragment& fragment : candidate->fragments) {
+        std::vector<Rect> next;
+        for (const Rect& piece : uncovered) {
+            std::vector<Rect> remainder = subtract_rect(piece, fragment.rect);
+            next.insert(next.end(), remainder.begin(), remainder.end());
+        }
+        uncovered.swap(next);
+        if (uncovered.empty()) break;
+    }
+    for (const Rect& piece : uncovered) {
+        if (piece.width == 0 || piece.height == 0) continue;
+        if (count >= max_pieces) return 0;
+        out_pieces[count].x = static_cast<uint16_t>(piece.x);
+        out_pieces[count].y = static_cast<uint16_t>(piece.y);
+        out_pieces[count].width = static_cast<uint16_t>(piece.width);
+        out_pieces[count].height = static_cast<uint16_t>(piece.height);
+        out_pieces[count].has_hd = 0;
+        out_pieces[count].hd_src_x = 0;
+        out_pieces[count].hd_src_y = 0;
+        ++count;
+    }
+    if (count < 2) return 0; /* nothing to fuse (should not happen: not fully covered implies >=1 native piece, and >=1 HD piece was required above) */
+
+    fill_entry(*candidate_entry, out_entry);
+    if (out_upload_width_words) *out_upload_width_words = candidate->width;
+    if (out_upload_height) *out_upload_height = candidate->height;
+    if (out_count) *out_count = count;
+    return 1;
+}
+
+/* C-callable wrapper around hd_texture_decode_query_rgba, for the native
+ * pieces hd_texture_pack_match_fused reports (VRAM-absolute word/texel rect,
+ * same coordinate space): decodes straight from query->vram, no upload/pack
+ * lookup involved. out_rgba must be at least width*pixels_per_word*height*4
+ * bytes (4bpp/8bpp/16bpp -> up to 4x/2x/1x width in texels; the caller in
+ * gpu_gl_renderer.c already knows depth when sizing its buffer). */
+int hd_texture_pack_decode_native_rgba(const HdTextureDrawQuery* query,
+                                       uint16_t rect_x, uint16_t rect_y,
+                                       uint16_t rect_w, uint16_t rect_h,
+                                       uint8_t* out_rgba, uint32_t out_capacity,
+                                       uint32_t* out_w, uint32_t* out_h) {
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    if (!query || !out_rgba || query->depth > HD_TEXTURE_DEPTH_16BPP ||
+        !query->vram || query->vram_word_count < kVramWords)
+        return 0;
+    const Rect rect{rect_x, rect_y, rect_w, rect_h};
+    std::vector<uint8_t> rgba;
+    unsigned w = 0, h = 0;
+    hd_texture_decode_query_rgba(*query, rect, &rgba, &w, &h);
+    if (w == 0 || h == 0 || rgba.size() > out_capacity) return 0;
+    std::memcpy(out_rgba, rgba.data(), rgba.size());
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return 1;
 }
 
 int hd_texture_pack_diag_dump_uploads(const HdTexturePack* pack, char* out,
@@ -1500,6 +1770,42 @@ int hd_texture_pack_match_draw(HdTexturePack* pack,
     query.clut_x = clut_x; query.clut_y = clut_y;
     query.vram = vram; query.vram_word_count = vram_word_count;
     return hd_texture_pack_match(pack, &query, out_match);
+}
+
+/* Texpage-based convenience wrapper, same role as hd_texture_pack_match_draw
+ * above but for the fused-page path -- keeps the texpage decode in one
+ * place instead of duplicating it in gpu.c. */
+int hd_texture_pack_match_fused_draw(HdTexturePack* pack,
+                                     uint16_t texpage,
+                                     uint16_t clut_x,
+                                     uint16_t clut_y,
+                                     uint8_t u_first,
+                                     uint8_t u_last,
+                                     uint8_t v_first,
+                                     uint8_t v_last,
+                                     const uint16_t* vram,
+                                     size_t vram_word_count,
+                                     HdTexturePackEntry* out_entry,
+                                     uint16_t* out_upload_width_words,
+                                     uint16_t* out_upload_height,
+                                     HdFusedPiece* out_pieces,
+                                     int max_pieces,
+                                     int* out_count,
+                                     HdTextureDrawQuery* out_query) {
+    const uint8_t depth = static_cast<uint8_t>((texpage >> 7) & 3u);
+    if (out_count) *out_count = 0;
+    if (depth > HD_TEXTURE_DEPTH_16BPP) return 0;
+    HdTextureDrawQuery query{};
+    query.page_x = static_cast<uint16_t>((texpage & 0xFu) * 64u);
+    query.page_y = static_cast<uint16_t>(((texpage >> 4) & 1u) * 256u);
+    query.depth = depth;
+    query.u_first = u_first; query.u_last = u_last;
+    query.v_first = v_first; query.v_last = v_last;
+    query.clut_x = clut_x; query.clut_y = clut_y;
+    query.vram = vram; query.vram_word_count = vram_word_count;
+    if (out_query) *out_query = query; /* caller needs it again for decode_native_rgba */
+    return hd_texture_pack_match_fused(pack, &query, out_entry, out_upload_width_words,
+                                       out_upload_height, out_pieces, max_pieces, out_count);
 }
 
 void hd_texture_pack_set_decode_budget(HdTexturePack* pack,
