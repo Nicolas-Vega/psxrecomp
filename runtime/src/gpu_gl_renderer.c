@@ -159,6 +159,7 @@ typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform1f)(GLint, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
+typedef void   (APIENTRY *PFN_glUniform4iv)(GLint, GLsizei, const GLint *);
 typedef void   (APIENTRY *PFN_glUniform2f)(GLint, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform3f)(GLint, GLfloat, GLfloat, GLfloat);
@@ -223,6 +224,7 @@ static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform1f         p_glUniform1f;
 static PFN_glUniform2i         p_glUniform2i;
 static PFN_glUniform4i         p_glUniform4i;
+static PFN_glUniform4iv        p_glUniform4iv;
 static PFN_glUniform2f         p_glUniform2f;
 static PFN_glUniform4f         p_glUniform4f;
 static PFN_glUniform3f         p_glUniform3f;
@@ -279,6 +281,7 @@ static int load_modern_gl(void) {
     LOAD(p_glGetUniformLocation, "glGetUniformLocation"); LOAD(p_glUniform1i, "glUniform1i");
     LOAD(p_glUniform1f, "glUniform1f");
     LOAD(p_glUniform2i, "glUniform2i"); LOAD(p_glUniform4i, "glUniform4i");
+    LOAD(p_glUniform4iv, "glUniform4iv");
     LOAD(p_glUniform2f, "glUniform2f");
     LOAD(p_glUniform4f, "glUniform4f");
     LOAD(p_glUniform3f, "glUniform3f");
@@ -2125,6 +2128,24 @@ static GLuint s_hd_prog = 0, s_hd_vao = 0, s_hd_vbo = 0;
 static GLint  s_hd_uXoff = -1, s_hd_uXhalf = -1, s_hd_uShift = -1, s_hd_uTex = -1, s_hd_uTint = -1,
              s_hd_uRaw = -1, s_hd_uTexSize = -1, s_hd_uSilhouette = -1,
              s_hd_uViewportX0 = -1, s_hd_uViewportW = -1;
+/* 2026-09-09 HD_SHADER_PARITY.md open item #1: real per-pixel mask/stencil
+ * bit for HD-replaced opaque prims (see HD_FS's comment above hd_orig_
+ * fetch_texel). u_vram/u_orig_* let HD_FS look up the ORIGINAL native
+ * texel (same CLUT decode as TEX_FS's fetch_texel, texture-window branch
+ * omitted since HD matching is already skipped entirely for windowed
+ * prims) at the corresponding position, purely to read its bit15 -- the
+ * replacement PNG's own alpha already encodes the cutout shape, but has no
+ * bit15/mask-bit concept of its own. */
+static GLint  s_hd_uVram = -1, s_hd_uMaskset = -1, s_hd_uOrigTpage = -1, s_hd_uOrigClut = -1,
+             s_hd_uOrigDepth = -1, s_hd_uOrigLimits = -1;
+/* HD_SHADER_PARITY.md open item #2: per-piece clamp rects for the opt-in
+ * fused-page compositing path (build_fused_composite), so hd_sample_
+ * bilinear's 4-tap footprint can't bleed across a piece boundary into an
+ * adjacent piece sharing the same composite texture -- see hd_piece_bounds.
+ * u_piece_count stays 0 (whole-texture clamp, today's behavior) for every
+ * ordinary single-PNG match; only the fused path ever sets it. */
+static GLint  s_hd_uPieceRects = -1, s_hd_uPieceCount = -1;
+#define HD_MAX_PIECE_RECTS 24  /* matches GPU_HD_FUSED_MAX_PIECES (gpu.h) */
 
 static const char *HD_VS =
     "#version 330\n"
@@ -2147,6 +2168,14 @@ static const char *HD_VS =
      * is unchanged while the rasterizer interpolates v_uv_p hyperbolically;
      * a_q==0 (the common case) makes w exactly 1.0, identical to before. */
     "layout(location=3) in float a_q;   /* persp weight; 0 = affine (default) */\n"
+    /* 2026-09-09 HD_SHADER_PARITY.md open item #1: the ORIGINAL (pre-remap)
+     * PS1 texel coordinate, carried alongside the already-remapped a_uv
+     * (which points into the replacement texture) purely so HD_FS can look
+     * up the corresponding NATIVE texel's mask bit -- see hd_orig_fetch_
+     * texel. Needs the same affine/perspective-correct treatment as a_uv
+     * for a matching sub-pixel sample position, hence v_orig_uv/v_orig_uv_p
+     * reusing the same v_persp flag. */
+    "layout(location=4) in vec2 a_orig_uv;\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;\n"
     "uniform float u_xhalf;\n"
@@ -2154,7 +2183,10 @@ static const char *HD_VS =
     "smooth out vec2 v_uv_p;  /* perspective-correct UV (used when v_persp!=0) */\n"
     "flat out int v_persp;\n"
     "noperspective out vec3 v_col;\n"
+    "noperspective out vec2 v_orig_uv;\n"
+    "smooth out vec2 v_orig_uv_p;\n"
     "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
+    "  v_orig_uv = a_orig_uv; v_orig_uv_p = a_orig_uv;\n"
     "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
     "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
     "  vec2 ndc = vec2((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0,\n"
@@ -2190,10 +2222,32 @@ static const char *HD_FS =
     "#version 330\n"
     "noperspective in vec2 v_uv; smooth in vec2 v_uv_p; flat in int v_persp;\n"
     "noperspective in vec3 v_col; out vec4 frag;\n"
+    "noperspective in vec2 v_orig_uv; smooth in vec2 v_orig_uv_p;\n"
     "uniform sampler2D u_tex;\n"
     "uniform vec2 u_tex_size;\n" /* u_tex's own (width, height) in texels */
-    "vec4 hd_texelfetch_clamped(ivec2 texel, ivec2 size) {\n"
-    "  texel = clamp(texel, ivec2(0), size - ivec2(1));\n"
+    /* 2026-09-09 HD_SHADER_PARITY.md open item #2: per-piece clamp rects for
+     * the opt-in fused-page compositing path (build_fused_composite), which
+     * packs multiple independent HD/native pieces into ONE shared texture.
+     * Without this, hd_sample_bilinear's 4-tap footprint clamps only to the
+     * WHOLE composite texture's bounds, so a sample within 1 texel of a
+     * piece's own edge can blend in a neighbouring piece's unrelated pixel
+     * -- the same class of bug as the already-fixed texture-window bleed,
+     * just for this feature. u_piece_count stays 0 for every ordinary
+     * single-PNG match (the overwhelming common case), which keeps this a
+     * no-op there: hd_piece_bounds immediately falls through to the old
+     * whole-texture bound. rects are {x0,y0,x1,y1} inclusive, in the
+     * composite texture's own pixel space. */
+    "uniform ivec4 u_piece_rects[24];\n"
+    "uniform int u_piece_count;\n"
+    "ivec4 hd_piece_bounds(ivec2 texel, ivec2 whole_size) {\n"
+    "  for (int i = 0; i < u_piece_count; i++) {\n"
+    "    ivec4 r = u_piece_rects[i];\n"
+    "    if (texel.x >= r.x && texel.x <= r.z && texel.y >= r.y && texel.y <= r.w) return r;\n"
+    "  }\n"
+    "  return ivec4(0, 0, whole_size.x - 1, whole_size.y - 1);\n"
+    "}\n"
+    "vec4 hd_texelfetch_clamped(ivec2 texel, ivec4 bounds) {\n"
+    "  texel = clamp(texel, bounds.xy, bounds.zw);\n"
     "  return texelFetch(u_tex, texel, 0);\n"
     "}\n"
     "vec4 hd_sample_bilinear(vec2 texel_uv, ivec2 size) {\n"
@@ -2201,11 +2255,18 @@ static const char *HD_FS =
     "  vec2 uv_offs = sign(uv_frac);\n"
     "  uv_frac = abs(uv_frac);\n"
     "  ivec2 base = ivec2(floor(texel_uv));\n"
+    /* Which piece (if any) the BASE sample belongs to decides the clamp
+     * rect for ALL FOUR taps -- deciding per-tap independently would let a
+     * tap that's crossed into a different piece's territory sample IT
+     * instead of clamping back into the base's own piece, same bleed this
+     * exists to prevent. */
+    "  ivec4 bounds = (u_piece_count > 0) ? hd_piece_bounds(base, size)\n"
+    "                                     : ivec4(0, 0, size.x - 1, size.y - 1);\n"
     "  ivec2 ox = ivec2(int(uv_offs.x), 0), oy = ivec2(0, int(uv_offs.y));\n"
-    "  vec4 c00 = hd_texelfetch_clamped(base, size);\n"
-    "  vec4 c10 = hd_texelfetch_clamped(base + ox, size);\n"
-    "  vec4 c01 = hd_texelfetch_clamped(base + oy, size);\n"
-    "  vec4 c11 = hd_texelfetch_clamped(base + ox + oy, size);\n"
+    "  vec4 c00 = hd_texelfetch_clamped(base, bounds);\n"
+    "  vec4 c10 = hd_texelfetch_clamped(base + ox, bounds);\n"
+    "  vec4 c01 = hd_texelfetch_clamped(base + oy, bounds);\n"
+    "  vec4 c11 = hd_texelfetch_clamped(base + ox + oy, bounds);\n"
     "  return c00*(1.0-uv_frac.x)*(1.0-uv_frac.y) + c10*uv_frac.x*(1.0-uv_frac.y)\n"
     "       + c01*(1.0-uv_frac.x)*uv_frac.y + c11*uv_frac.x*uv_frac.y;\n"
     "}\n"
@@ -2253,10 +2314,47 @@ static const char *HD_FS =
      * cutoff), and reverting to Beetle's real behavior removes a source of
      * divergence (framebuffer-order-dependent partial blending at any
      * texture's edge) without reintroducing the original jagged-text bug. */
+    /* 2026-09-09 HD_SHADER_PARITY.md open item #1: look up the ORIGINAL
+     * native VRAM texel at the corresponding position purely to read its
+     * bit15 (mask bit) -- see TEX_FS's fetch_texel, which this mirrors
+     * minus the texture-window branch (HD matching is already skipped
+     * entirely for windowed prims, so that branch would be dead code here).
+     * u_orig_depth < 0 is a sentinel meaning "no native texel info was
+     * supplied" (the calibration-test and coverage-debug-marker draws,
+     * which have no real underlying VRAM content to look up) -- those keep
+     * the OLD, pre-fix behavior of forcing stp=1 rather than reading
+     * garbage from VRAM address (0,0). */
+    "uniform usampler2D u_vram;\n"
+    "uniform ivec2 u_orig_tpage, u_orig_clut;\n"
+    "uniform int u_orig_depth;\n"
+    "uniform ivec4 u_orig_limits;\n"
+    "uniform int u_maskset;\n"
+    "int hd_orig_vram_at(int x, int y){\n"
+    "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
+    "}\n"
+    "int hd_orig_fetch_texel(int u, int v){\n"
+    "  u &= 255; v &= 255;\n"
+    "  u = clamp(u, u_orig_limits.x, u_orig_limits.z);\n"
+    "  v = clamp(v, u_orig_limits.y, u_orig_limits.w);\n"
+    "  if (u_orig_depth == 0) {\n"
+    "    int px = hd_orig_vram_at(u_orig_tpage.x + (u >> 2), u_orig_tpage.y + v);\n"
+    "    return hd_orig_vram_at(u_orig_clut.x + ((px >> ((u & 3) * 4)) & 0xF), u_orig_clut.y);\n"
+    "  } else if (u_orig_depth == 1) {\n"
+    "    int px = hd_orig_vram_at(u_orig_tpage.x + (u >> 1), u_orig_tpage.y + v);\n"
+    "    return hd_orig_vram_at(u_orig_clut.x + ((px >> ((u & 1) * 8)) & 0xFF), u_orig_clut.y);\n"
+    "  }\n"
+    "  return hd_orig_vram_at(u_orig_tpage.x + u, u_orig_tpage.y + v);\n"
+    "}\n"
     "void main(){\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
     "  vec4 c = hd_sample_bilinear(uv * u_tex_size, ivec2(u_tex_size));\n"
     "  if (u_silhouette_mode == 0 && c.a < 0.5) discard;\n"
+    "  int stp = 1;\n"
+    "  if (u_orig_depth >= 0) {\n"
+    "    vec2 orig_uv = (v_persp != 0) ? v_orig_uv_p : v_orig_uv;\n"
+    "    int orig_raw = hd_orig_fetch_texel(int(floor(orig_uv.x)), int(floor(orig_uv.y)));\n"
+    "    stp = (orig_raw >> 15) & 1;\n"
+    "  }\n"
     /* Per-vertex Gouraud shading (ambient/room lighting), same formula and
      * *2.0 scale as TEX_FS's "rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0)"
      * -- PS1 vertex colors are stored so 0x80 (0.5 normalized) means neutral
@@ -2271,7 +2369,7 @@ static const char *HD_FS =
     "    float t = clamp((gl_FragCoord.x - u_viewport_x0) / max(u_viewport_w, 1.0), 0.0, 1.0);\n"
     "    rgb = mix(vec3(0.0, 1.0, 1.0), vec3(0.6, 0.0, 0.8), t);\n"
     "  }\n"
-    "  frag = vec4(rgb, 1.0);\n"
+    "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "}\n";
 
 /* entry_id -> decoded/uploaded GL texture. Small in practice (one entry per
@@ -2430,18 +2528,28 @@ static void hd_gl_init(void) {
     s_hd_uSilhouette = p_glGetUniformLocation(s_hd_prog, "u_silhouette_mode");
     s_hd_uViewportX0 = p_glGetUniformLocation(s_hd_prog, "u_viewport_x0");
     s_hd_uViewportW = p_glGetUniformLocation(s_hd_prog, "u_viewport_w");
+    s_hd_uVram  = p_glGetUniformLocation(s_hd_prog, "u_vram");
+    s_hd_uMaskset = p_glGetUniformLocation(s_hd_prog, "u_maskset");
+    s_hd_uOrigTpage = p_glGetUniformLocation(s_hd_prog, "u_orig_tpage");
+    s_hd_uOrigClut = p_glGetUniformLocation(s_hd_prog, "u_orig_clut");
+    s_hd_uOrigDepth = p_glGetUniformLocation(s_hd_prog, "u_orig_depth");
+    s_hd_uOrigLimits = p_glGetUniformLocation(s_hd_prog, "u_orig_limits");
+    s_hd_uPieceRects = p_glGetUniformLocation(s_hd_prog, "u_piece_rects");
+    s_hd_uPieceCount = p_glGetUniformLocation(s_hd_prog, "u_piece_count");
     p_glGenVertexArrays(1, &s_hd_vao);
     p_glBindVertexArray(s_hd_vao);
     p_glGenBuffers(1, &s_hd_vbo);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_hd_vbo);
-    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)0);
+    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void *)0);
     p_glEnableVertexAttribArray(0);
-    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)(2 * sizeof(float)));
+    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void *)(2 * sizeof(float)));
     p_glEnableVertexAttribArray(1);
-    p_glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)(4 * sizeof(float)));
+    p_glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void *)(4 * sizeof(float)));
     p_glEnableVertexAttribArray(2);
-    p_glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)(7 * sizeof(float)));
+    p_glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void *)(7 * sizeof(float)));
     p_glEnableVertexAttribArray(3);
+    p_glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void *)(8 * sizeof(float)));
+    p_glEnableVertexAttribArray(4);
     p_glBindVertexArray(0);
     p_glUseProgram(s_hd_prog);
     p_glUniform1f(s_hd_uXoff, 0.0f);
@@ -2451,7 +2559,10 @@ static void hd_gl_init(void) {
      * is computed once here rather than mirrored from those programs. */
     p_glUniform1f(s_hd_uShift, 0.5f / (float)s_scale - 1.0f / 64.0f);
     p_glUniform1i(s_hd_uTex, 0);
+    p_glUniform1i(s_hd_uVram, 1);   /* VRAM (s_raw_tex) rides texture unit 1; u_tex owns unit 0 */
     p_glUniform3f(s_hd_uTint, 1.0f, 1.0f, 1.0f);
+    p_glUniform1i(s_hd_uOrigDepth, -1);  /* sentinel: no orig-texel info yet -> force stp=1 */
+    p_glUniform1i(s_hd_uPieceCount, 0);
     p_glUseProgram(0);
 
     const char *debug_missing_env = getenv("PSXRECOMP_HD_TEXTURE_DEBUG_MISSING");
@@ -3019,21 +3130,39 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
                                          float u_scale, float u_offset,
                                          float v_scale, float v_offset,
                                          float tint_r, float tint_g, float tint_b,
-                                         const float *qs) {
+                                         const float *qs,
+                                         const int *orig_texinfo,
+                                         const int *piece_rects, int piece_count) {
     /* qs: per-vertex perspective weight (HD_VS's a_q), same convention as
      * the native path's s_pq (0 = affine). NULL for callers that only ever
      * draw affine content (the calibration test, the coverage-debug marker)
-     * -- treated as {0,0,0}. See HD_VS's comment for why this exists. */
-    float verts[3 * 8];
+     * -- treated as {0,0,0}. See HD_VS's comment for why this exists.
+     *
+     * orig_texinfo: HD_SHADER_PARITY.md open item #1 -- {tpage_x, tpage_y,
+     * clut_x, clut_y, depth, lim_u0, lim_v0, lim_u1, lim_v1} describing the
+     * ORIGINAL native texel this replacement stands in for, so HD_FS can
+     * look up its real mask bit instead of always forcing one. NULL for
+     * callers with no real underlying VRAM content (calibration test,
+     * coverage-debug marker) -- HD_FS's u_orig_depth<0 sentinel keeps
+     * those forcing stp=1, matching their pre-fix behavior exactly.
+     *
+     * piece_rects/piece_count: HD_SHADER_PARITY.md open item #2 -- per-piece
+     * {x0,y0,x1,y1} clamp rects in the composite texture's own pixel space,
+     * for the opt-in fused-page compositing caller only. piece_count=0 (the
+     * ordinary single-PNG match, and every debug caller) keeps HD_FS's
+     * whole-texture clamp, today's behavior. */
+    float verts[3 * 10];
     for (int i = 0; i < 3; i++) {
-        verts[i * 8 + 0] = (float)xs[i];
-        verts[i * 8 + 1] = (float)ys[i];
-        verts[i * 8 + 2] = (float)us[i] * u_scale + u_offset;
-        verts[i * 8 + 3] = (float)vs[i] * v_scale + v_offset;
-        verts[i * 8 + 4] = col[i * 3 + 0];
-        verts[i * 8 + 5] = col[i * 3 + 1];
-        verts[i * 8 + 6] = col[i * 3 + 2];
-        verts[i * 8 + 7] = qs ? qs[i] : 0.0f;
+        verts[i * 10 + 0] = (float)xs[i];
+        verts[i * 10 + 1] = (float)ys[i];
+        verts[i * 10 + 2] = (float)us[i] * u_scale + u_offset;
+        verts[i * 10 + 3] = (float)vs[i] * v_scale + v_offset;
+        verts[i * 10 + 4] = col[i * 3 + 0];
+        verts[i * 10 + 5] = col[i * 3 + 1];
+        verts[i * 10 + 6] = col[i * 3 + 2];
+        verts[i * 10 + 7] = qs ? qs[i] : 0.0f;
+        verts[i * 10 + 8] = (float)us[i];
+        verts[i * 10 + 9] = (float)vs[i];
     }
     /* Same FBO/viewport/scissor bracket every other draw path in this file
      * uses (see flush_flat_batch/flush_tex_batch) -- without it this drew to
@@ -3046,11 +3175,28 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
     hr_begin(1);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0);
     p_glUseProgram(s_hd_prog);
     p_glUniform3f(s_hd_uTint, tint_r, tint_g, tint_b);
     p_glUniform1i(s_hd_uRaw, rawtex);
     p_glUniform2f(s_hd_uTexSize, (float)(tex_w > 0 ? tex_w : 1), (float)(tex_h > 0 ? tex_h : 1));
     p_glUniform1i(s_hd_uSilhouette, s_silhouette_mode);
+    p_glUniform1i(s_hd_uMaskset, s_mask_set);
+    if (orig_texinfo) {
+        p_glUniform2i(s_hd_uOrigTpage, orig_texinfo[0], orig_texinfo[1]);
+        p_glUniform2i(s_hd_uOrigClut, orig_texinfo[2], orig_texinfo[3]);
+        p_glUniform1i(s_hd_uOrigDepth, orig_texinfo[4]);
+        p_glUniform4i(s_hd_uOrigLimits, orig_texinfo[5], orig_texinfo[6], orig_texinfo[7], orig_texinfo[8]);
+    } else {
+        p_glUniform1i(s_hd_uOrigDepth, -1);  /* sentinel: no native texel info -> force stp=1 */
+    }
+    int clamped_piece_count = piece_count;
+    if (clamped_piece_count > HD_MAX_PIECE_RECTS) clamped_piece_count = HD_MAX_PIECE_RECTS;
+    p_glUniform1i(s_hd_uPieceCount, clamped_piece_count);
+    if (clamped_piece_count > 0)
+        p_glUniform4iv(s_hd_uPieceRects, clamped_piece_count, piece_rects);
     if (s_silhouette_mode == 2) {
         /* See flush_tex_batch's matching comment -- query the real bound
          * viewport instead of reconstructing it from tracked state. */
@@ -3059,12 +3205,26 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
         p_glUniform1f(s_hd_uViewportX0, (float)vp[0]);
         p_glUniform1f(s_hd_uViewportW, (float)vp[2]);
     }
-    /* Standard "over" blend for the replacement PNG's OWN anti-aliased edge
-     * pixels (see HD_FS's comment) -- not a PS1 blend-equation replication;
-     * the original native prim this replaces had no blending at all (semi <
-     * 0 gated this whole pipeline), so there is no PS1 mode to match here. */
-    glEnable(GL_BLEND);
-    p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
+    /* 2026-09-09: this used to enable GL_BLEND here ("over" blend for the
+     * replacement PNG's own anti-aliased edges) -- REMOVED, and here's why:
+     * frag.a was, until this same session, hardcoded to 1.0, which made
+     * that blend a permanent no-op (SRC_ALPHA=1 -> fully replace, dst never
+     * shows through) -- so this was never actually visually active. Now
+     * that HD_SHADER_PARITY.md's mask-bit fix makes frag.a carry the real
+     * stp-or-maskset signal (can legitimately be 0.0), leaving blend
+     * enabled turned that dormant no-op into a live bug: wherever the
+     * ORIGINAL native texel had its mask bit clear (the common case --
+     * most opaque PS1 content isn't authored with bit15 set), frag.a=0.0
+     * made this whole draw blend as `dst*1 + src*0` -- i.e. invisible,
+     * confirmed live (reported as "some HD did not render"/garbled text
+     * where HD-matched font glyphs vanished). The prim class this pipeline
+     * draws (semi < 0 only) has no blending on the native path either (see
+     * tex_batch_draw_passes: "if (semi < 0) glDisable(GL_BLEND)"), so
+     * disabling it here is the CORRECT parity fix, not a workaround: frag.a
+     * is free to be exactly the mask-bit signal with no blend interaction,
+     * matching how native TEX_FS's own alpha output behaves for the same
+     * prim class. */
+    glDisable(GL_BLEND);
     mask_stencil(s_mask_set);
     p_glBindVertexArray(s_hd_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_hd_vbo);
@@ -3227,10 +3387,12 @@ int gl_renderer_calib_test(int dx_offset) {
             int us2[3] = {PAT_N - 1, 0, PAT_N - 1},    vs2[3] = {0, PAT_N - 1, PAT_N - 1};
             draw_hd_replacement_triangle(xs1, ys1, us1, vs1, col_neutral, 1,
                                          hd_tex, HD_N, HD_N,
-                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1, NULL);
+                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1,
+                                         NULL, NULL, NULL, 0);
             draw_hd_replacement_triangle(xs2, ys2, us2, vs2, col_neutral, 1,
                                          hd_tex, HD_N, HD_N,
-                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1, NULL);
+                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1,
+                                         NULL, NULL, NULL, 0);
             glDeleteTextures(1, &hd_tex);
         }
         free(hd_rgba);
@@ -3658,10 +3820,17 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             }
             flush_flat_batch();
             flush_tex_batch();
-            draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, hd_tex, hd_tex_w, hd_tex_h,
-                                         hd_u_scale, hd_u_offset, hd_v_scale, hd_v_offset,
-                                         hd_tint_r, hd_tint_g, hd_tint_b,
-                                         s_pq_valid ? s_pq : NULL);
+            {
+                /* {tpage_x,tpage_y,clut_x,clut_y,depth,u_first,v_first,u_last,v_last}
+                 * -- see draw_hd_replacement_triangle's orig_texinfo comment. */
+                int orig_texinfo[9] = { base_x, base_y, clut_x, clut_y, depth,
+                                        lim[0], lim[1], lim[2], lim[3] };
+                draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, hd_tex, hd_tex_w, hd_tex_h,
+                                             hd_u_scale, hd_u_offset, hd_v_scale, hd_v_offset,
+                                             hd_tint_r, hd_tint_g, hd_tint_b,
+                                             s_pq_valid ? s_pq : NULL,
+                                             orig_texinfo, NULL, 0);
+            }
             return;
         }
         /* Fused-page fallback (opt-in, off by default -- see
@@ -3692,11 +3861,28 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                     s_hd_matches_seen++;
                     flush_flat_batch();
                     flush_tex_batch();
+                    /* HD_SHADER_PARITY.md open item #2: each piece's (x,y,
+                     * width,height) is already in the composite texture's
+                     * own pixel space (the composite is built exactly to
+                     * the query's bounding box, origin 0,0 == lim[0]/lim[1]
+                     * -- see fused_u_offset/v_offset just above), so this
+                     * is a direct, no-remap conversion to inclusive rects. */
+                    int piece_rects[GPU_HD_FUSED_MAX_PIECES * 4];
+                    for (int pi = 0; pi < fused_count; pi++) {
+                        piece_rects[pi*4+0] = (int)fused_pieces[pi].x;
+                        piece_rects[pi*4+1] = (int)fused_pieces[pi].y;
+                        piece_rects[pi*4+2] = (int)(fused_pieces[pi].x + fused_pieces[pi].width) - 1;
+                        piece_rects[pi*4+3] = (int)(fused_pieces[pi].y + fused_pieces[pi].height) - 1;
+                    }
+                    /* {tpage_x,tpage_y,clut_x,clut_y,depth,u_first,v_first,u_last,v_last} */
+                    int orig_texinfo[9] = { base_x, base_y, clut_x, clut_y, depth,
+                                            lim[0], lim[1], lim[2], lim[3] };
                     draw_hd_replacement_triangle(
                         xs, ys, us, vs, col, rawtex, fused_tex, s_fused_tex_w, s_fused_tex_h,
                         fused_u_scale, -(float)lim[0] * fused_u_scale,
                         fused_v_scale, -(float)lim[1] * fused_v_scale,
-                        1.0f, 1.0f, 1.0f, s_pq_valid ? s_pq : NULL);
+                        1.0f, 1.0f, 1.0f, s_pq_valid ? s_pq : NULL,
+                        orig_texinfo, piece_rects, fused_count);
                     return;
                 }
             }
@@ -3705,7 +3891,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             flush_flat_batch();
             flush_tex_batch();
             draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, s_hd_debug_missing_tex, 1, 1,
-                                         0.0f, 0.5f, 0.0f, 0.5f, 1.0f, 1.0f, 1.0f, NULL);
+                                         0.0f, 0.5f, 0.0f, 0.5f, 1.0f, 1.0f, 1.0f,
+                                         NULL, NULL, NULL, 0);
             return;
         }
     }

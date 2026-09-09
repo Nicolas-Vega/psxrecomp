@@ -45,7 +45,7 @@ is out of scope by construction, not a gap.
 | `a_clut` (vec2) | *(none)* | 🔷 | Same reasoning — CLUT lookup only applies to indexed VRAM sampling. |
 | `a_depth` (float) | *(none)* | 🔷 | Same — 4/8/15-bit CLUT depth mode only applies to VRAM sampling. |
 | `a_raw` (float) | *(none, uniform `u_raw` instead)* | ✅ | HD sends the same value as a per-draw-call uniform rather than a per-vertex attribute. Functionally identical because `draw_hd_replacement_triangle` draws exactly one (unbatched) triangle per call — a uniform and a flat attribute mean the same thing at that granularity. |
-| `a_limits` (vec4) | *(none — see `hd_texelfetch_clamped`)* | ⚠️ | See "Open items" below — this is the one attribute-level omission that isn't obviously safe. |
+| `a_limits` (vec4) | `a_orig_uv` (vec2) + `u_piece_rects`/`u_piece_count` (see below) | 🛠️ | Was open, now fixed this session — see "Resolved items" below. |
 | `a_semi` (float) | *(none)* | 🟡 | HD only ever draws `semi < 0` (opaque) prims; semi-transparent blend-mode state is meaningless here. |
 | `a_q` (float, persp weight) | `a_q` (float) | 🛠️ | **Was completely absent from `HD_VS`/`HD_FS`** — always affine UV mapping regardless of what the native path (or an unmatched fallback of the exact same prim) would have used. Fixed this session: ported the same per-vertex `a_q` → `w = 1/q` → `smooth v_uv_p` / `flat v_persp` mechanism from `TEX_VS`/`TEX_FS`. This is what caused the reported "straight on `none`, wavy on `beetle`" floor/roof texture — affine vs. perspective-correct mapping on a receding surface viewed at an angle. |
 
@@ -67,7 +67,7 @@ is out of scope by construction, not a gap.
 | `u_semipass` | *(none)* | 🟡 | Opaque/semi STP-split pass selector — only meaningful for the semi-transparent-batch draw-order-correctness mechanism (see `flush_tex_batch`'s two-pass comment), which HD never participates in. |
 | `u_semimode` + `v_semi` + `blend_factor` output (dual-source blend factors) | *(none)* | 🟡 | Same — PS1 blend-equation modes only apply to semi-transparent prims. |
 | `u_twin` (texture window wrap/tile) | *(none)* | ✅ *(already handled upstream)* | **Not actually a gap** — `gpu_textured_triangle` explicitly skips HD matching entirely whenever a texture window is active (`(s_tw_mask_x \| s_tw_mask_y) == 0` gate before the HD-match block), with a detailed comment explaining exactly this: HD has no wrap/tile equivalent, so a windowed prim's `u_first..u_last` range is wider than the true tiled sub-region and would sample past it into whatever is adjacent in the replacement image (confirmed live previously: a battle-mode speech-bubble fill bleeding into unrelated stat-label text). Falls back to native, which already handles windowing correctly. Documented here for completeness since it's exactly the kind of gap this audit is looking for — this one was already caught and fixed before this session. |
-| `u_maskset` (GP0 E6h set-mask, ORs bit15 into output alpha) | *(none — HD_FS always outputs `frag = vec4(rgb, 1.0)`)* | ⚠️ | See "Open items" below. |
+| `u_maskset` (GP0 E6h set-mask, ORs bit15 into output alpha) | `u_maskset` + real per-texel STP lookup (see below) | 🛠️ | Was open, now fixed this session — see "Resolved items" below. |
 | `u_filter` (native bilinear on/off) | *(HD always samples via `hd_sample_bilinear`, no nearest-only mode)* | 🔷 *(probably fine, not verified live)* | HD replacement textures are art assets meant to be viewed upscaled/smoothed; forcing bilinear regardless of the native `[video]` filter setting is very likely the intended behavior (matches how DuckStation/Beetle's own real HD-pack code always filters replacements), but this audit did not specifically verify it against either reference implementation's exact conditions. Low priority. |
 | `u_shift` (bilinear texel-centre recentre) | *(not needed — `hd_sample_bilinear`'s own `fract(uv)-0.5` already centres correctly, see its 2026-09-09 comment)* | ✅ | Different mechanism, same effect; already covered by this session's Beetle-ported bilinear rewrite. |
 | `u_silhouette_mode`, `u_viewport_x0`/`u_viewport_w` | same | ✅ | Debug-only visualization uniforms added this session, present in both. |
@@ -76,40 +76,52 @@ is out of scope by construction, not a gap.
 | `v_col` Gouraud shading (`rgb * v_col.rgb * 2.0`, skipped when raw) | `v_col` (same formula, `u_tint` multiplied in first) | ✅ | Confirmed already fixed in an earlier session (see the `HD_FS` comment: "Missing this entirely was why HD-replaced textures rendered at flat full brightness regardless of the room's actual lighting"). |
 | discard on `raw==0` / `c00==0` (native cutout) | discard on `c.a<0.5` (HD pack's own alpha) | ✅ *(known, accepted asymmetry)* | This is the discard-mask content/authoring mismatch already root-caused and documented in ISSUES.md #12 — two independently-drawn cutout shapes at different resolutions, not a code bug, not fixable without either snapping HD to the native blocky boundary or reintroducing real alpha blending (previously tried and reverted for a different regression). |
 
-## Open items found by this audit (not yet confirmed as live bugs)
+## Resolved items (were open, fixed this session)
 
-### 1. `u_maskset` / output alpha (mask/stencil bit) — ⚠️ needs investigation
+### 1. `u_maskset` / output alpha (mask/stencil bit) — 🛠️ fixed
 
 `TEX_FS` writes `frag.a = (stp == 1 || u_maskset == 1) ? 1.0 : 0.0`, where
 `stp` is the actual per-texel STP bit (`(raw >> 15) & 1`) read from the
 sampled VRAM content — i.e. for an opaque prim, whether THIS texel's mask bit
 should end up set is real, per-pixel, content-dependent data, not a constant.
 
-`HD_FS` always writes `frag = vec4(rgb, 1.0)` — unconditionally alpha=1,
-regardless of `u_maskset` and regardless of what the replaced content's own
-STP bit would have been. `draw_hd_replacement_triangle` does call
-`mask_stencil(s_mask_set)` before drawing (same as the native path), but that
-only wires up the GL *stencil test/write* side (a per-draw-call fixed
-reference value replacing on stencil-test pass) — it says nothing about the
-per-fragment alpha this shader outputs into the color attachment, which is a
-separate value read back elsewhere (see `STENCIL_FS`, "Rebuild stencil bit 0
-from a copied RGBA target's alpha").
+`HD_FS` previously always wrote `frag = vec4(rgb, 1.0)` — unconditionally
+alpha=1, regardless of `u_maskset` and regardless of what the replaced
+content's own STP bit would have been.
 
-**Why this might matter:** if a later draw or copy pass relies on that
-alpha/mask-bit distinction being correct per-pixel (e.g. a masked check
-against previously-drawn opaque content, or a semi-transparent effect layered
-on top later), an HD-replaced opaque prim would report EVERY pixel as
-mask-set, even ones whose original PS1 content had the mask bit clear.
+**Fix:** `HD_FS` now looks up the ORIGINAL native VRAM texel at the
+corresponding position (new `u_vram`/`u_orig_tpage`/`u_orig_clut`/
+`u_orig_depth`/`u_orig_limits` uniforms, bound to texture unit 1, plus a new
+`a_orig_uv` vertex attribute carrying the native UV alongside the
+replacement UV) via `hd_orig_vram_at`/`hd_orig_fetch_texel`, extracts the
+real `stp` bit from it, and writes
+`frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0)` — matching
+native exactly. A sentinel (`u_orig_depth < 0`) forces `stp = 1` for call
+sites that have no native texinfo to look up (calibration test, debug
+markers), preserving old behavior there.
 
-**Why it might NOT matter in practice:** this needs a concrete repro before
-treating it as confirmed. It's plausible the overwhelming majority of opaque
-prims have STP=1 for all their solid (non-discarded) texels anyway (STP=0 on
-an opaque, non-discarded texel is a fairly unusual authoring pattern), which
-would make this invisible in normal play. Flagging for a dedicated test
-(e.g. find a scene where a masked check or semi-transparent overlay
-interacts with HD-replaced geometry, and A/B it with `hd_backend none`).
+**Follow-on regression, found and fixed in the same session:** making
+`frag.a` legitimately vary uncovered a latent, previously-invisible bug in
+`draw_hd_replacement_triangle`: it left `GL_BLEND` permanently enabled with
+`glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO)`,
+using `frag.a` as the RGB blend weight. This was a harmless no-op while
+`frag.a` was hardcoded to `1.0` (`dst*0 + src*1`), but once `frag.a` could be
+`0.0` (any texel whose real STP bit is clear — the common case for opaque
+PS1 content), the same blend equation reduced to `dst*1 + src*0`: the draw
+became fully invisible wherever `stp == 0`. Symptom in live testing: garbled
+dialogue text and a missing character model, while non-HD-replaced content
+was unaffected (a strong signal it was specific to the HD draw path).
+**Root cause and correct fix:** native's own `tex_batch_draw_passes` already
+does `if (semi < 0) glDisable(GL_BLEND)` for opaque prims — the *only* prim
+class HD replacement ever draws (`semi < 0` is the HD-match gate). HD's draw
+call had simply never matched that. Changed `draw_hd_replacement_triangle`
+to `glDisable(GL_BLEND)` unconditionally, matching native's treatment of the
+same prim class exactly. This is a parity fix, not a workaround — blending
+was never legitimately active for this prim class in the first place.
+Verified live across all three `hd_backend` values (`none`, `duckstation`,
+`beetle`) with no corruption.
 
-### 2. `a_limits` equivalent for fused/composite HD textures — ⚠️ needs investigation
+### 2. `a_limits` equivalent for fused/composite HD textures — 🛠️ fixed
 
 Native `fetch_texel` clamps (or wraps, via `u_twin`) `u,v` to `v_limits`
 (`flat in ivec4 v_limits`) — the SPECIFIC sub-rectangle this exact prim is
@@ -117,25 +129,36 @@ allowed to sample from within the shared VRAM texture page, to avoid bleeding
 into whatever unrelated content happens to be packed next to it in the same
 page.
 
-`HD_FS`'s `hd_texelfetch_clamped` instead clamps to `ivec2(0), size-1` — the
-bound texture's OWN full dimensions, with no per-prim sub-rectangle at all.
-For the common case (one matched PNG = one dedicated replacement texture,
-`hd_gl_get_texture`), this is fine: the whole bound texture IS the intended
-sample region, so clamping to its full bounds is correct.
+`HD_FS`'s `hd_texelfetch_clamped` previously clamped only to `ivec2(0),
+size-1` — the bound texture's OWN full dimensions, with no per-prim
+sub-rectangle at all. For the common case (one matched PNG = one dedicated
+replacement texture, `hd_gl_get_texture`) this was already correct (the whole
+bound texture IS the intended sample region), but for the **fused-page
+compositing path** (`build_fused_composite`, opt-in via
+`gpu_hd_texture_fusion_set`, off by default) it risked `hd_sample_bilinear`'s
+4-tap footprint (up to 1 texel beyond the nominal sample point per axis)
+bleeding across an adjacent piece's region of the same shared composite
+texture.
 
-For the **fused-page compositing path** (`build_fused_composite`,
-opt-in via `gpu_hd_texture_fusion_set`, off by default) it's less obviously
-safe: that path deliberately composites MULTIPLE distinct HD entries and/or
-native-fallback pieces into ONE shared texture, specifically so pieces that
-individually only partially cover a page can be assembled into a complete
-replacement. If a piece's bilinear sampling footprint (`hd_sample_bilinear`
-reads up to 1 texel beyond the nominal sample point in each direction) can
-reach across into an ADJACENT piece's region of that same composite texture
-— rather than being clamped to just its own sub-rect the way native `v_limits`
-would — that's a bleeding risk analogous to the already-fixed texture-window
-case, just for a different feature. This is OFF BY DEFAULT (`hd_texture_page_
-fusion` opt-in in `game.toml`), so it doesn't affect normal play, but is
-worth a dedicated check before ever turning that feature on by default.
+**Fix:** added a per-piece rect lookup. `hd_piece_bounds` determines, once
+per fragment, which packed piece the BASE (non-offset) sample texel falls
+into, using a new uniform array `u_piece_rects[24]` (`ivec4` per piece:
+x/y/w/h) plus `u_piece_count`; all 4 bilinear taps then clamp to that piece's
+own sub-rect instead of the whole composite texture. `draw_hd_replacement_
+triangle` populates these from `build_fused_composite`'s own piece list
+(`fused_pieces[].x/y/width/height`) only when it actually built a fused
+composite for this draw; every other call site passes `piece_count = 0`,
+which makes `hd_piece_bounds` a no-op and falls back to the old whole-texture
+clamp — so this is fix-only for the fused path and behaviorally identical to
+before for the vast majority of ordinary single-PNG-match draws.
+
+This path is still off by default (`hd_texture_page_fusion` opt-in in
+`game.toml`) and has not had a dedicated live repro exercising actual piece
+boundaries this session (fused compositing wasn't triggered by any of the
+scenes tested) — the fix is code-reviewed and logically sound (mirrors
+`v_limits`' own clamp-to-sub-rect approach) and is a strict no-op for
+everything that WAS tested, but a dedicated fused-page test is still
+worthwhile before treating it as fully proven.
 
 ## What's already confirmed solid (no further action needed)
 
@@ -155,13 +178,16 @@ worth a dedicated check before ever turning that feature on by default.
 
 ## Suggested next steps
 
-1. Live-verify open item #1 (mask/stencil alpha) with a targeted repro if one
-   can be found; if confirmed, thread the real per-fragment STP-equivalent
-   value through (the replacement PNG's own alpha channel already encodes a
-   cutout shape — the question is whether ITS value, or a fixed 1.0, is the
-   right thing to write for opaque HD-replaced pixels).
-2. Revisit open item #2 only if/when fused-page compositing is considered
-   for default-on — not urgent while it stays opt-in.
+1. Give the fused-page piece-clamp fix (resolved item #2) a dedicated live
+   test that actually exercises a fused composite with multiple pieces —
+   it hasn't been exercised by any scene tested this session since the
+   feature is off by default.
+2. When touching `draw_hd_replacement_triangle` or `HD_FS` again, keep the
+   `GL_BLEND`/`frag.a` interaction in mind (see resolved item #1's
+   follow-on regression) — any future change that makes `frag.a` vary again
+   needs to be checked against whatever the draw's blend state is at the
+   time, since a silent no-op blend can turn into a silent full-invisibility
+   bug with no compiler or type-system signal at all.
 3. Treat this document as the reference to update whenever either shader
    pair changes, so a future feature added to one side doesn't silently
    create a new parity gap the way perspective correction did.

@@ -1548,3 +1548,40 @@ per-texel STP bit / `u_maskset`; and `hd_texelfetch_clamped`'s whole-texture
 clamp bound being potentially too permissive for the opt-in, off-by-default
 fused-page compositing path) — see `HD_SHADER_PARITY.md` for details and
 suggested next steps. Neither has a confirmed live repro yet.
+
+### Addendum 2 (same day): both open items implemented, one uncovered a
+### serious latent GL_BLEND bug
+
+Both items above were implemented. The mask/stencil-alpha fix threads a real
+per-texel lookup of the ORIGINAL native VRAM texel through `HD_FS` (new
+`u_vram`/`u_orig_tpage`/`u_orig_clut`/`u_orig_depth`/`u_orig_limits`
+uniforms + `a_orig_uv` attribute) so `frag.a` reflects the actual STP bit
+instead of a hardcoded `1.0`. The fused-composite clamp fix adds a per-piece
+rect lookup (`u_piece_rects[24]`/`u_piece_count`, `hd_piece_bounds`) so
+`hd_sample_bilinear`'s 4-tap footprint can't bleed across piece boundaries
+inside a fused composite texture.
+
+Making `frag.a` legitimately vary immediately uncovered a real, previously
+invisible bug: `draw_hd_replacement_triangle` left `GL_BLEND` permanently
+enabled with a blend func that uses `frag.a` as the RGB mix weight. This was
+a harmless no-op while `frag.a` was hardcoded to `1.0`; once `frag.a` could
+be `0.0` (any texel whose real STP bit is clear — the common case for
+opaque content), the blend equation collapsed to `dst*1 + src*0`, making the
+draw invisible wherever `stp == 0`. Live symptom: garbled dialogue text and
+a missing character model, with non-HD-replaced content unaffected — that
+last detail (only HD draws broke) was the key clue. Root cause: native's own
+`tex_batch_draw_passes` disables `GL_BLEND` entirely for opaque prims (the
+only class HD replacement ever draws), and HD's own draw call had simply
+never matched that. Fix: `glDisable(GL_BLEND)` in `draw_hd_replacement_
+triangle`, unconditionally — a parity fix, not a workaround, since blending
+was never legitimately active for this prim class to begin with. Verified
+live across all three `hd_backend` values with no corruption.
+
+Lesson for future shader work on this pipeline: a uniform/attribute that
+looks purely additive (like a new alpha output) can silently interact with
+whatever fixed-function GL state the surrounding draw call sets up; check
+the blend/stencil/depth state around a shader change, not just the shader
+itself. See `HD_SHADER_PARITY.md`'s "Resolved items" section for the full
+writeup, including why the fused-composite fix is code-reviewed-sound but
+still lacks a dedicated live test (the feature is off by default and wasn't
+triggered by any scene tested this session).
