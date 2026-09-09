@@ -1519,3 +1519,32 @@ animated content, across 10 frames over 3 seconds and across every
 `hd_backend` value (`none`/`duckstation`/`beetle`), came back byte-
 identical every time (stddev ~1e-14, i.e. exactly 0 modulo float noise) —
 zero flicker, fast path still engaged.
+
+
+### Addendum (same day, later): a real gap the ground-truth test couldn't have caught
+
+The calibration test in step 6 proved vertex POSITION math is identical
+between paths — it did not, and by construction could not, prove every
+OTHER per-vertex feature was also mirrored, since it used a flat, static
+checkerboard with no perspective content. A user report of a wavy/warped
+floor and roof texture (visible under `beetle`/`duckstation`, straight under
+`none`) led to a systematic feature-by-feature audit of every attribute,
+uniform, and varying in `HD_VS`/`HD_FS` against native `TEX_VS`/`TEX_FS` —
+see `docs/internal/HD_SHADER_PARITY.md` for the full comparison.
+
+That audit found `HD_VS`/`HD_FS` had **no perspective-correction mechanism
+at all** — always affine UV mapping, regardless of whether the native path
+(`a_q`/`v_persp`, driven by `[video] perspective_texturing` + GTE projection
+provenance) would have used perspective-correct interpolation for the exact
+same primitive. On a receding surface viewed at a steep angle (a floor or
+angled roof), affine-vs-perspective-correct is precisely the difference
+between warped and straight texture lines. Fixed by porting the same
+`a_q` → `w=1/q` → smooth `v_uv_p`/flat `v_persp` mechanism into `HD_VS`/
+`HD_FS`, verified live against the reported reproduction scene.
+
+The parity audit also flagged two further, not-yet-confirmed differences
+(HD-replaced opaque prims always writing alpha=1.0 regardless of the real
+per-texel STP bit / `u_maskset`; and `hd_texelfetch_clamped`'s whole-texture
+clamp bound being potentially too permissive for the opt-in, off-by-default
+fused-page compositing path) — see `HD_SHADER_PARITY.md` for details and
+suggested next steps. Neither has a confirmed live repro yet.

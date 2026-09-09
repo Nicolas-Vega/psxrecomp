@@ -1713,7 +1713,29 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
  * being precise: the centre is authoritatively overwritten by the blit, so the
  * ONLY requirement is that a margin-reaching prim is NOT skipped — hence the
  * conservative strict-inside test. 4:3 never runs any of this (g_wide_cur == 0).
- * Toggle via gl_wide_fast for A/B; default ON. */
+ *
+ * 2026-09-09: this assumes the wide surface's centre columns are ALWAYS
+ * identical to the canonical framebuffer, but that's only true when the
+ * canonical framebuffer's most recent draw target is the same VRAM half the
+ * display currently shows -- for a title that double-buffers by alternating
+ * which VRAM half it draws into while the display address stays fixed
+ * (confirmed live: Vagrant Story's draw-area rect toggles [0,319]/[320,639]
+ * every simulated frame while disp_x stays pinned at 320), that assumption
+ * is false on every other frame, and the resulting stale-vs-fresh mismatch
+ * between the blitted centre and the freshly mirror-drawn margins is
+ * directly visible as a live flicker. Two attempted targeted fixes (gating
+ * the skip decision, then additionally gating the blit itself, both on
+ * g_wide_cur_base == disp_x) were each tried live and reverted: the first
+ * still flickered, the second caused SEVERE visible corruption (most of the
+ * frame going black/garbage) -- this fast path's interaction with Vagrant
+ * Story's double-buffering is not yet understood well enough to patch
+ * safely under time pressure. DISABLED FOR THIS TITLE via game.toml's
+ * [widescreen] nw_full_mirror = true (TOML key; see config_loader.h for
+ * the ws_nw_full_mirror struct field it maps to; main.cpp
+ * reads it into gl_renderer_set_wide_fast at startup, overriding this
+ * compiled-in default) rather than changing the default here, since other
+ * titles may rely on this optimisation working correctly for them. Toggle
+ * via gl_wide_fast for live A/B testing regardless of the config value. */
 static int s_wide_fast = 1;
 void gl_renderer_set_wide_fast(int on) { s_wide_fast = on ? 1 : 0; }
 int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
@@ -1722,28 +1744,6 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * prim adds nothing to either reveal margin and its mirror can be skipped. */
 static int mirror_x_center_only(int lo, int hi) {
     if (!s_wide_fast) return 0;
-    /* 2026-09-09 root-cause fix (see wide_blit_center's TODO/comment history):
-     * this "skip the mirror, the later blit covers it" shortcut is only sound
-     * when the blit and this classification agree on WHICH VRAM half is the
-     * canonical centre. The blit always reads from the DISPLAYED half
-     * (disp_x, tracked live in s_present_disp_x -- fixed for a title that
-     * doesn't move its display address, e.g. Vagrant Story never does), but
-     * this check used g_wide_cur_base -- the half CURRENTLY BEING DRAWN INTO,
-     * which alternates every frame for a title that double-buffers by
-     * flipping which VRAM half is the draw target (confirmed live: this
-     * title's draw-area rect toggles [0,319]/[320,639] every frame while
-     * disp_x stays pinned at 320). On a frame where the draw target is the
-     * OFF-screen half (g_wide_cur_base != disp_x), a batch could get
-     * classified "centre-only" and skipped relative to a centre window the
-     * blit will never actually read from that frame -- reproduced live as a
-     * gradient-debug-mode flicker between two slightly different renders of
-     * the same content, fixed by disabling this whole fast path (gl_wide_fast
-     * on=0). Gating on the two bases agreeing keeps the optimisation for the
-     * (common) case they do, and safely falls back to the always-correct
-     * per-prim mirror otherwise -- this NEVER makes the skip decision more
-     * permissive, only more conservative, so it cannot regress a currently-
-     * working title. */
-    if (g_wide_cur_base != s_present_disp_x) return 0;
     int base = g_wide_cur_base, native_w = g_wide_w - 2 * g_wide_off;
     if (native_w <= 0) return 0;
     return (lo >= base) && (hi < base + native_w);
@@ -2131,14 +2131,35 @@ static const char *HD_VS =
     "layout(location=0) in vec2 a_pos;\n"
     "layout(location=1) in vec2 a_uv;\n"
     "layout(location=2) in vec3 a_col;\n"
+    /* 2026-09-09: perspective-correction parity fix. This prim's NATIVE
+     * rendering (TEX_VS/TEX_FS) can use either affine (PS1-faithful, the
+     * default) or perspective-correct UV interpolation, chosen per-prim via
+     * a_q (see TEX_VS's own comment: nonzero only when [video]
+     * perspective_texturing is on AND this prim carried full GTE projection
+     * provenance). HD_VS/HD_FS had NO equivalent -- always affine,
+     * regardless of what the native path (or an unmatched fallback of the
+     * SAME prim) would have done. On a receding surface viewed at a steep
+     * angle (a floor is the classic case), affine-vs-perspective-correct is
+     * exactly "warped/wavy" vs "straight" texture lines -- reported live as
+     * a floor pattern that looks straight under `none` but wavy under
+     * `beetle`/`duckstation`. Mirrors TEX_VS's own w-divide trick: emit
+     * clip coords pre-multiplied by w=1/q so the post-divide NDC position
+     * is unchanged while the rasterizer interpolates v_uv_p hyperbolically;
+     * a_q==0 (the common case) makes w exactly 1.0, identical to before. */
+    "layout(location=3) in float a_q;   /* persp weight; 0 = affine (default) */\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;\n"
     "uniform float u_xhalf;\n"
     "noperspective out vec2 v_uv;\n"
+    "smooth out vec2 v_uv_p;  /* perspective-correct UV (used when v_persp!=0) */\n"
+    "flat out int v_persp;\n"
     "noperspective out vec3 v_col;\n"
-    "void main(){ v_uv = a_uv; v_col = a_col;\n"
-    "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0,\n"
-    "                     (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
+    "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
+    "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
+    "  vec2 ndc = vec2((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0,\n"
+    "                   (a_pos.y+u_shift)/256.0 - 1.0);\n"
+    "  gl_Position = vec4(ndc * w, 0.0, w); }\n";
 /* 2026-09-09: sampling switched from GL's hardware bilinear (`texture(u_tex,
  * v_uv)`, GL_LINEAR) to a manual, Beetle-style texelFetch blend, ported
  * directly from real Beetle PSX HW's own HD-texture-pack shader
@@ -2167,7 +2188,8 @@ static const char *HD_VS =
  * at all; only how the shader turns that same uv into a sample did. */
 static const char *HD_FS =
     "#version 330\n"
-    "noperspective in vec2 v_uv; noperspective in vec3 v_col; out vec4 frag;\n"
+    "noperspective in vec2 v_uv; smooth in vec2 v_uv_p; flat in int v_persp;\n"
+    "noperspective in vec3 v_col; out vec4 frag;\n"
     "uniform sampler2D u_tex;\n"
     "uniform vec2 u_tex_size;\n" /* u_tex's own (width, height) in texels */
     "vec4 hd_texelfetch_clamped(ivec2 texel, ivec2 size) {\n"
@@ -2232,7 +2254,8 @@ static const char *HD_FS =
      * divergence (framebuffer-order-dependent partial blending at any
      * texture's edge) without reintroducing the original jagged-text bug. */
     "void main(){\n"
-    "  vec4 c = hd_sample_bilinear(v_uv * u_tex_size, ivec2(u_tex_size));\n"
+    "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+    "  vec4 c = hd_sample_bilinear(uv * u_tex_size, ivec2(u_tex_size));\n"
     "  if (u_silhouette_mode == 0 && c.a < 0.5) discard;\n"
     /* Per-vertex Gouraud shading (ambient/room lighting), same formula and
      * *2.0 scale as TEX_FS's "rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0)"
@@ -2411,12 +2434,14 @@ static void hd_gl_init(void) {
     p_glBindVertexArray(s_hd_vao);
     p_glGenBuffers(1, &s_hd_vbo);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_hd_vbo);
-    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)0);
+    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)0);
     p_glEnableVertexAttribArray(0);
-    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)(2 * sizeof(float)));
+    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)(2 * sizeof(float)));
     p_glEnableVertexAttribArray(1);
-    p_glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)(4 * sizeof(float)));
+    p_glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)(4 * sizeof(float)));
     p_glEnableVertexAttribArray(2);
+    p_glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void *)(7 * sizeof(float)));
+    p_glEnableVertexAttribArray(3);
     p_glBindVertexArray(0);
     p_glUseProgram(s_hd_prog);
     p_glUniform1f(s_hd_uXoff, 0.0f);
@@ -2993,16 +3018,22 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
                                          GLuint tex, int tex_w, int tex_h,
                                          float u_scale, float u_offset,
                                          float v_scale, float v_offset,
-                                         float tint_r, float tint_g, float tint_b) {
-    float verts[3 * 7];
+                                         float tint_r, float tint_g, float tint_b,
+                                         const float *qs) {
+    /* qs: per-vertex perspective weight (HD_VS's a_q), same convention as
+     * the native path's s_pq (0 = affine). NULL for callers that only ever
+     * draw affine content (the calibration test, the coverage-debug marker)
+     * -- treated as {0,0,0}. See HD_VS's comment for why this exists. */
+    float verts[3 * 8];
     for (int i = 0; i < 3; i++) {
-        verts[i * 7 + 0] = (float)xs[i];
-        verts[i * 7 + 1] = (float)ys[i];
-        verts[i * 7 + 2] = (float)us[i] * u_scale + u_offset;
-        verts[i * 7 + 3] = (float)vs[i] * v_scale + v_offset;
-        verts[i * 7 + 4] = col[i * 3 + 0];
-        verts[i * 7 + 5] = col[i * 3 + 1];
-        verts[i * 7 + 6] = col[i * 3 + 2];
+        verts[i * 8 + 0] = (float)xs[i];
+        verts[i * 8 + 1] = (float)ys[i];
+        verts[i * 8 + 2] = (float)us[i] * u_scale + u_offset;
+        verts[i * 8 + 3] = (float)vs[i] * v_scale + v_offset;
+        verts[i * 8 + 4] = col[i * 3 + 0];
+        verts[i * 8 + 5] = col[i * 3 + 1];
+        verts[i * 8 + 6] = col[i * 3 + 2];
+        verts[i * 8 + 7] = qs ? qs[i] : 0.0f;
     }
     /* Same FBO/viewport/scissor bracket every other draw path in this file
      * uses (see flush_flat_batch/flush_tex_batch) -- without it this drew to
@@ -3196,10 +3227,10 @@ int gl_renderer_calib_test(int dx_offset) {
             int us2[3] = {PAT_N - 1, 0, PAT_N - 1},    vs2[3] = {0, PAT_N - 1, PAT_N - 1};
             draw_hd_replacement_triangle(xs1, ys1, us1, vs1, col_neutral, 1,
                                          hd_tex, HD_N, HD_N,
-                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1);
+                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1, NULL);
             draw_hd_replacement_triangle(xs2, ys2, us2, vs2, col_neutral, 1,
                                          hd_tex, HD_N, HD_N,
-                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1);
+                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1, NULL);
             glDeleteTextures(1, &hd_tex);
         }
         free(hd_rgba);
@@ -3629,7 +3660,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             flush_tex_batch();
             draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, hd_tex, hd_tex_w, hd_tex_h,
                                          hd_u_scale, hd_u_offset, hd_v_scale, hd_v_offset,
-                                         hd_tint_r, hd_tint_g, hd_tint_b);
+                                         hd_tint_r, hd_tint_g, hd_tint_b,
+                                         s_pq_valid ? s_pq : NULL);
             return;
         }
         /* Fused-page fallback (opt-in, off by default -- see
@@ -3664,7 +3696,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                         xs, ys, us, vs, col, rawtex, fused_tex, s_fused_tex_w, s_fused_tex_h,
                         fused_u_scale, -(float)lim[0] * fused_u_scale,
                         fused_v_scale, -(float)lim[1] * fused_v_scale,
-                        1.0f, 1.0f, 1.0f);
+                        1.0f, 1.0f, 1.0f, s_pq_valid ? s_pq : NULL);
                     return;
                 }
             }
@@ -3673,7 +3705,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             flush_flat_batch();
             flush_tex_batch();
             draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, s_hd_debug_missing_tex, 1, 1,
-                                         0.0f, 0.5f, 0.0f, 0.5f, 1.0f, 1.0f, 1.0f);
+                                         0.0f, 0.5f, 0.0f, 0.5f, 1.0f, 1.0f, 1.0f, NULL);
             return;
         }
     }
