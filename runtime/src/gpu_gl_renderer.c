@@ -2033,7 +2033,7 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
  * ever actually used together (today's default widescreen state is off). */
 static GLuint s_hd_prog = 0, s_hd_vao = 0, s_hd_vbo = 0;
 static GLint  s_hd_uXoff = -1, s_hd_uXhalf = -1, s_hd_uShift = -1, s_hd_uTex = -1, s_hd_uTint = -1,
-             s_hd_uRaw = -1;
+             s_hd_uRaw = -1, s_hd_uTexSize = -1;
 
 static const char *HD_VS =
     "#version 330\n"
@@ -2048,10 +2048,54 @@ static const char *HD_VS =
     "void main(){ v_uv = a_uv; v_col = a_col;\n"
     "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0,\n"
     "                     (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+/* 2026-09-09: sampling switched from GL's hardware bilinear (`texture(u_tex,
+ * v_uv)`, GL_LINEAR) to a manual, Beetle-style texelFetch blend, ported
+ * directly from real Beetle PSX HW's own HD-texture-pack shader
+ * (rhi/shaders_gl/command_fragment.glsl.h, hd_sample_bilinear/hd_sample_nearest
+ * -- read directly from libretro/beetle-psx-libretro this session). Why:
+ * a 480-frame median-burst comparison (see ISSUES.md #11's 2026-09-09 update,
+ * burst_median_compare.py) measured a small, consistent, DIRECTIONAL pixel
+ * shift in HD-replaced body content vs. native rendering, traced to GL's
+ * hardware sampler treating texel i's centre as (i+0.5)/N while this
+ * project's u_offset/u_scale (gpu.c) had always assumed i/N -- confirmed by
+ * checking that HD_VS's vertex-position formula is bit-identical to the
+ * native TEX_VS/GEO_VS programs', ruling out a geometry-position bug. Adding
+ * a bare "+0.5/N" to u_offset (the obvious fix) was tried and reverted: GL's
+ * hardware sampler has no notion of "stay inside this one packed sub-image",
+ * so the shift pushed sampling in the dialogue-box font atlas (packed
+ * edge-to-edge, no inter-glyph padding) into the row below, bleeding it
+ * through every line of text. Real Beetle's own manual bilinear sidesteps
+ * exactly this: each of its 4 texel fetches is an explicit, discrete
+ * texelFetch that can be validated/clamped individually (its own
+ * hd_texel_valid/clamp_rect machinery) instead of trusting opaque hardware
+ * filtering. This is that same structure, simplified (no mip-level chain --
+ * this project's replacement textures have none): manual nearest fetch,
+ * clamped to the bound texture's own bounds (u_tex_size), blended with
+ * Beetle's exact fract(uv)-0.5 weighting so texel i's centre sits at
+ * uv=i+0.5 with no boundary tie -- u_offset/u_scale did not need to change
+ * at all; only how the shader turns that same uv into a sample did. */
 static const char *HD_FS =
     "#version 330\n"
     "noperspective in vec2 v_uv; noperspective in vec3 v_col; out vec4 frag;\n"
     "uniform sampler2D u_tex;\n"
+    "uniform vec2 u_tex_size;\n" /* u_tex's own (width, height) in texels */
+    "vec4 hd_texelfetch_clamped(ivec2 texel, ivec2 size) {\n"
+    "  texel = clamp(texel, ivec2(0), size - ivec2(1));\n"
+    "  return texelFetch(u_tex, texel, 0);\n"
+    "}\n"
+    "vec4 hd_sample_bilinear(vec2 texel_uv, ivec2 size) {\n"
+    "  vec2 uv_frac = fract(texel_uv) - vec2(0.5, 0.5);\n"
+    "  vec2 uv_offs = sign(uv_frac);\n"
+    "  uv_frac = abs(uv_frac);\n"
+    "  ivec2 base = ivec2(floor(texel_uv));\n"
+    "  ivec2 ox = ivec2(int(uv_offs.x), 0), oy = ivec2(0, int(uv_offs.y));\n"
+    "  vec4 c00 = hd_texelfetch_clamped(base, size);\n"
+    "  vec4 c10 = hd_texelfetch_clamped(base + ox, size);\n"
+    "  vec4 c01 = hd_texelfetch_clamped(base + oy, size);\n"
+    "  vec4 c11 = hd_texelfetch_clamped(base + ox + oy, size);\n"
+    "  return c00*(1.0-uv_frac.x)*(1.0-uv_frac.y) + c10*uv_frac.x*(1.0-uv_frac.y)\n"
+    "       + c01*(1.0-uv_frac.x)*uv_frac.y + c11*uv_frac.x*uv_frac.y;\n"
+    "}\n"
     /* Per-channel multiplier for the shading-approximation fallback (see
      * hd_texture_dump.h's header comment on hd_texture_dump_match) -- (1,1,1)
      * for an exact palette-hash match, a derived tint otherwise so a scene
@@ -2090,7 +2134,7 @@ static const char *HD_FS =
      * divergence (framebuffer-order-dependent partial blending at any
      * texture's edge) without reintroducing the original jagged-text bug. */
     "void main(){\n"
-    "  vec4 c = texture(u_tex, v_uv);\n"
+    "  vec4 c = hd_sample_bilinear(v_uv * u_tex_size, ivec2(u_tex_size));\n"
     "  if (c.a < 0.5) discard;\n"
     /* Per-vertex Gouraud shading (ambient/room lighting), same formula and
      * *2.0 scale as TEX_FS's "rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0)"
@@ -2111,7 +2155,7 @@ static const char *HD_FS =
  * of HD textures for one game is not expected to be a meaningful budget
  * concern, unlike the native VRAM texture cache this deliberately avoids
  * touching. */
-typedef struct { uint32_t entry_id; GLuint tex; int failed; } HdGlTexEntry;
+typedef struct { uint32_t entry_id; GLuint tex; int failed; int w, h; } HdGlTexEntry;
 static HdGlTexEntry *s_hd_tex_cache = NULL;
 static int s_hd_tex_cache_count = 0, s_hd_tex_cache_cap = 0;
 static uint64_t s_hd_draws_issued = 0;    /* draw_hd_replacement_triangle calls */
@@ -2178,6 +2222,7 @@ static void hd_gl_init(void) {
     s_hd_uTex   = p_glGetUniformLocation(s_hd_prog, "u_tex");
     s_hd_uTint  = p_glGetUniformLocation(s_hd_prog, "u_tint");
     s_hd_uRaw   = p_glGetUniformLocation(s_hd_prog, "u_raw");
+    s_hd_uTexSize = p_glGetUniformLocation(s_hd_prog, "u_tex_size");
     p_glGenVertexArrays(1, &s_hd_vao);
     p_glBindVertexArray(s_hd_vao);
     p_glGenBuffers(1, &s_hd_vbo);
@@ -2485,6 +2530,7 @@ static GLuint hd_gl_cache_insert(uint32_t entry_id, const unsigned char *pixels,
     slot->entry_id = entry_id;
     slot->tex = 0;
     slot->failed = 1;
+    slot->w = w; slot->h = h;
     if (!pixels) return 0;
     GLuint tex = 0;
     glGenTextures(1, &tex);
@@ -2493,6 +2539,12 @@ static GLuint hd_gl_cache_insert(uint32_t entry_id, const unsigned char *pixels,
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        /* MIN/MAG filter is vestigial now: HD_FS/FUSED_BLIT_FS sample this
+         * texture exclusively via texelFetch (see hd_sample_bilinear), which
+         * ignores filter mode entirely and does its own manual, Beetle-style
+         * bilinear blend instead of the hardware sampler's -- see the
+         * 2026-09-09 note above HD_FS for why. Left as GL_LINEAR only because
+         * nothing reads it anymore, not because it does anything. */
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -2504,16 +2556,23 @@ static GLuint hd_gl_cache_insert(uint32_t entry_id, const unsigned char *pixels,
     return slot->failed ? 0 : slot->tex;
 }
 
-static GLuint hd_gl_get_texture(uint32_t entry_id, const char *png_path) {
+static GLuint hd_gl_get_texture(uint32_t entry_id, const char *png_path, int *out_w, int *out_h) {
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
     for (int i = 0; i < s_hd_tex_cache_count; i++)
-        if (s_hd_tex_cache[i].entry_id == entry_id)
+        if (s_hd_tex_cache[i].entry_id == entry_id) {
+            if (out_w) *out_w = s_hd_tex_cache[i].w;
+            if (out_h) *out_h = s_hd_tex_cache[i].h;
             return s_hd_tex_cache[i].failed ? 0 : s_hd_tex_cache[i].tex;
+        }
     int w = 0, h = 0;
     unsigned char *pixels = hd_decode_png_file(png_path, &w, &h);
     if (!pixels)
         fprintf(stdout, "psxrecomp: HD texture decode failed: %s\n", png_path);
     GLuint result = hd_gl_cache_insert(entry_id, pixels, w, h);
     if (pixels) stbi_image_free(pixels);
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
     return result;
 }
 
@@ -2716,7 +2775,8 @@ void gpu_hd_texture_preload_active(void) {
 static void draw_hd_replacement_triangle(const int *xs, const int *ys,
                                          const int *us, const int *vs,
                                          const float *col, int rawtex,
-                                         GLuint tex, float u_scale, float u_offset,
+                                         GLuint tex, int tex_w, int tex_h,
+                                         float u_scale, float u_offset,
                                          float v_scale, float v_offset,
                                          float tint_r, float tint_g, float tint_b) {
     float verts[3 * 7];
@@ -2743,6 +2803,7 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
     p_glUseProgram(s_hd_prog);
     p_glUniform3f(s_hd_uTint, tint_r, tint_g, tint_b);
     p_glUniform1i(s_hd_uRaw, rawtex);
+    p_glUniform2f(s_hd_uTexSize, (float)(tex_w > 0 ? tex_w : 1), (float)(tex_h > 0 ? tex_h : 1));
     /* Standard "over" blend for the replacement PNG's OWN anti-aliased edge
      * pixels (see HD_FS's comment) -- not a PS1 blend-equation replication;
      * the original native prim this replaces had no blending at all (semi <
@@ -2814,7 +2875,8 @@ static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type); 
 static GLuint s_fused_fbo = 0, s_fused_tex = 0;
 static int    s_fused_tex_w = 0, s_fused_tex_h = 0;
 static GLuint s_fused_blit_prog = 0;
-static GLint  s_fused_blit_uTex = -1, s_fused_blit_uTargetSize = -1, s_fused_blit_uTint = -1;
+static GLint  s_fused_blit_uTex = -1, s_fused_blit_uTargetSize = -1, s_fused_blit_uTint = -1,
+             s_fused_blit_uTexSize = -1;
 static GLuint s_fused_blit_vao = 0, s_fused_blit_vbo = 0;
 
 static const char *FUSED_BLIT_VS =
@@ -2826,12 +2888,38 @@ static const char *FUSED_BLIT_VS =
     "void main(){ v_uv = a_uv;\n"
     "  vec2 ndc = (a_pos / u_target_size) * 2.0 - 1.0;\n"
     "  gl_Position = vec4(ndc, 0.0, 1.0); }\n";
+/* Same manual, Beetle-style texelFetch bilinear as HD_FS (see its 2026-09-09
+ * comment) instead of GL's hardware sampler -- this shader crops a rect out
+ * of the shared HD replacement texture for each HD piece of a fused
+ * composite, so it is exactly as exposed to the texel-centre/atlas-bleed
+ * problem as the plain HD_FS path was. */
 static const char *FUSED_BLIT_FS =
     "#version 330\n"
     "in vec2 v_uv; out vec4 frag;\n"
     "uniform sampler2D u_tex;\n"
+    "uniform vec2 u_tex_size;\n"
     "uniform vec3 u_tint;\n" /* debug marker multiply, see s_hd_tint_entry_cache_key; (1,1,1) = no-op */
-    "void main(){ vec4 c = texture(u_tex, v_uv); frag = vec4(c.rgb * u_tint, c.a); }\n";
+    "vec4 fb_texelfetch_clamped(ivec2 texel, ivec2 size) {\n"
+    "  texel = clamp(texel, ivec2(0), size - ivec2(1));\n"
+    "  return texelFetch(u_tex, texel, 0);\n"
+    "}\n"
+    "vec4 fb_sample_bilinear(vec2 texel_uv, ivec2 size) {\n"
+    "  vec2 uv_frac = fract(texel_uv) - vec2(0.5, 0.5);\n"
+    "  vec2 uv_offs = sign(uv_frac);\n"
+    "  uv_frac = abs(uv_frac);\n"
+    "  ivec2 base = ivec2(floor(texel_uv));\n"
+    "  ivec2 ox = ivec2(int(uv_offs.x), 0), oy = ivec2(0, int(uv_offs.y));\n"
+    "  vec4 c00 = fb_texelfetch_clamped(base, size);\n"
+    "  vec4 c10 = fb_texelfetch_clamped(base + ox, size);\n"
+    "  vec4 c01 = fb_texelfetch_clamped(base + oy, size);\n"
+    "  vec4 c11 = fb_texelfetch_clamped(base + ox + oy, size);\n"
+    "  return c00*(1.0-uv_frac.x)*(1.0-uv_frac.y) + c10*uv_frac.x*(1.0-uv_frac.y)\n"
+    "       + c01*(1.0-uv_frac.x)*uv_frac.y + c11*uv_frac.x*uv_frac.y;\n"
+    "}\n"
+    "void main(){\n"
+    "  vec4 c = fb_sample_bilinear(v_uv * u_tex_size, ivec2(u_tex_size));\n"
+    "  frag = vec4(c.rgb * u_tint, c.a);\n"
+    "}\n";
 
 static void fused_blit_init(void) {
     if (s_fused_blit_prog) return;
@@ -2840,6 +2928,7 @@ static void fused_blit_init(void) {
     s_fused_blit_uTex = p_glGetUniformLocation(s_fused_blit_prog, "u_tex");
     s_fused_blit_uTargetSize = p_glGetUniformLocation(s_fused_blit_prog, "u_target_size");
     s_fused_blit_uTint = p_glGetUniformLocation(s_fused_blit_prog, "u_tint");
+    s_fused_blit_uTexSize = p_glGetUniformLocation(s_fused_blit_prog, "u_tex_size");
     p_glGenVertexArrays(1, &s_fused_blit_vao);
     p_glBindVertexArray(s_fused_blit_vao);
     p_glGenBuffers(1, &s_fused_blit_vbo);
@@ -2858,7 +2947,8 @@ static void fused_blit_init(void) {
  * multiply the sampled color (1,1,1 = unmodified) -- see
  * s_hd_tint_entry_cache_key/s_hd_tint_native_fused for why a specific piece
  * might want to stand out from its neighbours. */
-static void fused_blit_quad(GLuint tex, float dx, float dy, float dw, float dh,
+static void fused_blit_quad(GLuint tex, int tex_w, int tex_h,
+                            float dx, float dy, float dw, float dh,
                             float su, float sv, float sw, float sh,
                             float tr, float tg, float tb) {
     const float verts[6 * 4] = {
@@ -2869,6 +2959,7 @@ static void fused_blit_quad(GLuint tex, float dx, float dy, float dw, float dh,
         dx + dw, dy + dh, su + sw, sv + sh,
         dx,      dy + dh, su,      sv + sh,
     };
+    p_glUniform2f(s_fused_blit_uTexSize, (float)(tex_w > 0 ? tex_w : 1), (float)(tex_h > 0 ? tex_h : 1));
     p_glUniform3f(s_fused_blit_uTint, tr, tg, tb);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -2940,13 +3031,15 @@ static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
      * (not per piece -- several pieces routinely share the same upload, e.g.
      * a heavily-fragmented one), indexed by hd_entry_idx. */
     GLuint hd_texs[GPU_HD_FUSED_MAX_ENTRIES] = {0};
+    int hd_tex_w[GPU_HD_FUSED_MAX_ENTRIES] = {0}, hd_tex_h[GPU_HD_FUSED_MAX_ENTRIES] = {0};
     int hd_entry_bad = 0;
     for (int i = 0; i < count; i++) {
         if (!pieces[i].has_hd) continue;
         const int e = pieces[i].hd_entry_idx;
         if (e < 0 || e >= entry_count) { hd_entry_bad = 1; break; }
         if (!hd_texs[e])
-            hd_texs[e] = hd_gl_get_texture(hd_cache_keys[e], hd_png_paths[e]);
+            hd_texs[e] = hd_gl_get_texture(hd_cache_keys[e], hd_png_paths[e],
+                                           &hd_tex_w[e], &hd_tex_h[e]);
     }
     if (hd_entry_bad) {
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
@@ -2997,7 +3090,7 @@ static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
                 if (s_hd_tint_entry_cache_key && hd_cache_keys[e] == s_hd_tint_entry_cache_key) {
                     tr = s_hd_tint_entry_r; tg = s_hd_tint_entry_g; tb = s_hd_tint_entry_b;
                 }
-                fused_blit_quad(hd_tex, dx, dy, dw, dh,
+                fused_blit_quad(hd_tex, hd_tex_w[e], hd_tex_h[e], dx, dy, dw, dh,
                                 p->hd_src_x / w_texels, p->hd_src_y / h_texels,
                                 p->width / w_texels, p->height / h_texels,
                                 tr, tg, tb);
@@ -3025,7 +3118,7 @@ static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
                 if (s_hd_tint_native_fused) {
                     tr = s_hd_tint_native_r; tg = s_hd_tint_native_g; tb = s_hd_tint_native_b;
                 }
-                fused_blit_quad(tmp, ndx, ndy, ndw, ndh, 0.0f, 0.0f, 1.0f, 1.0f, tr, tg, tb);
+                fused_blit_quad(tmp, pw, ph, ndx, ndy, ndw, ndh, 0.0f, 0.0f, 1.0f, 1.0f, tr, tg, tb);
             }
         }
     }
@@ -3103,6 +3196,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         float hd_u_scale = 0, hd_u_offset = 0, hd_v_scale = 0, hd_v_offset = 0;
         float hd_tint_r = 1.0f, hd_tint_g = 1.0f, hd_tint_b = 1.0f;
         GLuint hd_tex = 0;
+        int hd_tex_w = 0, hd_tex_h = 0;
         int hd_hit;
         /* Three mutually exclusive HD-replacement modes (see gpu.h's
          * gpu_hd_texture_set_backend): DuckStation-format packs (XXH3-64,
@@ -3130,7 +3224,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         }
         if (hd_hit) {
             s_hd_matches_seen++;
-            hd_tex = hd_gl_get_texture(hd_entry_id, hd_png_path);
+            hd_tex = hd_gl_get_texture(hd_entry_id, hd_png_path, &hd_tex_w, &hd_tex_h);
         }
         if (hd_tex) {
             if (s_hd_tint_entry_cache_key && hd_entry_id == s_hd_tint_entry_cache_key) {
@@ -3138,7 +3232,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             }
             flush_flat_batch();
             flush_tex_batch();
-            draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, hd_tex,
+            draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, hd_tex, hd_tex_w, hd_tex_h,
                                          hd_u_scale, hd_u_offset, hd_v_scale, hd_v_offset,
                                          hd_tint_r, hd_tint_g, hd_tint_b);
             return;
@@ -3172,7 +3266,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                     flush_flat_batch();
                     flush_tex_batch();
                     draw_hd_replacement_triangle(
-                        xs, ys, us, vs, col, rawtex, fused_tex,
+                        xs, ys, us, vs, col, rawtex, fused_tex, s_fused_tex_w, s_fused_tex_h,
                         fused_u_scale, -(float)lim[0] * fused_u_scale,
                         fused_v_scale, -(float)lim[1] * fused_v_scale,
                         1.0f, 1.0f, 1.0f);
@@ -3183,7 +3277,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (s_hd_debug_missing) {
             flush_flat_batch();
             flush_tex_batch();
-            draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, s_hd_debug_missing_tex,
+            draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, s_hd_debug_missing_tex, 1, 1,
                                          0.0f, 0.5f, 0.0f, 0.5f, 1.0f, 1.0f, 1.0f);
             return;
         }

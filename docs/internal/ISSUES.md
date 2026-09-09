@@ -1200,3 +1200,89 @@ same content. Investigation:
   doesn't need an equivalent workaround, and touches every rendering
   path (native, DuckStation-format, Beetle-format), not just this one
   seam. Scoped as a follow-up session, not attempted here.
+
+### 2026-09-09 (continued, later session): HD-texture sampling reimplemented to match real Beetle's own manual bilinear
+
+Investigated the user's proposed direction above, but landed somewhere
+more scoped and better-justified: reading real Beetle PSX HW's own
+HD-texture-pack fragment shader in full
+(`rhi/shaders_gl/command_fragment.glsl.h`, `hd_sample_nearest`/
+`hd_sample_bilinear`/`hd_texel_at`/`hd_make_level`) showed it does **not**
+sample its HD replacement textures through a normalized-UV hardware
+sampler at all — every fetch is a discrete, integer-indexed `texelFetch`,
+including bilinear, which it implements **manually** in-shader (fetch 4
+neighbouring texels individually, blend with computed weights) rather
+than relying on `GL_LINEAR`. This matches a pattern already confirmed
+elsewhere in Beetle's design (its *native*, non-HD rendering also never
+touches a normalized-UV sampler — `vram_get_pixel`/`uint(coords.x)` is a
+manual truncating fetch too), and turned out to already be true of this
+project's own **native** rendering as well: `TEX_FS`'s `fetch_texel`/
+`vram_at` already use `texelFetch` on an integer-indexed VRAM mirror, not
+GL_LINEAR — confirmed by reading it directly. So the earlier concern
+("native and HD might use different conventions") did not hold: native
+was already Beetle-shaped. The one place still relying on GL's hardware
+bilinear sampler (`texture(u_tex, v_uv)`, `GL_LINEAR`-filtered textures)
+was specifically the HD-replacement-PNG sampling — `HD_FS` and
+`FUSED_BLIT_FS` — which is exactly the code path implicated in both the
+font-atlas bleed (the reverted `+0.5` attempt) and the body-shift
+measurement.
+
+**Re-derived why the earlier `+0.5`-only attempt regressed the font**:
+Beetle's own `hd_sample_bilinear(uv)` computes `uv_frac = fract(uv) -
+0.5`, so it too requires a texel-centre-aligned caller convention (an
+uncorrected integer `uv` still lands exactly on the i-1/i boundary and
+blends 50/50) — the `+0.5` instinct was directionally correct by
+Beetle's own logic. What broke the font wasn't the direction of the
+correction; it was doing it through GL's *hardware* sampler, which has
+no notion of "stay inside this one packed sub-image" and will happily
+blend across an internal atlas boundary the moment the footprint
+reaches it. Beetle's manual approach fetches each of the 4 neighbours as
+an individually-clamped, discrete `texelFetch` (its own
+`hd_texel_valid`/`clamp_rect`), so the *same* per-texel-centre math can
+be applied with the blend footprint kept inside the bound texture's own
+bounds.
+
+**Implementation** (`gpu_gl_renderer.c`): ported Beetle's
+`hd_sample_bilinear`/`hd_sample_nearest` structure directly (simplified:
+no mip-level chain, since this project's replacement textures have
+none) into both `HD_FS` (the plain/fused-composite final draw) and
+`FUSED_BLIT_FS` (the per-piece blit inside `build_fused_composite`,
+which crops HD pieces out of the shared replacement texture the same
+way and was equally exposed). Both now do a manual 4-tap `texelFetch`
+bilinear blend, each tap individually clamped to `[0, size-1]` via a new
+`u_tex_size` uniform (the bound texture's real pixel dimensions, now
+tracked in `HdGlTexEntry.w/h` and threaded through `hd_gl_get_texture`'s
+new `out_w`/`out_h` params, `draw_hd_replacement_triangle`'s new
+`tex_w`/`tex_h` params, and `fused_blit_quad`'s same). **gpu.c's
+u_offset/v_offset formula did not need to change at all** — reverted
+back to its original, un-modified form (see the earlier note above); only
+how the shader turns that same uv into a sample changed. `GL_LINEAR` on
+the texture's own min/mag filter is now vestigial (texelFetch ignores it
+entirely) but left set since nothing reads it either way.
+
+**Verification status**: built clean, boots without crashing. Checked
+personally (no live user available for this pass — implemented and
+advanced through the "compiles and boots" milestone per explicit
+instruction, with the user planning to verify visually later): the title
+screen logo and an in-game cutscene (attract-mode loop) both render
+correctly with heavy real HD matching active (confirmed via
+`match_stats`, not just visually); most importantly, a 4-line dialogue
+text box — the exact content class that regressed under the earlier
+`+0.5`-only attempt — was inspected at a tight pixel crop and shows zero
+bleeding. Quantitative re-verification of the original body-shift
+measurement is **not** conclusively redone: the debug server's
+pause/step commands were deliberately removed (`handle_pause` etc.,
+2026-09 refactor), and no live user was available to navigate back to a
+proper static-hold scene (the `burst_median_compare.py` protocol needs
+one, same as the original measurement), so the only bursts captured this
+pass were against a moving attract-mode cutscene — one longer capture
+(300 frames) showed a monotonic, edge-of-range result (invalid, scene
+content genuinely drifted over that window); a shorter one (40 frames)
+showed a real, bounded minimum at shift=0, encouraging but noisier than
+the original controlled measurement. **Needs a live re-run of
+`burst_median_compare.py` at a genuine static-hold scene (e.g. a
+dialogue-text hold, same as the original measurement) to conclusively
+confirm the shift is actually gone**, and a live visual pass on the
+originally-reported seam scenes (the multi-entry fusion test cases from
+earlier in this document) to confirm the fused-path change didn't
+regress anything there.
