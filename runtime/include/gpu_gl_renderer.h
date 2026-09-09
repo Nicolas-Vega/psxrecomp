@@ -7,6 +7,7 @@
  * (gpu_render.h).  SDL_Window is forward-declared (SDL typedefs it from this
  * same struct tag) so this header needs no SDL include. */
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct SDL_Window;
@@ -61,6 +62,13 @@ uint64_t gl_renderer_hd_draws_issued(void);  /* draw_hd_replacement_triangle cal
 uint64_t gl_renderer_hd_matches_seen(void);  /* gpu_hd_texture_dump_match hits */
 int      gl_renderer_hd_prog_ready(void);    /* 1 = HD shader built OK */
 int      gl_renderer_hd_tex_cache_count(void); /* distinct replacement textures decoded */
+/* 2026-09-09 body-shift investigation: ring of the last ~32 HD-matched
+ * entries' scale ratio (replacement PNG pixel dimensions / original PS1
+ * upload texel dimensions) -- see gpu_gl_renderer.c's hd_scale_diag_record
+ * for why a non-integer ratio here would explain a residual per-texel drift
+ * no offset correction can fix. Writes a JSON object body (no braces). */
+int      gl_renderer_hd_scale_diag_dump(char *out, size_t out_capacity);
+void     gl_renderer_hd_scale_diag_clear(void); /* reset the distinct-entry set, e.g. before a fresh scene */
 /* Hot-reload N replacement PNGs that changed on disk (e.g. a regenerated
  * font pack) without relaunching: drops their on-disk raw-decode cache and
  * evicts them from the in-memory GL texture cache so the next draw call

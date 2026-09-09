@@ -5607,6 +5607,51 @@ static void handle_hd_debug_missing(int id, const char *json)
     send_ok(id);
 }
 
+static void handle_hd_scale_diag(int id, const char *json)
+{
+    (void)json;
+    static char buf[16384];
+    gl_renderer_hd_scale_diag_dump(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
+}
+
+static void handle_hd_scale_diag_clear(int id, const char *json)
+{
+    (void)json;
+    gl_renderer_hd_scale_diag_clear();
+    send_ok(id);
+}
+
+static void handle_hd_silhouette_mode(int id, const char *json)
+{
+    const int on = json_get_int(json, "on", 1);
+    gpu_hd_texture_silhouette_mode_set(on);
+    send_ok(id);
+}
+
+static void handle_hd_gradient_diag(int id, const char *json)
+{
+    (void)json;
+    char buf[256];
+    gpu_hd_texture_gradient_diag_dump(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"diag\":%s}", id, buf);
+}
+
+/* Draw only (no synchronous capture) -- a same-call capture was tried and
+ * confirmed WRONG (2026-09-09): it caught the frame mid-draw, before the
+ * game's own GP0 stream for the currently-targeted half had finished (that
+ * half's content is only complete and stable once the draw-area rect has
+ * flipped AWAY from it again), so it read back solid black. The caller
+ * should poll hd_gradient_diag's area_x1 for it to leave 320 (confirming
+ * this frame's draw into [320,639] finished and that half is now the
+ * stable, non-targeted one) before requesting a screenshot. */
+static void handle_calib_test(int id, const char *json)
+{
+    int dx = json_get_int(json, "dx", 150);
+    int drawn = gpu_hd_texture_calib_test(dx);
+    send_fmt("{\"id\":%d,\"ok\":true,\"dx\":%d,\"drawn\":%s}", id, dx, drawn ? "true" : "false");
+}
+
 static void handle_hdtex_recent(int id, const char *json)
 {
     int n = json_get_int(json, "count", 16);
@@ -9242,13 +9287,17 @@ static void handle_dump_buffer(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"y\":%d}", id, path, y0);
 }
 
-/* wide_shot: capture the NATIVE-WIDE present surface (post-compositor, what the
- * window actually shows in 16:9) to a PNG — unlike screenshot_file, which dumps
- * the canonical 320 VRAM region (pre-compositor). Pulls the exact buffer the
- * present path uses (gr_render_wide_display into a scratch buffer), so the dump
- * reflects the composited wide frame 1:1, orientation included. Errors if the
- * active backend has no wide compositor or native-wide isn't engaged. */
-static void handle_wide_shot(int id, const char *json)
+/* Shared core of wide_shot, factored out so calib_test (below) can capture
+ * synchronously in the SAME debug-command handler call as its draw --
+ * confirmed live (2026-09-09) that a separate screenshot command sent right
+ * after calib_test is racy: this title flips its draw-area rect between
+ * [0,319] and [320,639] every simulated frame, and even a few ms of gap
+ * between the draw call and a following screenshot call was enough for the
+ * next frame's normal redraw to have already overwritten the calib quads --
+ * observed as the capture intermittently coming back with no trace of them.
+ * Returns 1 and writes `path` on success, 0 (and leaves an error string in
+ * errbuf) otherwise. */
+static int capture_wide_shot_to_file(const char *path, char *errbuf, size_t errbuf_cap)
 {
     extern int gr_wide_supported(void);
     extern int gr_scale(void);
@@ -9257,33 +9306,28 @@ static void handle_wide_shot(int id, const char *json)
     extern void gl_renderer_sync_cpu(void);
     gl_renderer_sync_cpu();   /* no-op on SW / when no GL frame pending */
 
-    if (!gr_wide_supported()) { send_err(id, "active backend has no wide compositor"); return; }
+    if (!gr_wide_supported()) { snprintf(errbuf, errbuf_cap, "active backend has no wide compositor"); return 0; }
     int extra = ws_nw_extra();
-    if (extra <= 0) { send_err(id, "native-wide not engaged (extra=0; need a wide game frame)"); return; }
+    if (extra <= 0) { snprintf(errbuf, errbuf_cap, "native-wide not engaged (extra=0; need a wide game frame)"); return 0; }
 
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
-    if (di.disabled || di.width == 0 || di.height == 0) { send_err(id, "display disabled"); return; }
+    if (di.disabled || di.width == 0 || di.height == 0) { snprintf(errbuf, errbuf_cap, "display disabled"); return 0; }
 
     int scale = gr_scale(); if (scale < 1) scale = 1;
     int present_w = (int)di.width + extra;
     int W = present_w * scale, H = (int)di.height * scale;
 
-    char path[512];
-    if (!json_get_str(json, "path", path, sizeof(path)))
-        strncpy(path, "psx_wide.png", sizeof(path) - 1);
-    path[sizeof(path) - 1] = '\0';
-
     uint32_t *buf = (uint32_t *)malloc((size_t)W * H * sizeof(uint32_t));
-    if (!buf) { send_err(id, "alloc failed"); return; }
+    if (!buf) { snprintf(errbuf, errbuf_cap, "alloc failed"); return 0; }
     int n = gr_render_wide_display(buf, W * (int)sizeof(uint32_t),
                                    (int)di.display_x, (int)di.display_y, (int)di.height);
-    if (n <= 0) { free(buf); send_err(id, "no wide surface for displayed buffer"); return; }
+    if (n <= 0) { free(buf); snprintf(errbuf, errbuf_cap, "no wide surface for displayed buffer"); return 0; }
 
     /* ARGB8888 (0xAARRGGBB) -> RGB, written in the buffer's row order (so the
      * PNG shows exactly the present orientation — the point of this probe). */
     uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
-    if (!rgb) { free(buf); send_err(id, "alloc failed"); return; }
+    if (!rgb) { free(buf); snprintf(errbuf, errbuf_cap, "alloc failed"); return 0; }
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             uint32_t px = buf[(size_t)y * W + x];
@@ -9295,10 +9339,36 @@ static void handle_wide_shot(int id, const char *json)
     }
     free(buf);
     FILE *f = fopen(path, "wb");
-    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
+    if (!f) { free(rgb); snprintf(errbuf, errbuf_cap, "cannot open file"); return 0; }
     int ok = png_write_rgb(f, rgb, (uint32_t)W, (uint32_t)H);
     free(rgb); fclose(f);
-    if (!ok) { send_err(id, "png encode failed"); return; }
+    if (!ok) { snprintf(errbuf, errbuf_cap, "png encode failed"); return 0; }
+    return 1;
+}
+
+/* wide_shot: capture the NATIVE-WIDE present surface (post-compositor, what the
+ * window actually shows in 16:9) to a PNG — unlike screenshot_file, which dumps
+ * the canonical 320 VRAM region (pre-compositor). Pulls the exact buffer the
+ * present path uses (gr_render_wide_display into a scratch buffer), so the dump
+ * reflects the composited wide frame 1:1, orientation included. Errors if the
+ * active backend has no wide compositor or native-wide isn't engaged. */
+static void handle_wide_shot(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_wide.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    char err[128];
+    if (!capture_wide_shot_to_file(path, err, sizeof(err))) { send_err(id, err); return; }
+
+    /* Re-derive W/H for the response (capture_wide_shot_to_file doesn't
+     * return them) -- cheap, same calls the capture itself just made. */
+    extern int gr_scale(void);
+    int scale = gr_scale(); if (scale < 1) scale = 1;
+    int extra = ws_nw_extra();
+    GpuDisplayInfo di; gpu_get_display_info(&di);
+    int W = ((int)di.width + extra) * scale, H = (int)di.height * scale;
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
              id, path, W, H);
 }
@@ -13892,6 +13962,11 @@ static const CmdEntry s_commands[] = {
     { "hd_tint_native_fused", handle_hd_tint_native_fused },
     { "hd_tint_clear",     handle_hd_tint_clear },
     { "hd_debug_missing",  handle_hd_debug_missing },
+    { "hd_scale_diag",     handle_hd_scale_diag },
+    { "hd_scale_diag_clear", handle_hd_scale_diag_clear },
+    { "hd_silhouette_mode", handle_hd_silhouette_mode },
+    { "hd_gradient_diag", handle_hd_gradient_diag },
+    { "calib_test",        handle_calib_test },
     { "hdtex_recent",      handle_hdtex_recent },
     { "geom_correction",   handle_geom_correction },
     { "ws_cull_diag",      handle_ws_cull_diag },

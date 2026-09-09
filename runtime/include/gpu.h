@@ -274,6 +274,30 @@ void gpu_hd_texture_tint_clear(void);
  * needing a specific texhash/palhash to tint by. */
 void gpu_hd_texture_debug_missing_set(int on);
 
+/* Live setter for TEX_FS/HD_FS's shared debug-visualization mode (see either
+ * shader's u_silhouette_mode comment in gpu_gl_renderer.c for the full value
+ * table): 0 = off, 1 = discard-bypass with real content kept (isolates
+ * whether the native raw==0 / HD alpha<0.5 cutout-mask asymmetry explains a
+ * residual shift), 2 = discard-bypass with a cyan->purple screen-space
+ * gradient in place of real content (for live visual inspection, wired to
+ * the F1 hotkey in main.cpp). Off (0) by default. */
+void gpu_hd_texture_silhouette_mode_set(int mode);
+
+/* One-off diagnostic for the gradient debug mode -- see gpu_gl_renderer.c's
+ * gl_renderer_gradient_diag_dump. Writes a small JSON object into out. */
+void gpu_hd_texture_gradient_diag_dump(char *out, size_t cap);
+
+/* One-off synthetic ground-truth calibration test (see gpu_gl_renderer.c's
+ * gl_renderer_calib_test comment): draws a static, fully-opaque checkerboard
+ * through the native path at a fixed spot, and through a hand-built exact
+ * upscale via the HD replacement path dx_offset pixels to its right, in the
+ * SAME frame -- no jitter, no pack-authoring alpha-mask ambiguity, so any
+ * residual beyond the known dx_offset is a genuine rendering-math bug.
+ * Returns 1 if it actually drew, 0 if skipped (the live draw-area rect
+ * wasn't at the displayed VRAM address this call -- see the .c comment;
+ * caller should retry a moment later). */
+int gpu_hd_texture_calib_test(int dx_offset);
+
 /* Enumeration for gpu_gl_renderer.c's boot-time / backend-switch preload
  * pass (gpu_hd_texture_preload_active): count + indexed (entry_id/cache_key,
  * png_path) access over every loaded entry of each backend, independent of

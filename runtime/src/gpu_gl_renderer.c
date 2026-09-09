@@ -324,6 +324,11 @@ static int           s_scale = 1;          /* internal-res scale (hr FBO) */
 /* Netplay: SW@1× + GPU@s_scale dual write; CPU VRAM always authoritative. */
 static int           s_cpu_auth_dual = 0;
 static int           s_req_scale = 1;      /* requested before context init */
+/* Last-presented display rect, native VRAM px -- see gl_renderer_present_vram's
+ * capture comment. Used only by the gradient debug mode (u_silhouette_mode==2)
+ * to scope its cyan->purple ramp to the actual visible screen instead of the
+ * full VRAM raster canvas. */
+static int           s_present_disp_x = 0, s_present_disp_w = VRAM_W;
 
 static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) */
 static int           s_present_w = 0, s_present_h = 0;
@@ -406,6 +411,27 @@ static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
 static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
 static GLint s_uLimits = -1;
+/* 2026-09-09 body-shift investigation: shared global mode for TEX_FS's and
+ * HD_FS's debug-visualization uniform (see either shader's comment), set on
+ * both programs' u_silhouette_mode uniform so a native-vs-HD comparison can
+ * isolate pure polygon coverage. 0 = off (normal rendering). 1 = discard
+ * bypass: skip the content-driven cutout discard (native raw==0 / HD
+ * alpha<0.5) but keep real sampled color, toggled via the `hd_silhouette_
+ * mode` debug-server command for the burst_median_compare.py tooling. 2 =
+ * gradient overlay: also bypass discard, but replace color with a cyan
+ * (screen-left) -> purple (screen-right) horizontal gradient (see
+ * s_uViewportW/s_hd_uViewportW) instead of real content, toggled live via
+ * the F1 hotkey (main.cpp) for eyeballing a shift while playing -- a flat
+ * single-color version of this was tried first and abandoned: with every
+ * surface the same solid color, character and background become visually
+ * indistinguishable (same color drawn over same color), erasing exactly the
+ * boundary being inspected. The gradient's continuously-varying hue restores
+ * that boundary without needing real texture content. s_hd_uSilhouette
+ * (HD_FS's own location) is declared near the rest of the HD program's
+ * uniforms below. */
+static int s_silhouette_mode = 0;
+static GLint s_uSilhouette = -1;
+static GLint s_uViewportX0 = -1, s_uViewportW = -1;
 /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
  * canonical). When wide is off these stay 0 / 512 so the canonical pass is
@@ -1110,6 +1136,16 @@ static const char *TEX_FS =
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
     "uniform float u_shift;\n"
+    /* 2026-09-09 body-shift investigation: debug-visualization mode, values
+     * documented on s_silhouette_mode above. Mode 1 (discard bypass, real
+     * content kept) tests whether the helmet-plume residual vanishes once
+     * the native raw==0 / HD alpha<0.5 cutout-mask asymmetry is removed.
+     * Mode 2 (gradient overlay) also bypasses discard but replaces color
+     * with a screen-space cyan->purple gradient for live visual inspection
+     * (F1 hotkey) -- every discard site below is gated on mode==0 so normal
+     * rendering is byte-identical when unused. */
+    "uniform int u_silhouette_mode;\n"
+    "uniform float u_viewport_x0, u_viewport_w;\n"
     "int vram_at(int x, int y){\n"
     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
     "}\n"
@@ -1142,7 +1178,7 @@ static const char *TEX_FS =
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
     "  if (u_filter == 0) {\n"
     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
-    "    if (raw == 0) discard;\n"
+    "    if (u_silhouette_mode == 0 && raw == 0) discard;\n"
     "    rgb = col5(raw);\n"
     "    stp = (raw >> 15) & 1;\n"
     "  } else {\n"
@@ -1159,7 +1195,7 @@ static const char *TEX_FS =
     "    int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;\n"
     "    fx = abs(fx); fy = abs(fy);\n"
     "    int c00 = fetch_texel(iu, iv);\n"
-    "    if (c00 == 0) discard;\n"
+    "    if (u_silhouette_mode == 0 && c00 == 0) discard;\n"
     "    int c10 = fetch_texel(iu + sx, iv);\n"
     "    int c01 = fetch_texel(iu, iv + sy);\n"
     "    int c11 = fetch_texel(iu + sx, iv + sy);\n"
@@ -1167,7 +1203,7 @@ static const char *TEX_FS =
     "    float w10 = (c10 == 0 ? 0.0 : 1.0) * fx * (1.0 - fy);\n"
     "    float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;\n"
     "    float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;\n"
-    "    float opac = w00 + w10 + w01 + w11;\n"
+    "    float opac = max(w00 + w10 + w01 + w11, 0.0001);\n"
     "    rgb = (col5(c00)*w00 + col5(c10)*w10 + col5(c01)*w01 + col5(c11)*w11) / opac;\n"
     "    float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10\n"
     "                + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
@@ -1180,6 +1216,10 @@ static const char *TEX_FS =
     "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
     "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
+    "  }\n"
+    "  if (u_silhouette_mode == 2) {\n"
+    "    float t = clamp((gl_FragCoord.x - u_viewport_x0) / max(u_viewport_w, 1.0), 0.0, 1.0);\n"
+    "    rgb = mix(vec3(0.0, 1.0, 1.0), vec3(0.6, 0.0, 0.8), t);\n"
     "  }\n"
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
@@ -1682,6 +1722,28 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * prim adds nothing to either reveal margin and its mirror can be skipped. */
 static int mirror_x_center_only(int lo, int hi) {
     if (!s_wide_fast) return 0;
+    /* 2026-09-09 root-cause fix (see wide_blit_center's TODO/comment history):
+     * this "skip the mirror, the later blit covers it" shortcut is only sound
+     * when the blit and this classification agree on WHICH VRAM half is the
+     * canonical centre. The blit always reads from the DISPLAYED half
+     * (disp_x, tracked live in s_present_disp_x -- fixed for a title that
+     * doesn't move its display address, e.g. Vagrant Story never does), but
+     * this check used g_wide_cur_base -- the half CURRENTLY BEING DRAWN INTO,
+     * which alternates every frame for a title that double-buffers by
+     * flipping which VRAM half is the draw target (confirmed live: this
+     * title's draw-area rect toggles [0,319]/[320,639] every frame while
+     * disp_x stays pinned at 320). On a frame where the draw target is the
+     * OFF-screen half (g_wide_cur_base != disp_x), a batch could get
+     * classified "centre-only" and skipped relative to a centre window the
+     * blit will never actually read from that frame -- reproduced live as a
+     * gradient-debug-mode flicker between two slightly different renders of
+     * the same content, fixed by disabling this whole fast path (gl_wide_fast
+     * on=0). Gating on the two bases agreeing keeps the optimisation for the
+     * (common) case they do, and safely falls back to the always-correct
+     * per-prim mirror otherwise -- this NEVER makes the skip decision more
+     * permissive, only more conservative, so it cannot regress a currently-
+     * working title. */
+    if (g_wide_cur_base != s_present_disp_x) return 0;
     int base = g_wide_cur_base, native_w = g_wide_w - 2 * g_wide_off;
     if (native_w <= 0) return 0;
     return (lo >= base) && (hi < base + native_w);
@@ -1852,6 +1914,19 @@ static void flush_tex_batch(void) {
     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
+    p_glUniform1i(s_uSilhouette, s_silhouette_mode);
+    if (s_silhouette_mode == 2) {
+        /* Query the REAL, currently-bound viewport rather than reconstruct it
+         * from tracked state (g_wide_w/s_present_disp_x/_w) -- that guess
+         * turned out wrong for at least one active render path (observed
+         * live: the gradient still compressed into the left ~12% of the
+         * frame even when the reconstructed x0/width looked correct on
+         * paper), and this is a debug-only draw so the extra query is cheap. */
+        GLint vp[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        p_glUniform1f(s_uViewportX0, (float)vp[0]);
+        p_glUniform1f(s_uViewportW, (float)vp[2]);
+    }
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -1868,6 +1943,21 @@ static void flush_tex_batch(void) {
         s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
+        if (s_silhouette_mode == 2) {
+            /* wide_target_begin just rebound to a different FBO/viewport (the
+             * wide mirror surface, not s_hr_fbo) -- the gradient uniform set
+             * above, before this branch, still holds the CANONICAL pass's
+             * now-stale viewport. Re-query so this second draw (landing in
+             * the mirror's side margins) gets its own correct values instead
+             * of the narrow canonical pass's leftover ones -- this stale-
+             * reuse was the actual cause of the reported flicker/seam
+             * between the 4:3 centre and the widened side bars, not a real
+             * geometry issue. */
+            GLint vp[4];
+            glGetIntegerv(GL_VIEWPORT, vp);
+            p_glUniform1f(s_uViewportX0, (float)vp[0]);
+            p_glUniform1f(s_uViewportW, (float)vp[2]);
+        }
         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         if (s_ws_ablate != 2) tex_batch_draw_passes(nverts, semi);
         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
@@ -2033,7 +2123,8 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
  * ever actually used together (today's default widescreen state is off). */
 static GLuint s_hd_prog = 0, s_hd_vao = 0, s_hd_vbo = 0;
 static GLint  s_hd_uXoff = -1, s_hd_uXhalf = -1, s_hd_uShift = -1, s_hd_uTex = -1, s_hd_uTint = -1,
-             s_hd_uRaw = -1, s_hd_uTexSize = -1;
+             s_hd_uRaw = -1, s_hd_uTexSize = -1, s_hd_uSilhouette = -1,
+             s_hd_uViewportX0 = -1, s_hd_uViewportW = -1;
 
 static const char *HD_VS =
     "#version 330\n"
@@ -2105,6 +2196,13 @@ static const char *HD_FS =
     /* 1 = this primitive is in raw/unlit mode (no per-vertex shading), same
      * convention as the native TEX_FS's v_raw. */
     "uniform int u_raw;\n"
+    /* Debug-visualization mode, matching TEX_FS's u_silhouette_mode (see its
+     * comment for the full value table). Mode 1 skips this path's c.a<0.5
+     * cutout while keeping real content/color; mode 2 additionally replaces
+     * color with the cyan->purple screen-space gradient. Off (0) by
+     * default. */
+    "uniform int u_silhouette_mode;\n"
+    "uniform float u_viewport_x0, u_viewport_w;\n"
     /* PS1 opaque-classified prims (semi < 0, the only ones this pipeline
      * handles) still cut out fully: any texel whose native VRAM value was
      * exactly 0 is discarded (see TEX_FS's fetch_texel/"if (raw==0) discard"
@@ -2135,7 +2233,7 @@ static const char *HD_FS =
      * texture's edge) without reintroducing the original jagged-text bug. */
     "void main(){\n"
     "  vec4 c = hd_sample_bilinear(v_uv * u_tex_size, ivec2(u_tex_size));\n"
-    "  if (c.a < 0.5) discard;\n"
+    "  if (u_silhouette_mode == 0 && c.a < 0.5) discard;\n"
     /* Per-vertex Gouraud shading (ambient/room lighting), same formula and
      * *2.0 scale as TEX_FS's "rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0)"
      * -- PS1 vertex colors are stored so 0x80 (0.5 normalized) means neutral
@@ -2146,6 +2244,10 @@ static const char *HD_FS =
      * visibly darker/shaded than this recomp's in the identical room). */
     "  vec3 rgb = c.rgb * u_tint;\n"
     "  if (u_raw == 0) rgb = clamp(rgb * v_col * 2.0, 0.0, 1.0);\n"
+    "  if (u_silhouette_mode == 2) {\n"
+    "    float t = clamp((gl_FragCoord.x - u_viewport_x0) / max(u_viewport_w, 1.0), 0.0, 1.0);\n"
+    "    rgb = mix(vec3(0.0, 1.0, 1.0), vec3(0.6, 0.0, 0.8), t);\n"
+    "  }\n"
     "  frag = vec4(rgb, 1.0);\n"
     "}\n";
 
@@ -2164,6 +2266,85 @@ uint64_t gl_renderer_hd_draws_issued(void) { return s_hd_draws_issued; }
 uint64_t gl_renderer_hd_matches_seen(void) { return s_hd_matches_seen; }
 int gl_renderer_hd_prog_ready(void) { return s_hd_prog != 0; }
 int gl_renderer_hd_tex_cache_count(void) { return s_hd_tex_cache_count; }
+
+/* 2026-09-09 body-shift investigation: per-entry scale-ratio ring. Checks a
+ * specific hypothesis for the RESIDUAL shift left after switching HD_FS/
+ * FUSED_BLIT_FS to manual texelFetch bilinear (see ISSUES.md #11's latest
+ * update): the shader maps a PS1 integer texel index to a sample position in
+ * the replacement PNG via u_tex_size (the PNG's real pixel dimensions) and
+ * u_scale (1/upload_w_texels, the ORIGINAL PS1 upload's texel count). If a
+ * pack entry's PNG width/height is not a clean integer multiple of the
+ * original upload's texel dimensions, the mapping from PS1 texel i to PNG
+ * pixel i*ratio drifts by a different sub-pixel amount for every i instead
+ * of a constant offset -- a scale mismatch, not an offset bug, and one no
+ * amount of a "+0.5" or texel-centre correction can fix. ratio_w/ratio_h are
+ * tex_w/upload_w_texels and tex_h/upload_h; an exact integer here (4.0, 8.0,
+ * ...) rules this out for that entry, a non-integer confirms it. */
+/* Deduplicated by path (NOT a chronological ring): a single frequently-
+ * redrawn entry (e.g. the font glyph atlas, matched on nearly every prim)
+ * would otherwise fill every slot between two queries and crowd out
+ * everything else -- confirmed live, 2026-09-09, first version of this as a
+ * plain ring returned 32/32 slots of the same font entry mid-scene. Existing
+ * entries update in place; new ones take the next free slot up to the cap. */
+#define HD_SCALE_DIAG_CAP 64
+typedef struct {
+    char path[256];
+    float tex_w, tex_h;          /* replacement PNG's real pixel dimensions */
+    float upload_w_texels, upload_h; /* original PS1 upload's texel dimensions */
+    float ratio_w, ratio_h;
+} HdScaleDiagEntry;
+static HdScaleDiagEntry s_hd_scale_diag[HD_SCALE_DIAG_CAP];
+static int s_hd_scale_diag_count = 0;
+static uint64_t s_hd_scale_diag_total = 0;
+
+static void hd_scale_diag_record(const char *path, float tex_w, float tex_h,
+                                 float u_scale, float v_scale) {
+    if (!path || u_scale <= 0.0f || v_scale <= 0.0f) return;
+    ++s_hd_scale_diag_total;
+    const float upload_w_texels = 1.0f / u_scale, upload_h = 1.0f / v_scale;
+    HdScaleDiagEntry *e = NULL;
+    for (int i = 0; i < s_hd_scale_diag_count; i++) {
+        if (strcmp(s_hd_scale_diag[i].path, path) == 0) { e = &s_hd_scale_diag[i]; break; }
+    }
+    if (!e) {
+        if (s_hd_scale_diag_count >= HD_SCALE_DIAG_CAP) return; /* full: keep the first-seen set */
+        e = &s_hd_scale_diag[s_hd_scale_diag_count++];
+        snprintf(e->path, sizeof(e->path), "%s", path);
+    }
+    e->tex_w = tex_w; e->tex_h = tex_h;
+    e->upload_w_texels = upload_w_texels; e->upload_h = upload_h;
+    e->ratio_w = tex_w / upload_w_texels; e->ratio_h = tex_h / upload_h;
+}
+
+int gl_renderer_hd_scale_diag_dump(char *out, size_t out_capacity) {
+    if (!out || out_capacity == 0) return 0;
+    int pos = snprintf(out, (int)out_capacity, "\"total\":%llu,\"distinct\":%d,\"recent\":[",
+                       (unsigned long long)s_hd_scale_diag_total, s_hd_scale_diag_count);
+    const int n = s_hd_scale_diag_count;
+    for (int k = 0; k < n && pos < (int)out_capacity - 256; k++) {
+        const HdScaleDiagEntry *e = &s_hd_scale_diag[k];
+        char escaped[512];
+        int ep = 0;
+        for (const char *p = e->path; *p && ep + 2 < (int)sizeof(escaped); p++) {
+            if (*p == '\\' || *p == '"') escaped[ep++] = '\\';
+            escaped[ep++] = *p;
+        }
+        escaped[ep] = '\0';
+        pos += snprintf(out + pos, (size_t)((int)out_capacity - pos),
+            "%s{\"path\":\"%s\",\"tex_w\":%.3f,\"tex_h\":%.3f,"
+            "\"upload_w_texels\":%.3f,\"upload_h\":%.3f,"
+            "\"ratio_w\":%.6f,\"ratio_h\":%.6f}",
+            k ? "," : "", escaped, e->tex_w, e->tex_h,
+            e->upload_w_texels, e->upload_h, e->ratio_w, e->ratio_h);
+    }
+    pos += snprintf(out + pos, (size_t)((int)out_capacity - pos), "]");
+    return 1;
+}
+
+void gl_renderer_hd_scale_diag_clear(void) {
+    s_hd_scale_diag_count = 0;
+    s_hd_scale_diag_total = 0;
+}
 
 /* Coverage-debugging aid (PSXRECOMP_HD_TEXTURE_DEBUG_MISSING=1): paints every
  * opaque textured primitive that did NOT end up HD-replaced (no match, or a
@@ -2223,6 +2404,9 @@ static void hd_gl_init(void) {
     s_hd_uTint  = p_glGetUniformLocation(s_hd_prog, "u_tint");
     s_hd_uRaw   = p_glGetUniformLocation(s_hd_prog, "u_raw");
     s_hd_uTexSize = p_glGetUniformLocation(s_hd_prog, "u_tex_size");
+    s_hd_uSilhouette = p_glGetUniformLocation(s_hd_prog, "u_silhouette_mode");
+    s_hd_uViewportX0 = p_glGetUniformLocation(s_hd_prog, "u_viewport_x0");
+    s_hd_uViewportW = p_glGetUniformLocation(s_hd_prog, "u_viewport_w");
     p_glGenVertexArrays(1, &s_hd_vao);
     p_glBindVertexArray(s_hd_vao);
     p_glGenBuffers(1, &s_hd_vbo);
@@ -2271,6 +2455,37 @@ void gl_renderer_hd_debug_missing_set(int on) {
     }
     fprintf(stdout, "psxrecomp: HD texture coverage-debug %s -- unreplaced opaque prims render solid violet\n",
             s_hd_debug_missing ? "ON" : "OFF");
+}
+
+/* 2026-09-09 body-shift investigation: see TEX_FS/HD_FS's u_silhouette_mode
+ * comment for the 0/1/2 value table. Both programs read the SAME
+ * s_silhouette_mode value; no per-program texture/state to lazily create
+ * (unlike debug_missing above), so this is just the flag flip -- the uniform
+ * gets pushed on the next draw through either program (flush_tex_batch /
+ * draw_hd_replacement_triangle). Takes the raw mode value (not a bool) so
+ * callers can select discard-bypass (1) vs the gradient overlay (2). */
+void gl_renderer_hd_silhouette_mode_set(int mode) {
+    s_silhouette_mode = mode < 0 ? 0 : (mode > 2 ? 2 : mode);
+    static const char *const kModeNames[3] = {
+        "OFF", "ON (discard bypass, real content)", "ON (cyan->purple gradient)",
+    };
+    fprintf(stdout, "psxrecomp: HD debug-visualization mode: %s\n",
+            kModeNames[s_silhouette_mode]);
+}
+
+/* One-off diagnostic: dump the raw state the gradient debug mode's
+ * u_viewport_x0/_w derive from, to check whether it stays consistent across
+ * a live hd_backend switch (2026-09-09: the gradient compressed into a much
+ * narrower band under one backend than the other -- this exists to find out
+ * whether s_present_disp_x/_w or s_scale is the one actually changing). */
+void gl_renderer_gradient_diag_dump(char *out, size_t cap) {
+    snprintf(out, cap,
+             "{\"disp_x\":%d,\"disp_w\":%d,\"scale\":%d,\"wide_w\":%d,"
+             "\"area_x1\":%d,\"area_y1\":%d,\"area_x2\":%d,\"area_y2\":%d,"
+             "\"wide_off\":%d,\"wide_cur_base\":%d}",
+             s_present_disp_x, s_present_disp_w, s_scale, g_wide_w,
+             s_area_x1, s_area_y1, s_area_x2, s_area_y2,
+             g_wide_off, g_wide_cur_base);
 }
 
 /* Some pack PNGs (confirmed so far in a subset of Beetle-format assets, e.g.
@@ -2804,6 +3019,15 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
     p_glUniform3f(s_hd_uTint, tint_r, tint_g, tint_b);
     p_glUniform1i(s_hd_uRaw, rawtex);
     p_glUniform2f(s_hd_uTexSize, (float)(tex_w > 0 ? tex_w : 1), (float)(tex_h > 0 ? tex_h : 1));
+    p_glUniform1i(s_hd_uSilhouette, s_silhouette_mode);
+    if (s_silhouette_mode == 2) {
+        /* See flush_tex_batch's matching comment -- query the real bound
+         * viewport instead of reconstructing it from tracked state. */
+        GLint vp[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        p_glUniform1f(s_hd_uViewportX0, (float)vp[0]);
+        p_glUniform1f(s_hd_uViewportW, (float)vp[2]);
+    }
     /* Standard "over" blend for the replacement PNG's OWN anti-aliased edge
      * pixels (see HD_FS's comment) -- not a PS1 blend-equation replication;
      * the original native prim this replaces had no blending at all (semi <
@@ -2830,12 +3054,178 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
         int dx = wide_dx();
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_hd_uXoff, s_hd_uXhalf);
+        if (s_silhouette_mode == 2) {
+            /* See flush_tex_batch's matching comment -- re-query after the
+             * FBO/viewport rebind so this mirror-pass draw doesn't reuse the
+             * canonical pass's now-stale gradient uniform values. */
+            GLint vp[4];
+            glGetIntegerv(GL_VIEWPORT, vp);
+            p_glUniform1f(s_hd_uViewportX0, (float)vp[0]);
+            p_glUniform1f(s_hd_uViewportW, (float)vp[2]);
+        }
         if (s_ws_ablate != 2) glDrawArrays(GL_TRIANGLES, 0, 3);
         wide_target_end(s_hd_uXoff, s_hd_uXhalf);
         gl_perf_mirror_end();
     }
     hr_end();
     s_hd_draws_issued++;
+}
+
+static void gpu_textured_rect(int x,int y,int w,int h,
+                              int u0,int v0,int u1,int v1,
+                              uint16_t clut_x,uint16_t clut_y,uint16_t tp,int semi); /* fwd: def below */
+
+/* 2026-09-09 body-shift investigation: synthetic ground-truth calibration
+ * test. Every A/B comparison so far has fought real confounds -- PS1-style
+ * per-frame vertex jitter, and the native/HD paths using two INDEPENDENTLY-
+ * drawn cutout masks (native's raw==0 vs the pack's own alpha channel) that
+ * don't trace identical edges even when geometry is pixel-perfect. Neither
+ * of those exists here: this draws a fully-opaque synthetic checkerboard
+ * (no alpha-cutout ambiguity) in a single static frame (no animation, so no
+ * jitter) through BOTH paths at a HAND-SPECIFIED, known pixel offset from
+ * each other -- so any residual misalignment beyond that known offset is a
+ * genuine rendering-math discrepancy, not jitter or pack-authoring noise.
+ *
+ * The "native" quad samples a checkerboard written directly into a borrowed,
+ * off-screen VRAM slot (texpage (14,1), 15bpp direct -- outside any texpage
+ * a real scene here uses) through the ordinary textured-rect path. The "HD"
+ * quad bypasses the real hash-matching system entirely (irrelevant to what
+ * this is testing) and draws through draw_hd_replacement_triangle directly
+ * against a hand-built, EXACT 4x nearest-neighbour upscale of the identical
+ * pattern -- so there is no possible pack-artist alignment error, only
+ * whatever the renderer's own math contributes. Restores the borrowed VRAM
+ * slot before returning. */
+int gl_renderer_calib_test(int dx_offset) {
+    if (!s_raster_ok || !s_ctx) return 0;
+
+    const int PAT_X = 896, PAT_Y = 256, PAT_N = 64;  /* borrowed VRAM slot */
+    const int CELL = 8;                              /* 8x8 grid, 8px cells */
+    const int UPSCALE = 4;
+    const int HD_N = PAT_N * UPSCALE;
+    /* Draw at the DISPLAYED VRAM address -- confirmed live via hd_gradient_
+     * diag that disp_x is FIXED at 320 (this title never alternates which
+     * half is shown), while the DRAW AREA (s_area_x1/x2, this scissors
+     * hr_begin(1)'s clip) alternates between [0,319] and [320,639] frame to
+     * frame. A quad here is only actually rasterized (not scissored to
+     * nothing) on a frame where the draw area happens to include x=340 --
+     * the caller must poll (hd_gradient_diag's area_x1) and call this only
+     * when area_x1==320, then screenshot immediately (no swap-wait needed,
+     * since the display address itself never moves). Returns without
+     * drawing (but still restores/no-ops harmlessly) if area_x1 isn't 320
+     * at call time, so a caller that got the timing wrong sees nothing
+     * rather than a corrupted partial draw. */
+    const int DRAW_X = 340, DRAW_Y = 20;
+    if (s_area_x1 != 320) {
+        fprintf(stdout, "psxrecomp: calib_test skipped -- draw area is [%d,%d], "
+                "need [320,639] (retry the call)\n", s_area_x1, s_area_x2);
+        return 0;
+    }
+
+    uint16_t *saved = (uint16_t *)malloc((size_t)PAT_N * PAT_N * sizeof(uint16_t));
+    if (!saved) return 0;
+    for (int y = 0; y < PAT_N; y++)
+        memcpy(saved + (size_t)y * PAT_N,
+               s_vram + (size_t)(PAT_Y + y) * VRAM_W + PAT_X,
+               (size_t)PAT_N * sizeof(uint16_t));
+
+    /* 1555 packing (see col5 in TEX_FS): bits0-4=R, 5-9=G, 10-14=B, bit15=STP.
+     * Fully saturated, mutually distinct colors plus corner markers so any
+     * sub-pixel edge is unambiguous; never exactly 0 (native TEX_FS discards
+     * raw==0 texels -- a real hole here would silently break the native
+     * quad). */
+    const uint16_t COL_A = 0x801F;  /* R=31        -> red   */
+    const uint16_t COL_B = 0xB3E0;  /* G=31        -> green */
+    const uint16_t COL_TL = 0xFFFF; /* white: top-left 2x2 marker */
+    const uint16_t COL_BR = 0xFC00; /* B=31 -> blue: bottom-right 2x2 marker */
+    for (int y = 0; y < PAT_N; y++) {
+        uint16_t *row = s_vram + (size_t)(PAT_Y + y) * VRAM_W + PAT_X;
+        for (int x = 0; x < PAT_N; x++) {
+            int cell = (x / CELL) + (y / CELL);
+            row[x] = (cell & 1) ? COL_B : COL_A;
+        }
+    }
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++)
+        s_vram[(size_t)(PAT_Y + y) * VRAM_W + (PAT_X + x)] = COL_TL;
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++)
+        s_vram[(size_t)(PAT_Y + PAT_N - 1 - y) * VRAM_W + (PAT_X + PAT_N - 1 - x)] = COL_BR;
+
+    up_add(PAT_X, PAT_Y, PAT_X + PAT_N - 1, PAT_Y + PAT_N - 1);
+    flush_cpu_upload();  /* pushes the pattern to s_raw_tex / s_up_tex now */
+
+    /* Native quad: texpage (14,1), 15bpp direct (base_x=896,base_y=256,
+     * depth=2 -- see gpu_textured_triangle's texpage decode). */
+    const uint16_t TP_NATIVE = 14 | (1 << 4) | (2 << 7);
+    float col_neutral[9] = {1,1,1, 1,1,1, 1,1,1};
+    gpu_textured_rect(DRAW_X, DRAW_Y, PAT_N, PAT_N, 0, 0, PAT_N - 1, PAT_N - 1,
+                      0, 0, TP_NATIVE, -1);
+    flush_tex_batch();  /* must land before the VRAM source gets restored below */
+
+    /* HD quad: hand-built exact upscale, drawn at the SAME shape, offset by
+     * dx_offset. Converts each source texel with the identical 5-bit-per-
+     * channel -> 8-bit formula col5()/TEX_FS uses, so a matching pixel is
+     * genuinely byte-identical in color, not just visually close. */
+    uint8_t *hd_rgba = (uint8_t *)malloc((size_t)HD_N * HD_N * 4);
+    if (hd_rgba) {
+        for (int y = 0; y < HD_N; y++) {
+            for (int x = 0; x < HD_N; x++) {
+                uint16_t raw = s_vram[(size_t)(PAT_Y + y / UPSCALE) * VRAM_W + (PAT_X + x / UPSCALE)];
+                uint8_t r = (uint8_t)((raw & 31) * 255 / 31);
+                uint8_t g = (uint8_t)(((raw >> 5) & 31) * 255 / 31);
+                uint8_t b = (uint8_t)(((raw >> 10) & 31) * 255 / 31);
+                uint8_t *p = hd_rgba + ((size_t)y * HD_N + x) * 4;
+                p[0] = r; p[1] = g; p[2] = b; p[3] = 255;
+            }
+        }
+        GLuint hd_tex = 0;
+        glGenTextures(1, &hd_tex);
+        if (hd_tex) {
+            p_glActiveTexture(PSXGL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, hd_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, HD_N, HD_N, 0, GL_RGBA, GL_UNSIGNED_BYTE, hd_rgba);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+            int hx = DRAW_X + dx_offset, hy = DRAW_Y;
+            int xs1[3] = {hx, hx + PAT_N, hx}, ys1[3] = {hy, hy, hy + PAT_N};
+            int us1[3] = {0, PAT_N - 1, 0},    vs1[3] = {0, 0, PAT_N - 1};
+            int xs2[3] = {hx + PAT_N, hx, hx + PAT_N}, ys2[3] = {hy, hy + PAT_N, hy + PAT_N};
+            int us2[3] = {PAT_N - 1, 0, PAT_N - 1},    vs2[3] = {0, PAT_N - 1, PAT_N - 1};
+            draw_hd_replacement_triangle(xs1, ys1, us1, vs1, col_neutral, 1,
+                                         hd_tex, HD_N, HD_N,
+                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1);
+            draw_hd_replacement_triangle(xs2, ys2, us2, vs2, col_neutral, 1,
+                                         hd_tex, HD_N, HD_N,
+                                         1.0f / PAT_N, 0.0f, 1.0f / PAT_N, 0.0f, 1,1,1);
+            glDeleteTextures(1, &hd_tex);
+        }
+        free(hd_rgba);
+    }
+
+    /* Restore the borrowed VRAM slot -- both quads already landed in the hr
+     * FBO above (flush_tex_batch for the native one, draw_hd_replacement_
+     * triangle draws immediately), so this cannot affect either draw. */
+    for (int y = 0; y < PAT_N; y++)
+        memcpy(s_vram + (size_t)(PAT_Y + y) * VRAM_W + PAT_X,
+               saved + (size_t)y * PAT_N,
+               (size_t)PAT_N * sizeof(uint16_t));
+    free(saved);
+    /* The full-frame black-out chased earlier (2026-09-09) turned out to be
+     * an unrelated capture-timing bug (screenshotting mid-draw, before the
+     * game's own GP0 stream for this frame had finished painting the
+     * targeted half -- see capture_wide_shot_to_file's comment in
+     * debug_server.c), not this re-upload; restoring it live tested clean
+     * once the caller waits for the draw-area flip before capturing. */
+    up_add(PAT_X, PAT_Y, PAT_X + PAT_N - 1, PAT_Y + PAT_N - 1);
+    flush_cpu_upload();
+
+    fprintf(stdout, "psxrecomp: calib_test drawn -- native at (%d,%d), HD at (%d,%d), "
+            "dx_offset=%d, pattern %dx%d cells of %dpx\n",
+            DRAW_X, DRAW_Y, DRAW_X + dx_offset, DRAW_Y, dx_offset, PAT_N/CELL, PAT_N/CELL, CELL);
+    return 1;
 }
 
 /* ---- Fused-page compositing (opt-in, see gpu_hd_texture_fusion_set) -----
@@ -3085,6 +3475,8 @@ static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
             const GLuint hd_tex = hd_texs[e];
             const float w_texels = hd_upload_w_texels[e], h_texels = hd_upload_h[e];
             if (!hd_tex || w_texels <= 0.0f || h_texels <= 0.0f) { ok = 0; break; }
+            hd_scale_diag_record(hd_png_paths[e], (float)hd_tex_w[e], (float)hd_tex_h[e],
+                                 1.0f / w_texels, 1.0f / h_texels);
             {
                 float tr = 1.0f, tg = 1.0f, tb = 1.0f;
                 if (s_hd_tint_entry_cache_key && hd_cache_keys[e] == s_hd_tint_entry_cache_key) {
@@ -3225,6 +3617,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (hd_hit) {
             s_hd_matches_seen++;
             hd_tex = hd_gl_get_texture(hd_entry_id, hd_png_path, &hd_tex_w, &hd_tex_h);
+            if (hd_tex)
+                hd_scale_diag_record(hd_png_path, (float)hd_tex_w, (float)hd_tex_h,
+                                     hd_u_scale, hd_v_scale);
         }
         if (hd_tex) {
             if (s_hd_tint_entry_cache_key && hd_entry_id == s_hd_tint_entry_cache_key) {
@@ -4071,6 +4466,9 @@ static int init_gpu_raster(void) {
     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
     s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
+    s_uSilhouette = p_glGetUniformLocation(s_tex_prog, "u_silhouette_mode");
+    s_uViewportX0 = p_glGetUniformLocation(s_tex_prog, "u_viewport_x0");
+    s_uViewportW = p_glGetUniformLocation(s_tex_prog, "u_viewport_w");
     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
@@ -5585,6 +5983,14 @@ int gl_renderer_present_hold_last(void) {
 
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
+    /* Captured unconditionally (even on the "nothing changed, skip present"
+     * early-return below) so the gradient debug mode's u_viewport_x0/_w --
+     * see u_silhouette_mode==2 -- always reflects the actual visible display
+     * rect instead of the full 1024-wide VRAM canvas most draw calls use as
+     * their raster target. Native VRAM px; scaled by s_scale when pushed as
+     * a uniform (flush_tex_batch / draw_hd_replacement_triangle). */
+    s_present_disp_x = disp_x;
+    s_present_disp_w = w;
     if (!s_ctx || !s_raster_ok) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -5657,6 +6063,30 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
  * produced by the mirror; this leaves them untouched. One FBO->FBO blit,
  * x-translated by the reveal offset. No-op when s_wide_fast is off (then the
  * mirror drew the full surface, as before). Shared by both present paths. */
+/* TODO(2026-09-09, body-shift/gradient investigation): base_x here is caller-
+ * supplied per present call (gl_renderer_present_wide_fbo's disp_x /
+ * glb_render_wide_display's base_x), read at PRESENT time. The geometry this
+ * blits FROM (s_hr_fbo) was drawn earlier in the same frame under whatever
+ * g_wide_cur_base was current AT DRAW TIME (see wide_dx(), set via
+ * glb_wide_set_target). If Vagrant Story's display area changes mid-frame
+ * (plausible for a title that double-buffers VRAM halves, alternating which
+ * half is "draw" vs "display"), these two reads of "the current base X" can
+ * disagree, and this blit then copies a column shifted from where the
+ * caller's own present-time math expects it to be -- invisible against
+ * normal content (still valid, just-rendered pixels either way) but a
+ * confirmed, reproducible frame-to-frame flicker under the u_silhouette_mode
+ * ==2 debug gradient (gpu_gl_renderer.c's TEX_FS/HD_FS), which is sensitive
+ * enough to reveal even a 1px source-column shift as a visible hue jump.
+ * CONFIRMED WORKAROUND (live, 2026-09-09): `gl_wide_fast on=0` (disables this
+ * function entirely, falling back to full per-prim re-rasterization into the
+ * wide surface -- see s_wide_fast below) makes the flicker disappear, which
+ * points squarely at this blit's base_x as the culprit rather than anything
+ * in the actual polygon/vertex math. NOT YET fixed for real: that costs the
+ * "skip centre-only batches" perf win this fast path exists for. Real fix is
+ * probably to make g_wide_cur_base (or whatever THIS blit reads as base_x)
+ * and the draw-time value provably the same read of display-area state
+ * within one frame, rather than two independent reads that can straddle a
+ * mid-frame display-area change. */
 static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h) {
     if (!s_wide_fast || g_wide_w <= 0) return;
     int native_w = g_wide_w - 2 * g_wide_off;

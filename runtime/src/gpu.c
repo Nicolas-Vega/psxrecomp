@@ -247,6 +247,26 @@ void gpu_hd_texture_debug_missing_set(int on) {
     gl_renderer_hd_debug_missing_set(on);
 }
 
+/* 2026-09-09 body-shift investigation: live setter for TEX_FS/HD_FS's shared
+ * debug-visualization mode (0=off, 1=discard-bypass, 2=gradient overlay) --
+ * see either shader's u_silhouette_mode comment (gpu_gl_renderer.c) for the
+ * full value table and why this isolates the content-driven cutout/alpha-
+ * mask differences the two paths normally have. */
+extern void gl_renderer_hd_silhouette_mode_set(int mode);
+void gpu_hd_texture_silhouette_mode_set(int mode) {
+    gl_renderer_hd_silhouette_mode_set(mode);
+}
+
+extern void gl_renderer_gradient_diag_dump(char *out, size_t cap);
+void gpu_hd_texture_gradient_diag_dump(char *out, size_t cap) {
+    gl_renderer_gradient_diag_dump(out, cap);
+}
+
+extern int gl_renderer_calib_test(int dx_offset);
+int gpu_hd_texture_calib_test(int dx_offset) {
+    return gl_renderer_calib_test(dx_offset);
+}
+
 /* Boot-time / backend-switch preload enumeration (see gpu_gl_renderer.c's
  * gpu_hd_texture_preload_active): both wrap the same signature (index in,
  * entry_id + png_path out) so that function can preload whichever backend

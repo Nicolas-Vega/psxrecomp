@@ -7405,6 +7405,21 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     };
                     host_osd_push(kBackendNames[backend], 900);
                 }
+                /* 2026-09-09: F1 toggles the cyan->purple gradient debug-
+                 * visualization mode (gpu_gl_renderer.c's u_silhouette_mode
+                 * == 2) live -- lets a tester eyeball a native-vs-HD shift by
+                 * flipping F2/F3/F4 while this is on, without needing the
+                 * debug-server tooling. Tracks its own on/off state since the
+                 * renderer flag is a raw mode value (0/1/2), not a bool. */
+                else if (!key_repeat && !psx_rewind_is_open() &&
+                         !savestate_menu_open && !texpack_menu_open &&
+                         key == SDLK_F1) {
+                    static bool s_gradient_debug_on = false;
+                    s_gradient_debug_on = !s_gradient_debug_on;
+                    gpu_hd_texture_silhouette_mode_set(s_gradient_debug_on ? 2 : 0);
+                    host_osd_push(s_gradient_debug_on ?
+                        "Debug gradient: ON" : "Debug gradient: OFF", 900);
+                }
                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                     debug_force_cd_reinsert();

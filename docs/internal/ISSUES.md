@@ -1286,3 +1286,236 @@ confirm the shift is actually gone**, and a live visual pass on the
 originally-reported seam scenes (the multi-entry fusion test cases from
 earlier in this document) to confirm the fused-path change didn't
 regress anything there.
+
+## Issue #12 — "Character shifts between HD backends" investigation: no geometry bug found; real cause was a native-wide fast-path present bug
+
+**Status:** CLOSED — root cause found and fixed (native-wide fast-path); the
+originally-reported symptom (character position differing between `none` /
+`duckstation` / `beetle`) was never a real geometry bug
+**Date opened:** 2026-09-09
+
+### Symptom (as originally reported)
+
+Live, side-by-side comparison (F2/F3/F4 hotkeys added this session to
+switch `hd_backend` without opening the menu) appeared to show a character
+sitting at a slightly different screen position between `none` and
+`beetle`, most visible on the knight's helmet plume against the static
+window frame behind it. Single-frame screenshots pasted from the desktop
+appeared to confirm this.
+
+### Investigation summary (long; see the session transcript for full
+blow-by-blow — this is the condensed record of what was tried, what was
+ruled out, and why)
+
+1. **Single-frame comparisons are unreliable.** PS1-style rendering has
+   real per-frame vertex jitter unrelated to which HD backend is active.
+   Built `burst_median_compare.py` (median-of-N-frames per backend,
+   toggling `hd_backend` live mid-process — never reloading a savestate
+   between captures, since that silently resets HD-texture upload
+   tracking to empty and makes a "beetle" capture render 100% native
+   without any visible sign of it). This became the standard methodology
+   for the rest of the investigation.
+2. **Whole-frame and cropped shift-search (median-of-300, real content):**
+   consistently found shift=0 as the best horizontal alignment between
+   backends, both before and after a real fix (see below) to the
+   HD-texture sampler (switched `HD_FS`/`FUSED_BLIT_FS` from GL hardware
+   bilinear to a manual, Beetle-ported 4-tap `texelFetch` bilinear —
+   this WAS a real, kept fix, since the hardware sampler did not
+   texel-centre align the same way the native path's discrete
+   `texelFetch` does). Even after that fix, a small residual (~20-28%
+   higher error at +/-1px vs. 0) remained on fine/high-contrast edges
+   (the plume feathers specifically).
+3. **Debug-visualization mode built to isolate geometry from content**
+   (`u_silhouette_mode` in `TEX_FS`/`HD_FS`, `hd_silhouette_mode` debug
+   command): mode 1 bypasses each path's content-driven cutout discard
+   (native `raw==0` vs. HD pack's own `alpha<0.5`) while keeping real
+   sampled color, so a residual that disappears under this mode implicates
+   the discard-mask mismatch rather than geometry. Result: the residual
+   shrank close to noise level (crop shift-search gap dropped from
+   ~20-28% to ~4.5%) — pointing at the discard-mask asymmetry, not
+   geometry, as the (small) real difference between backends.
+   - An earlier, abandoned version of this mode replaced color with a flat
+     tint (bypassing discard entirely) instead of keeping real content —
+     this was structurally wrong: making every surface the same flat
+     color erases the exact boundary (character vs. background) being
+     measured, since same-color-over-same-color is indistinguishable
+     regardless of any real position difference. Caught by the user
+     directly ("I think you are tinting the whole window").
+4. **Mode 2, a cyan-to-purple screen-space gradient**, was added on request
+   for live visual inspection (F1 hotkey, `main.cpp`) instead of a flat
+   tint, to keep a strong per-pixel position signal without losing the
+   character/background boundary. This surfaced two real, unrelated GL
+   bugs before it was trustworthy:
+   - The gradient's `u_viewport_x0`/`u_viewport_w` were first derived from
+     tracked scale/offset state; this did not match the ACTUAL bound
+     viewport for at least one active render path (compressed the visible
+     gradient into ~12-30% of the frame). Fixed by querying
+     `glGetIntegerv(GL_VIEWPORT, ...)` directly at each draw call instead
+     of reconstructing it.
+   - The native-wide mirror pass (draws a second copy of each batch into
+     the wide compositor surface when native-wide is engaged) was reusing
+     the first (canonical-pass) query's gradient uniform value for its own,
+     differently-viewported draw. Fixed by re-querying
+     `glGetIntegerv(GL_VIEWPORT, ...)` again inside the mirror-pass branch
+     in both `flush_tex_batch` and `draw_hd_replacement_triangle`.
+5. **Even after both gradient bugs were fixed, a real flicker remained**,
+   confirmed by the user live: the CENTRE (4:3) portion of the frame
+   flickered between two visibly different gradient baselines frame to
+   frame; the widened side margins stayed stable. `gl_wide_fast on=0`
+   (disables the native-wide "skip the redundant centre mirror, blit it
+   from canonical instead" fast path) made the flicker disappear —
+   isolating it to that specific optimisation. Root cause and real fix:
+   see the write-up below — this was a genuine bug, independent of
+   HD-texture rendering entirely (it reproduces with `hd_backend none`),
+   and is very likely what the user was actually seeing live when
+   comparing backends with the gradient on, on top of whatever small
+   real difference the discard-mask asymmetry contributes.
+6. **Ground-truth calibration test** (`calib_test` debug command,
+   `gl_renderer_calib_test` in `gpu_gl_renderer.c`): built specifically to
+   settle the question with zero jitter and zero content ambiguity. Draws
+   a fully-opaque synthetic checkerboard through the NATIVE path at a
+   fixed screen position, and an independently-hand-built EXACT 4x
+   nearest-neighbour upscale of the identical pixels through the HD
+   replacement path (`draw_hd_replacement_triangle`, bypassing the real
+   hash-matching system entirely — irrelevant to what this tests) at a
+   KNOWN, hand-specified pixel offset (150 native px = 600 screen px at
+   4x internal scale) from the native draw, in the same frame. Both
+   quads land in a live gameplay scene (not a purpose-built test level),
+   confirming this exercises the real rendering pipeline.
+   - Result: after subtracting the known 600px offset, the residual
+     best-fit alignment was exactly 0 — both by rigorous
+     cross-correlation (SAD shift-search: a sharp, decisive minimum at
+     shift 0, ~10% higher at +/-1) and visually (the two checkerboards are
+     pixel-identical in phase and cell size). This conclusively rules
+     out a rendering-math/geometry bug in the native-vs-HD paths.
+   - Building this tool surfaced and fixed several unrelated correctness
+     bugs along the way, all now fixed in code:
+     - `u_scale`/`u_offset` misunderstanding: `HD_FS` expects a
+       NORMALIZED (0..1) UV (it does `v_uv * u_tex_size` itself to get
+       absolute texel coordinates) — passing an already-absolute scale
+       (naive upscale factor) made every sample clamp to one texture edge
+       (rendered as a solid color instead of the pattern). Real pack
+       matching already does this correctly (`u_scale = 1.0f /
+       upload_w_texels` in `gpu.c`); the calibration test now matches.
+     - This title double-buffers its 4:3 draw target: the live draw-area
+       rect (`s_area_x1`/`s_area_x2`) alternates `[0,319]`/`[320,639]`
+       every simulated frame, while the DISPLAYED VRAM address
+       (`di.display_x`) stays fixed at 320 for the whole scene (confirmed
+       live via the `hd_gradient_diag` debug command, extended this
+       session to report `area_x1/x2`, `wide_off`, `wide_cur_base`
+       alongside the existing `disp_x`/`disp_w`/`scale`/`wide_w`). A test
+       draw must land on a frame where the draw area is `[320,639]` (else
+       it is scissor-clipped to nothing) — `gl_renderer_calib_test` now
+       checks this and returns 0 (caller should retry) instead of
+       silently drawing nothing.
+     - A synchronous capture (draw, then immediately read back the
+       present buffer, all inside one debug-command handler call) reads
+       the frame BEFORE the game's own GP0 draws for that half have
+       necessarily finished — reproducibly captured mid-draw black-outs.
+       The correct sequence is: retry the draw until it actually lands
+       (draw area == `[320,639]`), THEN poll until the draw area flips
+       AWAY from 320 (confirms that half's rendering, including the test
+       quads, is complete and stable), THEN capture — this is a client-
+       side (Python harness) orchestration note, not a further code
+       change, since `capture_wide_shot_to_file` (factored out of
+       `handle_wide_shot` in `debug_server.c` this session so
+       `calib_test` could reuse it) is correct; it was always the
+       CALLER's timing that needed to respect the frame lifecycle.
+7. **User independently confirmed on a different scene** (rooftop,
+   "put out the fires" dialogue) that both `duckstation`- and
+   `beetle`-matched HD content show the SAME misalignment on a
+   high-contrast diagonal roof edge — ruling out a backend/matcher-
+   specific bug (DuckStation uses `gpu_hd_texture_dump_match`, XXH3-64,
+   sub-region entries; Beetle uses `gpu_hd_texture_pack_match`, CRC32,
+   whole-upload entries — genuinely different matching algorithms, but
+   BOTH feed the exact same `draw_hd_replacement_triangle`/`HD_FS`
+   rendering code already proven geometry-correct in step 6). The
+   earlier impression that DuckStation "looked correct" was explained as
+   duckstation's pack having far fewer entries, so many earlier test
+   scenes simply fell back to native (matching itself trivially) rather
+   than actually being HD-replaced.
+
+### Conclusion
+
+There is no rendering-math/geometry bug in the native-vs-HD-replacement
+code path — proven with a synthetic, jitter-free, content-unambiguous
+ground-truth test (step 6). What actually explains everything observed
+this session:
+
+1. **Real PS1-style per-frame vertex jitter**, present on every backend
+   (confirmed via a dedicated per-pixel standard-deviation tool,
+   `burst_variance_compare.py`, new this session), barely visible against
+   the original low-resolution blocky PS1 art but much more visible when
+   reflected through a crisp, high-detail HD replacement texture.
+   Substantially reduced by PGXP (`VagrantStory_Recompiled_pgxp.exe`):
+   mean per-channel stddev in the test region dropped from ~57-87% higher
+   than native (no PGXP) to only ~3-31% higher (with PGXP) for `beetle`
+   vs. `none`. Recommend PGXP as the default build for HD-texture-pack
+   testing/play — not yet made the default; a separate decision for the
+   user.
+2. **Native/HD discard-mask boundary mismatch**: native discards a texel
+   where the ORIGINAL VRAM content is exactly 0; an HD pack discards on
+   its OWN, independently hand-drawn alpha channel. These are two
+   different cutout shapes authored at different resolutions by different
+   people (the original PS1 artist vs. the replacement-pack artist) — on
+   thin, near-diagonal, or high-contrast edges (feather tips, roof
+   creases) they don't trace the identical sub-pixel boundary. This is a
+   content/authoring characteristic of using ANY hand-made HD replacement
+   pack, not a renderer bug, and is NOT fixable in code without either
+   (a) snapping the HD path's cutout to the native blocky boundary
+   (defeats the purpose of higher-res replacement art) or (b) reintroducing
+   real alpha blending at edges (previously tried and reverted this
+   project for reintroducing a worse, different regression — see the
+   `HD_FS` shader comment history).
+3. **The native-wide "fast path" present bug** (below) — a real,
+   confirmed, now-fixed correctness bug, but unrelated to HD-texture
+   rendering (reproduces with `hd_backend none`).
+
+---
+
+### Sub-issue: native-wide fast-path (`gl_wide_fast`) present-time blit bug
+
+**Symptom:** with the debug gradient overlay on, the CENTRE (4:3) portion
+of the presented frame flickered between two different color baselines
+frame to frame; the widened side margins stayed stable. Reproduced with
+`hd_backend none` — unrelated to HD-texture rendering. `gl_wide_fast
+on=0` made it disappear.
+
+**Root cause:** `gpu_gl_renderer.c`'s native-wide "fast path" (comment
+block above `s_wide_fast`, ~line 1704) skips the expensive per-prim
+mirror-redraw for any batch classified as "fully inside the 4:3 frame"
+(`mirror_x_center_only`), on the assumption that the wide compositor
+surface's centre columns get filled later, at present time, by a cheap
+FBO-to-FBO blit from the canonical (narrow) framebuffer
+(`wide_blit_center`). That blit always reads from the VRAM column at the
+DISPLAYED address (`disp_x`/`di.display_x`, tracked live this session as
+`s_present_disp_x`) — but the classification check used
+`g_wide_cur_base`, the VRAM half CURRENTLY BEING DRAWN INTO, set via
+`glb_wide_set_target`. For a title that double-buffers by alternating
+which VRAM half is the draw target (confirmed live this session: this
+title's draw-area rect toggles `[0,319]`/`[320,639]` every simulated
+frame while `disp_x` stays pinned at 320 — see `hd_gradient_diag`), these
+two "which half is canonical" answers disagree on every OTHER frame. On
+a frame where the draw target is the off-screen half
+(`g_wide_cur_base != disp_x`), a batch could be wrongly classified
+"centre-only" and have its mirror-redraw skipped relative to a centre
+window the later blit will never actually read that frame — reproduced
+live as the reported gradient flicker.
+
+**Fix** (`mirror_x_center_only`, `gpu_gl_renderer.c`): gate the
+"skip the mirror, the blit covers it" shortcut on `g_wide_cur_base ==
+s_present_disp_x` in addition to the existing bounds check. This makes
+the fast path take the shortcut ONLY when it can prove the draw target
+and the display target currently agree (the common case), and safely
+fall back to the always-correct full per-prim mirror-redraw otherwise.
+The change is strictly MORE conservative than before (never skips a
+mirror that the old code would not also have skipped), so it cannot
+regress any other title currently relying on this fast path — it only
+prevents an unsafe skip, never adds one.
+
+**Verified live** (PGXP build, `wide_fast` left at its default `on=1`):
+static-patch color sampled at fixed pixel coordinates away from any
+animated content, across 10 frames over 3 seconds and across every
+`hd_backend` value (`none`/`duckstation`/`beetle`), came back byte-
+identical every time (stddev ~1e-14, i.e. exactly 0 modulo float noise) —
+zero flicker, fast path still engaged.
