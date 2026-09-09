@@ -7383,6 +7383,28 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                                  (int)mod)) {
                     hard_restart_game();
                 }
+                /* 2026-09-09: direct, unbindable A/B hotkeys for the HD
+                 * texture-replacement backend -- F2=none/original,
+                 * F3=DuckStation, F4=Beetle. Same effect as cycling
+                 * texpack_menu_move() to that slot (gpu_hd_texture_set_backend
+                 * + preload-warm + OSD), just without opening the F10 menu
+                 * first: requested live, mid-session, for faster same-scene
+                 * A/B comparisons than "open menu, arrow to the row, close
+                 * menu" allows. Skipped while any modal overlay owns
+                 * keyboard input, matching texpack_menu_toggle's own guard. */
+                else if (!key_repeat && !psx_rewind_is_open() &&
+                         !savestate_menu_open && !texpack_menu_open &&
+                         (key == SDLK_F2 || key == SDLK_F3 || key == SDLK_F4)) {
+                    const int backend = key == SDLK_F2 ? 2 : key == SDLK_F3 ? 0 : 1;
+                    gpu_hd_texture_set_backend(backend);
+                    gpu_hd_texture_preload_active();
+                    static const char *const kBackendNames[3] = {
+                        "HD textures: DuckStation format",
+                        "HD textures: Beetle PSX HW format",
+                        "HD textures: off (original PS1 textures)",
+                    };
+                    host_osd_push(kBackendNames[backend], 900);
+                }
                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                     debug_force_cd_reinsert();
