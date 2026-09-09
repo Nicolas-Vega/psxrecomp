@@ -1066,3 +1066,137 @@ coverage. Left uninvestigated per the user's call — worth a live A/B
 evidence yet that it is visibly wrong.
 
 - All inert when diff mode is off; normal play unaffected. Builds clean.
+
+### 2026-09-09: multi-entry fused compositing, and a separate, still-open small-shift bug
+
+**Fused-page compositing expanded from one candidate upload to several.**
+The original fix above only handled exactly one partially-covering upload
+(max 4 pieces) and bailed to the old seam-prone path the moment a second
+candidate showed up. A live-reproduced case (a soldier character's face/
+hair texture, `upload_fragments: 7` for a single upload alone) exceeded
+that scope and still showed the seam with fusion on. `hd_texture_pack_match_fused`
+(hd_texture_pack.cpp) now collects up to `GPU_HD_FUSED_MAX_ENTRIES` (4)
+distinct candidate uploads and `GPU_HD_FUSED_MAX_PIECES` (24, up from 4)
+pieces; each candidate's fragments claim whatever part of the
+still-uncovered region they touch. Candidates are resolved **newest-
+upload-first** (sorted by descending `serial`), not the ascending order
+`upload_index_collect` returns them in — VRAM is last-write-wins, and
+sorting oldest-first let an older upload's surviving fragments steal
+pixels out from under a newer, correct one, which read live as a
+misaligned patch. `gpu.h`/`gpu.c`/`gpu_gl_renderer.c`'s fused plumbing
+(cache keys, upload dimensions, GL texture lookups) all changed from
+single values to arrays indexed by each piece's `hd_entry_idx`.
+
+**New debug tooling built for this investigation** (all in
+`gpu_gl_renderer.c`/`gpu.c`/`debug_server.c`, TCP commands via
+`debug_client.py`):
+- `hd_fused_last` / `hd_fused_fails`: rings of the last ~64 successful
+  and ~32 failed `hd_texture_pack_match_fused` calls, the latter with a
+  reason code (UV-wrap, ambiguous, too-many-entries, no-hash-match,
+  too-many-pieces, nothing-to-fuse). Built because the existing
+  plain-match ring only recorded successes, giving no way to tell why
+  one specific query never resolved at all.
+- `hd_tint_entry` / `hd_tint_native_fused` / `hd_debug_missing` (the last
+  one a live on/off for an existing boot-only env-var toggle): on-demand
+  solid-color markers so a specific replacement PNG, every native piece
+  inside a fused composite, or anything that fails both matchers can be
+  painted a flat color live and matched directly against what's on
+  screen, instead of guessing from screenshots.
+
+**Root-caused the animated-mouth "gap"** using this tooling: the mouth/
+eye region of a close-up dialogue portrait is not a texture upload at
+all in this runtime's model — `hd_debug_missing` shows it fails both
+matchers, but no `missing_textures/` export ever fires (export requires
+some tracked upload's fragments to fully cover the query, and none do),
+and `gpu_hd_texture_pack_match_stats`'s `no_candidates` counter reads 0
+for the entire session, ruling out "nothing is tracked there at all" —
+the only candidate found is the surrounding face upload, whose *bounding
+box* spans the area (fragments elsewhere make the box big enough) while
+no individual *fragment* touches it. Most likely explanation: the game
+renders this region via ordinary GPU polygon rasterization into a VRAM
+sub-rect that's later sampled as a texture ("render-to-texture"), which
+neither of this runtime's two upload-tracking hooks (CPU→VRAM DMA,
+VRAM→VRAM copy) can see. **Attempted a fix** (`flush_pack_if_sampling`
+in gpu_gl_renderer.c already detects exactly this moment — a texture
+sample whose region the raster GPU rendered into since the last sync —
+so it was extended to scoped-read that region back to the CPU-visible
+`vram[]` mirror and feed it into the same upload-tracking pipeline a
+normal DMA upload uses). **Reverted**: dropped the title-screen menu to
+~1 FPS, because `flush_pack_if_sampling` fires far more often in real
+gameplay (menus, UI, text compositing) than assumed, and every trigger
+now paid for a `glReadPixels` GPU/CPU sync stall plus a full
+upload-invalidation pass. A real fix needs this gated far more
+conservatively (opt-in, small-region-only, probably an async/PBO
+readback instead of a blocking one) — scoped as a separate, bigger
+feature, not attempted further this session.
+
+**A second, independent small-shift bug, still unfixed.** Separately
+from the seam/mouth work, the user reported (and, after two false starts,
+a live measurement confirmed) that HD-replaced character body content
+renders shifted a few pixels left relative to native rendering of the
+same content. Investigation:
+- First attempt (single-frame `none` vs `beetle` screenshot diff, shift-
+  search by SAD over horizontal offsets) found shift=0 as unambiguously
+  best. **Invalidated in two ways before it was trusted**: (1) PS1-style
+  per-frame vertex/animation jitter dominates a single-frame comparison —
+  the user's own suggestion to capture a burst of frames and compare
+  per-pixel MEDIANS (cancels the jitter) is what actually surfaces a real
+  signal; (2) the first burst attempt used a savestate to reset position
+  between the `none` and `beetle` captures, which silently invalidated
+  the test — `pack->uploads` (which VRAM regions are tracked, with
+  content hashes) is runtime-only state, not part of a savestate, so
+  jumping straight into a savestate on a fresh process leaves tracking
+  empty and the matcher never matches anything (confirmed:
+  `match_stats.matched: 0` for the whole burst). The corrected protocol
+  (`psxrecomp/tools/burst_median_compare.py`): reach the scene by real
+  play in one continuous process, then capture both 480-frame bursts
+  back-to-back by toggling `hd_backend` live (which does not reset
+  tracking) — never reloading a savestate in between.
+- With real matching confirmed (a few hundred thousand new matches
+  during the burst) and per-pixel medians taken, the shift is real: best
+  alignment at +1 to +2 pixels (at ~5.3x the native 320px buffer, so
+  roughly 0.2-0.4 of a native PS1 pixel), consistently in the same
+  direction across independently-checked head/torso/arm crops — ruling
+  out random noise/antialiasing artifacts, which would not agree across
+  regions like that.
+- Ruled out a geometry/vertex-position bug: `HD_VS`'s position formula
+  (`(a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0`, same `u_shift =
+  0.5/scale - 1/64` bias) is byte-identical to the native `TEX_VS`/
+  `GEO_VS` programs', confirmed by reading the source directly. Whatever
+  causes the shift, it moves texture *content* within a correctly-
+  positioned polygon, not the polygon itself.
+- **Tried and reverted**: `hd_gl_get_texture` (gpu_gl_renderer.c) loads
+  every replacement PNG with `GL_LINEAR` filtering, whose texel grid
+  puts texel *i*'s center at `(i+0.5)/N`, not `i/N` — the
+  `u_offset`/`v_offset` formula in `gpu_hd_texture_pack_match` (gpu.c)
+  had no such `+0.5` term, meaning every sample landed exactly on a
+  texel *boundary*, which `GL_LINEAR` resolves as a 50/50 blend with the
+  wrong neighbor. Mathematically well-supported (and real Beetle PSX
+  HW's own fragment shader, `sample_texel` in
+  `rhi/shaders_gl/command_fragment.glsl.h`, sidesteps the whole question
+  by manually flooring a continuous texel-space coordinate instead of
+  going through a normalized-UV hardware sampler at all — it has no
+  directly comparable term). Adding `+0.5/N` to both offsets fixed
+  nothing conclusively confirmed yet and broke something else: the
+  dialogue-box font atlas is packed edge-to-edge with no inter-glyph
+  padding, and the shift was just enough to bleed the next line of text
+  through every line of dialogue (confirmed absent on the exact same
+  frame before the change). Reverted in full.
+- **User's proposed next direction** (not yet attempted): rather than
+  patch the HD-path's own UV math in isolation, research exactly how
+  real Beetle PSX HW's GL RHI backend renders its *own* native/unmatched
+  primitives (its real vertex/fragment shaders, already partially read
+  this session — `command_vertex.glsl.h` has no `u_shift`-equivalent
+  half-pixel bias at all: `xpos = (pos.x/512.) - 1.0`, a pure linear
+  map) and reimplement this project's native (backend=`none`/unmatched)
+  rendering to match that convention exactly, so both the matched (HD)
+  and unmatched (native) paths derive from the *same* Beetle-sourced
+  convention instead of two independently-tuned ones that happen to
+  agree with each other but not necessarily with Beetle. Not started:
+  this project's current `u_shift` bias was added deliberately to fix a
+  *different*, already-confirmed bug (dropped 1px columns at quad seams
+  from float ties, e.g. Tomba's title background) — removing or
+  replacing it needs to first understand why Beetle's own pipeline
+  doesn't need an equivalent workaround, and touches every rendering
+  path (native, DuckStation-format, Beetle-format), not just this one
+  seam. Scoped as a follow-up session, not attempted here.

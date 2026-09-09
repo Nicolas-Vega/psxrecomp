@@ -416,6 +416,16 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
      * texels, cancels it exactly instead. v needs no such correction: PS1
      * never packs multiple texel rows per VRAM row, so v_first was folded
      * into source_y with no division (and no truncation) to begin with. */
+    /* 2026-09-09: a +0.5-texel term was tried here (GL_LINEAR's texel grid
+     * centers texel i at (i+0.5)/N, not i/N, so an uncorrected uv=i/N samples
+     * exactly on the i-1/i boundary) to explain a small, consistent left-
+     * shift of HD-replaced body content measured via a 480-frame median
+     * burst (see burst_median_compare.py). Reverted: it fixed nothing
+     * conclusively confirmed yet and introduced a real regression -- the
+     * dialogue-box font atlas (packed edge-to-edge, no inter-glyph padding)
+     * started bleeding the row below through every line of text, confirmed
+     * absent on the exact same frame before this change. Root cause of the
+     * body shift is still open; see ISSUES.md. */
     if (u_offset)
         *u_offset = (float)(((unsigned)m.source_word_x - (unsigned)u_first / ppw) * ppw) /
                     (float)upload_w_texels;
