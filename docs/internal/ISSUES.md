@@ -1585,3 +1585,36 @@ itself. See `HD_SHADER_PARITY.md`'s "Resolved items" section for the full
 writeup, including why the fused-composite fix is code-reviewed-sound but
 still lacks a dedicated live test (the feature is off by default and wasn't
 triggered by any scene tested this session).
+
+### Addendum 3 (same day): a third gap, found by direct user report — color
+### fringing from non-premultiplied bilinear blending
+
+A user screenshot pointed at a thin blue line along a character's jaw/chin
+silhouette edge, visible only under an HD backend. Not the same issue as
+the discard-boundary POSITION mismatch already documented above (native's
+blocky cutout vs. HD's own alpha shape) — this was a color-fringe HALO right
+at the edge, with a different root cause: `hd_sample_bilinear` blends raw,
+non-premultiplied RGBA texels. A near-transparent PNG texel adjacent to a
+cutout edge commonly still holds whatever arbitrary RGB the pack author's
+tooling left there (alpha=0 normally hides it, so nobody clears it — here,
+a stray solid blue), and the naive per-channel blend gave that stray color
+full weight regardless of its own near-zero alpha, so a blended edge texel
+whose alpha still cleared the `c.a < 0.5` discard cutoff could carry visible
+fringe color.
+
+Fixed by premultiplying RGB by alpha at PNG-decode time (`hd_normalize_alpha`,
+right after its existing alpha-stretch step) and un-premultiplying in
+`HD_FS` immediately after the bilinear sample, before the discard test or
+any tint/Gouraud math — so a near-transparent neighbour's contribution is
+naturally weighted toward black instead of its raw stray hue. Bumped
+`HD_CACHE_MAGIC` (`"HDC3"`→`"HDC4"`) so pre-existing on-disk decode caches
+(built with the old, non-premultiplied format) are treated as a miss and
+transparently regenerated rather than silently loaded wrong.
+
+Verified live on the PGXP build across three distinct HD-replaced close-up
+frames of the same scene (a blond armored character in profile) — clean
+edges, no fringe, cache-busted so the fix was actually exercised. See
+`HD_SHADER_PARITY.md`'s "Resolved items" #3 for the full writeup, including
+a note that the non-PGXP build shares this exact code path but a live
+non-PGXP repro attempt was cut short by an unrelated test-harness quirk
+(debug-savestate load landing in an in-game menu instead of applying).

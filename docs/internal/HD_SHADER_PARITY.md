@@ -160,6 +160,52 @@ scenes tested) — the fix is code-reviewed and logically sound (mirrors
 everything that WAS tested, but a dedicated fused-page test is still
 worthwhile before treating it as fully proven.
 
+### 3. Non-premultiplied-alpha bilinear blending — 🛠️ fixed
+
+Found later the same day via a direct user report: a thin blue line visible
+along a character's jaw/chin silhouette edge, HD-backend-only. Distinct from
+item #77's "known, accepted asymmetry" row above (discard-boundary POSITION
+mismatch between native's blocky cutout and HD's own alpha shape) — this is
+a color-fringe HALO at the edge, not a shape mismatch, and had a different
+root cause.
+
+`hd_sample_bilinear` reads 4 raw RGBA texels via `texelFetch` and blends them
+with a plain per-channel linear interpolation (`c00*w00 + c10*w10 + ...`).
+Fully or near-transparent texels near a cutout edge commonly hold whatever
+arbitrary RGB the pack author's tooling happened to leave there — alpha=0
+normally makes that RGB invisible, so nobody bothers clearing it (observed:
+a stray solid blue). Because the blend weights RGB and alpha independently
+rather than in premultiplied space, a tap pair straddling the edge (one
+fully-opaque skin/chin texel, one near-transparent stray-blue texel) can
+blend to a result whose alpha still clears the `c.a < 0.5` discard cutoff
+while its RGB has already been pulled toward that stray color — exactly the
+thin colored fringe reported.
+
+**Fix:** `hd_normalize_alpha` (`gpu_gl_renderer.c`, PNG-decode time) now
+premultiplies RGB by alpha, immediately after its existing alpha-stretch
+step (a near-transparent texel's RGB is scaled toward black, giving it
+negligible weight in any future blend regardless of its original stray
+color). `HD_FS`'s `main()` un-premultiplies (`c.rgb / c.a`, guarded against
+near-zero alpha) immediately after `hd_sample_bilinear` returns, before the
+`c.a < 0.5` discard test and before any tint/Gouraud color math touches the
+result — so every downstream consumer of the sampled color still sees plain
+(straight-alpha) RGB, only the blend step itself operates in premultiplied
+space. `HD_CACHE_MAGIC` was bumped `0x33434448` → `0x34434448` ("HDC3" →
+"HDC4") so any on-disk decode cache built before this fix (non-premultiplied
+RGB) is treated as a cache miss and transparently re-decoded/re-cached in
+the new format, rather than silently loaded in the wrong one.
+
+Verified live on the PGXP build across three distinct HD-replaced
+close-up scenes (a blond armored character in profile, three different
+dialogue frames) with clean jaw/chin/silhouette edges and no fringe in any
+of them, cache-busted via the magic bump so the fix was actually exercised
+rather than serving a stale cached decode. The non-PGXP build shares this
+exact object code (`gpu_gl_renderer.c` is not PGXP-specific) — a live
+non-PGXP repro attempt hit an unrelated test-harness quirk (debug-savestate
+load landing in an in-game menu instead of applying) and was not completed,
+but there is no code-level reason to expect divergent behavior between the
+two builds for this fix.
+
 ## What's already confirmed solid (no further action needed)
 
 - Vertex position math: bit-identical between paths, proven with a synthetic

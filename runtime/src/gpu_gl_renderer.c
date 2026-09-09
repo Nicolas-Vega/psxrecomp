@@ -2348,6 +2348,15 @@ static const char *HD_FS =
     "void main(){\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
     "  vec4 c = hd_sample_bilinear(uv * u_tex_size, ivec2(u_tex_size));\n"
+    /* c.rgb is premultiplied by its own alpha on disk (hd_decode_png_file's
+     * hd_normalize_alpha) -- undo that here, before anything else touches
+     * color, so bilinear blending near a cutout edge weighted a
+     * near-transparent neighbour's contribution by its own near-zero alpha
+     * instead of giving its raw (often arbitrary/unrelated) stored RGB full
+     * weight. Without this, a thin fringe of that neighbour's color shows
+     * along the edge whenever the blended alpha still clears the 0.5 cutoff
+     * below (2026-09-09, user-reported blue line along a character jaw). */
+    "  vec3 c_rgb = (c.a > (1.0/255.0)) ? clamp(c.rgb / c.a, 0.0, 1.0) : c.rgb;\n"
     "  if (u_silhouette_mode == 0 && c.a < 0.5) discard;\n"
     "  int stp = 1;\n"
     "  if (u_orig_depth >= 0) {\n"
@@ -2363,7 +2372,7 @@ static const char *HD_FS =
      * replaced textures rendered at flat full brightness regardless of the
      * room's actual lighting (confirmed live: DuckStation's floor read
      * visibly darker/shaded than this recomp's in the identical room). */
-    "  vec3 rgb = c.rgb * u_tint;\n"
+    "  vec3 rgb = c_rgb * u_tint;\n"
     "  if (u_raw == 0) rgb = clamp(rgb * v_col * 2.0, 0.0, 1.0);\n"
     "  if (u_silhouette_mode == 2) {\n"
     "    float t = clamp((gl_FragCoord.x - u_viewport_x0) / max(u_viewport_w, 1.0), 0.0, 1.0);\n"
@@ -2645,10 +2654,32 @@ static void hd_normalize_alpha(unsigned char *pixels, int w, int h) {
         const unsigned char a = pixels[i * 4 + 3];
         if (a > max_a) max_a = a;
     }
-    if (max_a == 0 || max_a == 255) return; /* all-transparent, or already fine */
+    if (max_a == 0) return; /* all-transparent: nothing to stretch or premultiply */
+    if (max_a != 255) {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char *a = &pixels[i * 4 + 3];
+            *a = (unsigned char)(((unsigned)*a * 255u + max_a / 2) / max_a);
+        }
+    }
+    /* 2026-09-09: premultiply RGB by (now-stretched) alpha so hd_sample_
+     * bilinear's naive linear blend of raw texelFetch results doesn't pull a
+     * fully/near-transparent neighbour's arbitrary stored RGB into the color
+     * of a partially-visible edge texel -- a fully-transparent PNG pixel's
+     * color is normally irrelevant, so pack authors leave whatever was
+     * there (observed: a stray solid blue), and unpremultiplied bilinear
+     * blending gives it full weight regardless of its own near-zero alpha.
+     * User-reported symptom: a thin blue fringe line along a character's
+     * jaw/chin silhouette edge, visible only under an HD backend. HD_FS's
+     * main() divides this back out (un-premultiplies) immediately after the
+     * bilinear sample, before the cutout discard test and before any
+     * tint/Gouraud math touches the color -- see its comment for why that's
+     * safe/necessary. */
     for (size_t i = 0; i < n; i++) {
-        unsigned char *a = &pixels[i * 4 + 3];
-        *a = (unsigned char)(((unsigned)*a * 255u + max_a / 2) / max_a);
+        unsigned char *p = &pixels[i * 4];
+        const unsigned a = p[3];
+        p[0] = (unsigned char)(((unsigned)p[0] * a + 127u) / 255u);
+        p[1] = (unsigned char)(((unsigned)p[1] * a + 127u) / 255u);
+        p[2] = (unsigned char)(((unsigned)p[2] * a + 127u) / 255u);
     }
 }
 
@@ -2681,7 +2712,11 @@ static void hd_normalize_alpha(unsigned char *pixels, int w, int h) {
  * that PNG's .bin (or the whole processed/ folder) and this regenerates
  * just the ones that are missing on the next boot. No mtime/hash staleness
  * check on purpose, to keep the cache-hit path simple. */
-#define HD_CACHE_MAGIC 0x33434448u /* "HDC3" LE (v3: alpha-normalized, see hd_normalize_alpha) */
+#define HD_CACHE_MAGIC 0x34434448u /* "HDC4" LE (v4: RGB now premultiplied by alpha too, see
+                                    * hd_normalize_alpha -- bumped from v3 so any pre-existing
+                                    * cache file (built before this fix, non-premultiplied RGB)
+                                    * is treated as a miss and re-decoded/re-cached rather than
+                                    * silently loaded in the wrong format. */
 
 static void hd_cache_paths_for(const char *png_path, char *out_dir, size_t dir_cap,
                                char *out_file, size_t file_cap) {
