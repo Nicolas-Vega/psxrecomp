@@ -707,7 +707,11 @@ post-dispatch IRQ pump shadow guard (already in tree).
 
 ## Issue #10 — Access-violation crash after ~6-7h continuous runtime (overnight session)
 
-**Status:** open, not yet investigated
+**Status:** open — root cause not found, but now CONFIRMED and REPRODUCIBLE
+(a real, fast, ongoing memory leak at plain idle, ~350-450 MB/hour steady
+state; see the 2026-09-08 investigation below), with a likely-related
+audio underrun/overflow storm also found live. Build now has embedded
+debug symbols and the crash report carries more diagnostics for next time.
 **Date opened:** 2026-09-08
 
 ### Symptom
@@ -737,27 +741,133 @@ crash handler) recorded:
   happened many hours later, deep into idle overnight runtime, and
   `frame: 1,395,540` is far beyond where either of those code paths
   would misbehave on the first few thousand frames if they were wrong.
+- **HD-texture GL cache growth (2026-09-08 live investigation, see
+  below): ruled out.** `hd_tex_cache_count` stayed at 2-4 for the
+  entire soak below while working-set memory grew by hundreds of MB —
+  nowhere near enough entries to account for the growth.
+- GDI/USER object counts (`GetGuiResources`): flat at 21/26 throughout
+  the soak — not a classic GDI handle leak.
+- No allocation (malloc/realloc/calloc) found in: `spu.c`'s hot paths,
+  `psx_sdl_audio.cpp`, `audio_trace.c` (confirmed fully static —
+  3 PCM taps + 1 event ring, all fixed-size BSS arrays, no dynamic
+  allocation anywhere in the file), `recomp_audio_drc.h`'s `rab_push`/
+  `rab_pull`/`rab__update_controller` hot path (fixed-size ring, no
+  per-frame alloc), or the `sdl_drc_callback`/pre-bridge pump function
+  in `main.cpp` (`sdl_audio_buf` is a static array). None of the
+  obvious audio-subsystem allocation sites explain the leak.
 
-### Suspected contributing factor (unconfirmed)
+### 2026-09-08 live investigation: confirmed reproducible, and a likely-related symptom found
 
-`gpu_gl_renderer.c`'s HD-texture GL cache (`s_hd_tex_cache`, see
-`hd_gl_cache_insert`) is documented in-tree as "Never shrinks/evicts —
-a whole session's worth of HD textures for one game is not expected to
-be a meaningful budget concern." That assumption was scoped to a normal
-play session, not an unattended multi-hour idle run; worth checking
-whether cache growth (or some other unbounded per-frame allocation)
-correlates with the crash once the offsets above are symbolized.
+Rebuilt with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` (confirmed embedded
+DWARF via `llvm-objdump -h` — `.debug_info`/`.debug_line`/etc. present;
+no separate PDB with this clang/lld toolchain) so a *future* crash can
+actually be symbolized — the exact binary that produced the original
+report had already been overwritten by same-day rebuilds, so the
+original `module_offset 0x59EB1` could not be resolved this session.
+
+Launched fresh, took **zero input**, sat at the title screen. Contrary
+to expectations (the original crash took ~7h), the leak is fast and
+immediately measurable:
+
+| Time (uptime) | Working set |
+|---|---|
+| ~0 min (boot) | ~700 MB |
+| ~1 min | ~1.0 GB |
+| ~2 min | ~1.14 GB |
+| ~8-9 min | ~1.38-1.42 GB |
+
+Growth rate is NOT constant: a fast burst in the first ~1-2 minutes
+(plausibly boot-time cache warming, though HD-tex-cache was already
+ruled out above as *the* cache in question), settling to a steady
+**~350-450 MB/hour** from minute ~2 onward. `HandleCount` grew briefly
+early on then went flat (900-913, no further growth in the back half
+of the soak) — the steady-state leak is pure heap/buffer growth, not
+OS-handle-based.
+
+**Likely-related symptom, reported live by the user during this same
+soak run:** intro-cutscene music "hangs" into a sustained, constant
+tone after a while. Queried `audio_stats` at that moment (backend
+`hdtex_recent` was unaffected/normal) and found the `out` stage
+(`bridge-pull` mode, `recomp_audio_drc.h`'s `rab_push`/`rab_pull`)
+reporting **139,562 underruns and 55,600 overflow drops** after only
+**8.36 minutes of uptime** (`Get-Process ... StartTime`) — roughly
+270+ underruns/second on average, a catastrophic and apparently
+near-immediate (not gradually-worsening) breakdown of the audio
+producer/consumer timing. `rab_pull`'s underrun path (`recomp_audio_drc.h`
+~line 348: "hold last sample, let gain fade it out") is exactly the
+kind of logic that produces a held/repeating-sample drone when the
+ring is chronically starved, matching the user's description.
+
+However, re-checked `audio_stats.out.underruns` several minutes later:
+it had **not increased** (still 139,562) while working-set memory kept
+climbing — so the underrun storm and the memory leak are not tightly
+coupled moment-to-moment; the storm looks like it happened in an early
+burst (plausibly correlated with whatever caused the fast early memory
+growth) and then the audio ring recovered (`fill_ms` back near
+`target_ms` by then), while the memory leak continued independently
+afterward. Two possibly-related but not identical issues, or one root
+cause with two different time profiles — not resolved this session.
+
+### Key context from the user, reframes the whole reproduction
+
+The title screen is NOT a static idle screen when left untouched: this
+title has an attract-mode loop that plays two of the game's cutscenes
+repeatedly once the player stops giving input (the longer of the two
+runs more often over a long session). **These are in-game/in-engine
+cutscenes (scripted 3D scenes with the normal character models, camera,
+and dialogue system), NOT pre-rendered FMV** — an initial guess that
+this pointed at MDEC/CD-XA movie playback was wrong; there is no video
+decode involved. So the "idle soak" above was actually exercising
+REPEATED IN-GAME CUTSCENE PLAYBACK within the first few minutes, not a
+genuinely inert screen — which is exactly consistent with what was
+found: a fast early memory burst, an audio underrun/overflow storm
+that then stabilized (plausibly tied to specific cutscene boundaries),
+and a slower-but-still-real ongoing leak afterward as the loop kept
+repeating. `mdec.c`'s capacity-growth helpers were checked and ruled
+out as the mechanism (correct grow-only pattern, and not even the
+relevant subsystem now that these are confirmed non-FMV) — the real
+candidates are whatever drives scripted in-game cutscenes: per-scene
+area/asset load-unload, the dialogue/text-box system, or the scripted
+camera/event system, none of which have been checked yet.
 
 ### Next steps
 
+- Re-run the soak with the attract loop in mind: count how many times
+  it has replayed and correlate memory growth AND the underrun-storm
+  timing against loop boundaries specifically (scene/area load-unload
+  events), instead of a plain wall-clock idle sample.
+- Look at what runs on scene start / scene end / loop-restart for the
+  two attract cutscenes specifically (area asset load/unload, dialogue/
+  text-box system, scripted camera/event system) rather than the
+  general audio-pump hot path or MDEC, both already checked and ruled
+  out.
+- Get a proper heap profiler on this (Dr. Memory, or attach a
+  Visual-Studio-class diagnostic tool) rather than continuing to guess
+  allocation sites by code review — every audio-subsystem site checked
+  this session came back clean, so the leak is either in a file not
+  yet checked or in a pattern (e.g. an STL container growing, a
+  `std::string`/`std::vector` in a C++ file, not a raw C `malloc`)
+  that a `grep -n malloc` sweep would miss entirely.
+- Reproduce the audio underrun storm specifically and catch it
+  mid-event (not after it's already stabilized) — try triggering it by
+  reproducing the user's original repro (an early-game cutscene) rather
+  than idling at the title screen, and query `audio_stats`/`spu_status`
+  repeatedly through the whole cutscene, not just once afterward.
+- Try `PSXRECOMP_AUDIO_LEGACY=1` (the `SDL_QueueAudio` path, bypassing
+  `rab_push`/`rab_pull` entirely) for a soak/repro run — if the leak
+  and/or the underrun storm disappear, that squarely implicates the
+  bridge/DRC code; if they persist, look elsewhere.
+- `psx_last_run_report.json` now includes a `"resources"` block
+  (`hd_gl_tex_cache_count`, `working_set_bytes`, `peak_working_set_bytes`,
+  `pagefile_usage_bytes` — added this session, `crash_trace.c`) so the
+  *next* crash (or a deliberately `TASKKILL`ed-at-high-memory soak run,
+  which still writes the report via the `atexit` path) shows this data
+  immediately without needing to reproduce live again.
 - Symbolize `module_offset 0x59EB1` and the repeating `stack_scan`
-  offsets against a matching build (`nightly-2-g1d4646f3-dirty`,
-  2026-09-06 23:43:52 build) to identify the actual faulting function.
-- Try to reproduce with a long unattended/idle soak test rather than
-  active play, since that's the condition that triggered it.
-- Check whether HD-texture GL cache size (`gl_renderer_hd_tex_cache_count`)
-  or any other per-frame-growing structure correlates with uptime in a
-  long soak.
+  offsets from the ORIGINAL overnight crash — no longer possible (the
+  binary was overwritten), but keep this build's DWARF-embedded binary
+  around from now on until the leak is fixed, so the next crash report
+  can actually be resolved with `llvm-symbolizer`/`llvm-addr2line`.
 
 ## Issue #11 — Beetle-format HD pack: visible seam where partial mesh coverage meets native fallback
 

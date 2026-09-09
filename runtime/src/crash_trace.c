@@ -28,6 +28,7 @@
 #endif
 #include <windows.h>
 #include <intrin.h>     /* __readgsqword — fiber TEB stack bounds for native_stack walk */
+#include <psapi.h>      /* PROCESS_MEMORY_COUNTERS / K32GetProcessMemoryInfo — resources block */
 #endif
 
 #include <stdint.h>
@@ -61,6 +62,12 @@ extern CPUState *debug_cpu_ptr;
 /* Main RAM (2 MiB) and scratchpad — peeks in the crash report, no MMIO. */
 extern uint8_t *g_psx_ram;
 extern uint8_t *memory_get_scratchpad_ptr(void);
+
+/* HD-texture GL cache size (gpu_gl_renderer.c) — documented in-tree as
+ * "never shrinks/evicts" for a normal play session; the "resources" block
+ * below reports it so an overnight-idle crash report (see issue #10) shows
+ * at a glance whether it had grown to something implausible. */
+extern int gl_renderer_hd_tex_cache_count(void);
 
 /* Overlay loader snapshot (post-FMV splash miss vs resim load freeze). */
 extern uint32_t overlay_loader_get_inprogress(void);
@@ -796,7 +803,38 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
                 (unsigned long long)e->seq,
                 e->target, e->ra, e->a0, e->a1, e->frame);
         }
-        append_str(buf, sizeof(buf), &pos, "]\n  }\n");
+        append_str(buf, sizeof(buf), &pos, "]\n  },\n");
+    }
+
+    /* Process/GPU resource snapshot -- added investigating issue #10 (an
+     * overnight idle-session SEH access-violation crash at frame ~1.4M with
+     * no clear cause and no debug symbols to trace it by). Lets the NEXT
+     * occurrence show at a glance whether the HD-texture GL cache
+     * (documented elsewhere as "never shrinks/evicts", an assumption scoped
+     * to a normal play session, not a multi-hour idle run) or overall
+     * process memory had grown to something implausible by crash time,
+     * without needing to reproduce it again first. */
+    {
+        uint32_t hd_tex_cache = (uint32_t)gl_renderer_hd_tex_cache_count();
+        unsigned long long working_set = 0, peak_working_set = 0, pagefile_usage = 0;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS pmc;
+        memset(&pmc, 0, sizeof(pmc));
+        pmc.cb = sizeof(pmc);
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+            working_set = (unsigned long long)pmc.WorkingSetSize;
+            peak_working_set = (unsigned long long)pmc.PeakWorkingSetSize;
+            pagefile_usage = (unsigned long long)pmc.PagefileUsage;
+        }
+#endif
+        append_fmt(buf, sizeof(buf), &pos,
+            "  \"resources\": {\n"
+            "    \"hd_gl_tex_cache_count\": %u,\n"
+            "    \"working_set_bytes\": %llu,\n"
+            "    \"peak_working_set_bytes\": %llu,\n"
+            "    \"pagefile_usage_bytes\": %llu\n"
+            "  }\n",
+            hd_tex_cache, working_set, peak_working_set, pagefile_usage);
     }
 
     append_str(buf, sizeof(buf), &pos, "}\n");

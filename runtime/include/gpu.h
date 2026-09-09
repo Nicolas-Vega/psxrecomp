@@ -174,7 +174,11 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
 void gpu_hd_texture_fusion_set(int on);
 int  gpu_hd_texture_fusion_enabled(void);
 
-#define GPU_HD_FUSED_MAX_PIECES 4
+#define GPU_HD_FUSED_MAX_PIECES 24  /* headroom for a heavily-fragmented upload
+                                      * (confirmed live: a character head texture's
+                                      * upload had survived 7 VRAM-invalidation
+                                      * fragments, 2026-09-08) */
+#define GPU_HD_FUSED_MAX_ENTRIES 4  /* distinct replacement PNGs one fused draw may reference */
 #define GPU_HD_FUSED_PIECE_MAX_DIM 128 /* per-axis cap on a native piece's decoded size */
 #define GPU_HD_FUSED_PIECE_MAX_BYTES \
     (GPU_HD_FUSED_PIECE_MAX_DIM * GPU_HD_FUSED_PIECE_MAX_DIM * 4)
@@ -182,35 +186,42 @@ int  gpu_hd_texture_fusion_enabled(void);
 /* One piece of a fused composite, TEXEL-space (x/y/width/height, relative to
  * the query's own u_first/v_first origin -- i.e. x=0,y=0 is the primitive's
  * own UV origin, not a VRAM-absolute coordinate). has_hd selects which of
- * hd_src_x/hd_src_y (into the shared replacement PNG named by
- * gpu_hd_texture_pack_match_fused's png_path/upload_w_texels/upload_h_out)
- * or native_rgba (already-decoded VRAM content, RGBA8, tightly packed rows
- * of width*4 bytes, valid for width*height*4 <= GPU_HD_FUSED_PIECE_MAX_BYTES)
- * fills it. */
+ * hd_src_x/hd_src_y (into the replacement PNG named by
+ * gpu_hd_texture_pack_match_fused's cache_keys[hd_entry_idx]/png_paths[
+ * hd_entry_idx]/upload_w_texels[hd_entry_idx]/upload_h[hd_entry_idx]) or
+ * native_rgba (already-decoded VRAM content, RGBA8, tightly packed rows of
+ * width*4 bytes, valid for width*height*4 <= GPU_HD_FUSED_PIECE_MAX_BYTES)
+ * fills it. Pieces from different uploads/entries are routine (a heavily
+ * fragmented upload, or genuinely different uploads both touching the same
+ * query) -- each piece keeps its OWN entry index, not one shared entry. */
 typedef struct GpuHdFusedPiece {
     float x, y, width, height;
     int has_hd;
     float hd_src_x, hd_src_y;
+    int hd_entry_idx; /* valid when has_hd; index into the parallel entry arrays below */
     uint8_t native_rgba[GPU_HD_FUSED_PIECE_MAX_BYTES];
 } GpuHdFusedPiece;
 
 /* Only meaningful (and only tried by gpu_gl_renderer.c) when
  * gpu_hd_texture_fusion_enabled() and gpu_hd_texture_pack_match above
  * already returned 0 for this exact query: composites the query's HD-covered
- * and native-fallback pieces so the caller can build ONE texture and draw
- * the primitive through a SINGLE GL draw call, instead of the seam that
- * splitting it across the HD and native pipelines (two draws, two
- * shaders/blend states) produces where they meet -- see
- * hd_texture_pack_match_fused's comment in hd_texture_pack.cpp for the exact
- * (narrow, common) scope and why real Beetle PSX HW's Vulkan renderer avoids
- * this by the same technique ("fused page", HD_TEXTURE_CACHE.md). Returns 0
- * for anything outside that scope (UV wrap, ambiguous/multi-upload overlap,
- * a piece bigger than GPU_HD_FUSED_PIECE_MAX_DIM) so the caller falls back
- * to plain native rendering unchanged. */
+ * (possibly from SEVERAL distinct replacement PNGs, see cache_keys/png_paths/
+ * upload_w_texels/upload_h below, capacity max_entries) and native-fallback
+ * pieces so the caller can build ONE texture and draw the primitive through
+ * a SINGLE GL draw call, instead of the seam that splitting it across the HD
+ * and native pipelines (two draws, two shaders/blend states) produces where
+ * they meet -- see hd_texture_pack_match_fused's comment in
+ * hd_texture_pack.cpp for the exact scope and why real Beetle PSX HW's
+ * Vulkan renderer avoids this by the same technique ("fused page",
+ * HD_TEXTURE_CACHE.md). Returns 0 for anything outside that scope (UV wrap,
+ * an ambiguous entry, more than max_entries distinct uploads, a piece
+ * bigger than GPU_HD_FUSED_PIECE_MAX_DIM, or more pieces than max_pieces)
+ * so the caller falls back to plain native rendering unchanged. */
 int gpu_hd_texture_pack_match_fused(int texpage, int clut_x, int clut_y,
                                     int u_first, int u_last, int v_first, int v_last,
-                                    uint32_t* cache_key, const char** png_path,
-                                    float* upload_w_texels_out, float* upload_h_out,
+                                    uint32_t* cache_keys, const char** png_paths,
+                                    float* upload_w_texels, float* upload_h,
+                                    int max_entries, int* out_entry_count,
                                     GpuHdFusedPiece* out_pieces, int max_pieces,
                                     int* out_count);
 
@@ -233,6 +244,35 @@ int gpu_hd_texture_pack_dump_uploads(char* out, size_t out_capacity);
  * hd_texture_pack_diag_dump_ring) -- the SET of replacement images the
  * currently on-screen frame is drawing from, not just the most recent one. */
 int gpu_hd_texture_pack_dump_match_ring(char* out, size_t out_capacity);
+/* Snapshot of the last successful fused-page match (see
+ * hd_texture_pack_diag_dump_fused_last) -- which candidate upload(s)/entries
+ * it picked and the exact pieces resolved. Only the fused path (multi-entry
+ * candidates, gpu_hd_texture_pack_match_fused) populates this; the plain
+ * ring above never does. Writes a JSON object body (no braces) into out. */
+int gpu_hd_texture_pack_dump_fused_last(char* out, size_t out_capacity);
+/* Ring of the last ~32 fused-match FAILURES with a reason code, see
+ * hd_texture_pack_diag_dump_fused_fails. */
+int gpu_hd_texture_pack_dump_fused_fails(char* out, size_t out_capacity);
+
+/* On-demand debug tint markers (2026-09-08 mouth/eye-seam investigation):
+ * marks a specific replacement PNG entry (by the same texhash/palhash a
+ * ring/uploads dump reports) or every native-fallback piece inside a fused
+ * composite a solid color live, so a visible gap or misalignment can be
+ * pinned to an exact piece/panel by sight instead of guessed at from
+ * screenshots. Multiplies the sampled color (so the underlying content and
+ * its position on the actual polygon stay visible through the tint) rather
+ * than painting a flat overlay. r/g/b are 0..1; gpu_hd_texture_tint_clear
+ * turns both off. */
+void gpu_hd_texture_tint_entry(uint32_t texhash, uint32_t palhash, float r, float g, float b);
+void gpu_hd_texture_tint_native_fused(int on, float r, float g, float b);
+void gpu_hd_texture_tint_clear(void);
+
+/* Live on/off for the "solid violet for anything unmatched by either the
+ * plain or fused matcher" coverage-debug overlay (previously boot-only via
+ * PSXRECOMP_HD_TEXTURE_DEBUG_MISSING). Useful for spotting genuinely
+ * unreplaceable content -- e.g. an always-native animated sprite -- without
+ * needing a specific texhash/palhash to tint by. */
+void gpu_hd_texture_debug_missing_set(int on);
 
 /* Enumeration for gpu_gl_renderer.c's boot-time / backend-switch preload
  * pass (gpu_hd_texture_preload_active): count + indexed (entry_id/cache_key,

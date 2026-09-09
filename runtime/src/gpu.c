@@ -209,6 +209,44 @@ int gpu_hd_texture_pack_dump_match_ring(char* out, size_t out_capacity) {
     return hd_texture_pack_diag_dump_ring(out, out_capacity);
 }
 
+int gpu_hd_texture_pack_dump_fused_last(char* out, size_t out_capacity) {
+    return hd_texture_pack_diag_dump_fused_last(out, out_capacity);
+}
+
+int gpu_hd_texture_pack_dump_fused_fails(char* out, size_t out_capacity) {
+    return hd_texture_pack_diag_dump_fused_fails(out, out_capacity);
+}
+
+/* 2026-09-08 mouth/eye-seam investigation: on-demand debug tint markers, see
+ * gl_renderer_hd_tint_entry_set's header comment (gpu_gl_renderer.c) for how
+ * they're drawn. cache_key here uses the SAME formula as
+ * gpu_hd_texture_pack_match's FOUND branch above, so a (texhash,palhash) pair
+ * read off hd_fused_last/hd_match_ring can be turned into the cache_key this
+ * expects without the caller needing to know the hash formula itself. */
+extern void gl_renderer_hd_tint_entry_set(uint32_t cache_key, float r, float g, float b);
+extern void gl_renderer_hd_tint_native_fused_set(int on, float r, float g, float b);
+extern void gl_renderer_hd_tint_clear(void);
+
+void gpu_hd_texture_tint_entry(uint32_t texhash, uint32_t palhash, float r, float g, float b) {
+    const uint32_t cache_key = 0x80000000u | (texhash ^ (palhash * 2654435761u));
+    gl_renderer_hd_tint_entry_set(cache_key, r, g, b);
+}
+void gpu_hd_texture_tint_native_fused(int on, float r, float g, float b) {
+    gl_renderer_hd_tint_native_fused_set(on, r, g, b);
+}
+void gpu_hd_texture_tint_clear(void) {
+    gl_renderer_hd_tint_clear();
+}
+
+/* Live on/off for the existing "solid violet for anything unmatched by
+ * either the plain or fused matcher" coverage-debug overlay (previously
+ * boot-only via PSXRECOMP_HD_TEXTURE_DEBUG_MISSING). See
+ * gl_renderer_hd_debug_missing_set's header comment. */
+extern void gl_renderer_hd_debug_missing_set(int on);
+void gpu_hd_texture_debug_missing_set(int on) {
+    gl_renderer_hd_debug_missing_set(on);
+}
+
 /* Boot-time / backend-switch preload enumeration (see gpu_gl_renderer.c's
  * gpu_hd_texture_preload_active): both wrap the same signature (index in,
  * entry_id + png_path out) so that function can preload whichever backend
@@ -396,39 +434,48 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
  * should not need to know about the word/texel distinction at all. */
 int gpu_hd_texture_pack_match_fused(int texpage, int clut_x, int clut_y,
                                     int u_first, int u_last, int v_first, int v_last,
-                                    uint32_t* cache_key, const char** png_path,
-                                    float* upload_w_texels_out, float* upload_h_out,
+                                    uint32_t* cache_keys, const char** png_paths,
+                                    float* upload_w_texels, float* upload_h,
+                                    int max_entries, int* out_entry_count,
                                     GpuHdFusedPiece* out_pieces, int max_pieces,
                                     int* out_count) {
     if (out_count) *out_count = 0;
-    if (!g_hd_texture_pack || !out_pieces || max_pieces <= 0) return 0;
+    if (out_entry_count) *out_entry_count = 0;
+    if (!g_hd_texture_pack || !out_pieces || max_pieces <= 0 || max_entries <= 0) return 0;
     const int depth_bits = (texpage >> 7) & 3;
     const unsigned ppw = depth_bits == 0 ? 4u : depth_bits == 1 ? 2u : 1u;
 
-    HdTexturePackEntry entry;
-    uint16_t upload_w_words = 0, upload_h = 0;
+    HdTexturePackEntry entries[GPU_HD_FUSED_MAX_ENTRIES];
+    uint16_t upload_w_words[GPU_HD_FUSED_MAX_ENTRIES];
+    uint16_t upload_h_texels[GPU_HD_FUSED_MAX_ENTRIES];
+    int entry_count = 0;
     HdFusedPiece pieces[GPU_HD_FUSED_MAX_PIECES];
     int count = 0;
     HdTextureDrawQuery query;
+    const int entry_cap = max_entries < GPU_HD_FUSED_MAX_ENTRIES ? max_entries : GPU_HD_FUSED_MAX_ENTRIES;
     const int cap = max_pieces < GPU_HD_FUSED_MAX_PIECES ? max_pieces : GPU_HD_FUSED_MAX_PIECES;
     const int ok = hd_texture_pack_match_fused_draw(
         g_hd_texture_pack, (uint16_t)texpage, (uint16_t)clut_x, (uint16_t)clut_y,
         (uint8_t)u_first, (uint8_t)u_last, (uint8_t)v_first, (uint8_t)v_last,
         vram, sizeof(vram) / sizeof(vram[0]),
-        &entry, &upload_w_words, &upload_h, pieces, cap, &count, &query);
-    if (!ok || count <= 0 || count > cap) return 0;
+        entries, upload_w_words, upload_h_texels, entry_cap, &entry_count,
+        pieces, cap, &count, &query);
+    if (!ok || count <= 0 || count > cap || entry_count <= 0 || entry_count > entry_cap) return 0;
 
-    const unsigned upload_w_texels = (unsigned)upload_w_words * ppw;
-    if (upload_w_texels == 0 || upload_h == 0) return 0;
-    /* Same construction as gpu_hd_texture_pack_match's cache_key above --
-     * hd_gl_get_texture keys purely on this integer, so it must stay
-     * consistent with the plain (non-fused) match path for the same entry. */
-    if (cache_key)
-        *cache_key = 0x80000000u |
-                     (entry.texture_hash ^ (entry.palette_hash * 2654435761u));
-    if (png_path) *png_path = entry.replacement_path;
-    if (upload_w_texels_out) *upload_w_texels_out = (float)upload_w_texels;
-    if (upload_h_out) *upload_h_out = (float)upload_h;
+    for (int e = 0; e < entry_count; e++) {
+        const unsigned w_texels = (unsigned)upload_w_words[e] * ppw;
+        if (w_texels == 0 || upload_h_texels[e] == 0) return 0;
+        /* Same construction as gpu_hd_texture_pack_match's cache_key above --
+         * hd_gl_get_texture keys purely on this integer, so it must stay
+         * consistent with the plain (non-fused) match path for the same entry. */
+        if (cache_keys)
+            cache_keys[e] = 0x80000000u |
+                            (entries[e].texture_hash ^ (entries[e].palette_hash * 2654435761u));
+        if (png_paths) png_paths[e] = entries[e].replacement_path;
+        if (upload_w_texels) upload_w_texels[e] = (float)w_texels;
+        if (upload_h) upload_h[e] = (float)upload_h_texels[e];
+    }
+    if (out_entry_count) *out_entry_count = entry_count;
 
     /* Pieces exactly tile `want` (the query rect hd_texture_pack.cpp resolved
      * u_first/v_first into), so its VRAM-absolute word/texel origin is just
@@ -449,6 +496,7 @@ int gpu_hd_texture_pack_match_fused(int texpage, int clut_x, int clut_y,
         out_pieces[i].has_hd = pieces[i].has_hd;
         out_pieces[i].hd_src_x = (float)(pieces[i].hd_src_x * ppw);
         out_pieces[i].hd_src_y = (float)pieces[i].hd_src_y;
+        out_pieces[i].hd_entry_idx = pieces[i].hd_entry_idx;
         /* Native pieces decode straight from VRAM here (cheap CPU work, done
          * once per fused-composite cache miss -- see gpu_gl_renderer.c's
          * cache) instead of handing gpu_gl_renderer.c the raw query struct,

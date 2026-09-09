@@ -5552,6 +5552,61 @@ static void handle_hd_match_ring(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"recent_matches\":[%s]}", id, buf);
 }
 
+static void handle_hd_fused_last(int id, const char *json)
+{
+    (void)json;
+    static char buf[131072];
+    gpu_hd_texture_pack_dump_fused_last(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
+}
+
+static void handle_hd_fused_fails(int id, const char *json)
+{
+    (void)json;
+    static char buf[32768];
+    gpu_hd_texture_pack_dump_fused_fails(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
+}
+
+/* On-demand debug tint markers (see gpu_hd_texture_tint_entry's header
+ * comment, gpu.h): texhash/palhash come as decimal or "0x..." strings (not
+ * json_get_int -- a bare texhash/palhash routinely exceeds INT32_MAX, which
+ * json_get_int's strtol-based parsing would saturate instead of preserving
+ * the bit pattern) matching what hd_fused_last/hd_match_ring print. r/g/b
+ * are 0..255 ints, converted to the 0..1 float range the renderer expects. */
+static void handle_hd_tint_entry(int id, const char *json)
+{
+    char buf[32];
+    uint32_t texhash = 0, palhash = 0;
+    if (json_get_str(json, "texhash", buf, sizeof buf)) texhash = (uint32_t)strtoul(buf, NULL, 0);
+    if (json_get_str(json, "palhash", buf, sizeof buf)) palhash = (uint32_t)strtoul(buf, NULL, 0);
+    const int r = json_get_int(json, "r", 255), g = json_get_int(json, "g", 0), b = json_get_int(json, "b", 255);
+    gpu_hd_texture_tint_entry(texhash, palhash, r / 255.0f, g / 255.0f, b / 255.0f);
+    send_ok(id);
+}
+
+static void handle_hd_tint_native_fused(int id, const char *json)
+{
+    const int on = json_get_int(json, "on", 1);
+    const int r = json_get_int(json, "r", 255), g = json_get_int(json, "g", 0), b = json_get_int(json, "b", 255);
+    gpu_hd_texture_tint_native_fused(on, r / 255.0f, g / 255.0f, b / 255.0f);
+    send_ok(id);
+}
+
+static void handle_hd_tint_clear(int id, const char *json)
+{
+    (void)json;
+    gpu_hd_texture_tint_clear();
+    send_ok(id);
+}
+
+static void handle_hd_debug_missing(int id, const char *json)
+{
+    const int on = json_get_int(json, "on", 1);
+    gpu_hd_texture_debug_missing_set(on);
+    send_ok(id);
+}
+
 static void handle_hdtex_recent(int id, const char *json)
 {
     int n = json_get_int(json, "count", 16);
@@ -13831,6 +13886,12 @@ static const CmdEntry s_commands[] = {
     { "hd_reload_paths",   handle_hd_reload_paths },
     { "hd_uploads_dump",   handle_hd_uploads_dump },
     { "hd_match_ring",     handle_hd_match_ring },
+    { "hd_fused_last",     handle_hd_fused_last },
+    { "hd_fused_fails",    handle_hd_fused_fails },
+    { "hd_tint_entry",     handle_hd_tint_entry },
+    { "hd_tint_native_fused", handle_hd_tint_native_fused },
+    { "hd_tint_clear",     handle_hd_tint_clear },
+    { "hd_debug_missing",  handle_hd_debug_missing },
     { "hdtex_recent",      handle_hdtex_recent },
     { "geom_correction",   handle_geom_correction },
     { "ws_cull_diag",      handle_ws_cull_diag },

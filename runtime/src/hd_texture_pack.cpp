@@ -1088,6 +1088,75 @@ uint64_t g_hd_pack_diag_font_region_touches = 0; /* track_upload calls intersect
 uint32_t g_hd_pack_diag_font_region_last_hash = 0;
 uint64_t g_hd_pack_diag_font_region_last_serial = 0;
 
+/* Ring of the last N successful hd_texture_pack_match_fused calls (2026-09-08
+ * multi-entry-candidate investigation): the plain match's ring above only
+ * records PLAIN matches, so it says nothing about what the fused path
+ * actually resolved for an animated (mouth/eye "gif") region once it stopped
+ * bailing out on a second candidate. A single "last match" snapshot turned
+ * out not to be enough on its own: the fused path also handles small,
+ * frequent UI elements (dialogue-box glyphs, HUD icons), so the single most
+ * recent call is as likely to be one of those as the specific face draw
+ * being investigated (confirmed live: a "last" snapshot queried while a
+ * character's face with the suspected seam was on screen turned out to be a
+ * 7x14-texel glyph-sized region instead). A ring mirrors g_hd_pack_diag_ring
+ * above so every fused match from one held frame can be inspected as a set
+ * and filtered by piece size to find the actual character draw. */
+#define HD_FUSED_DIAG_MAX_ENTRIES 4
+#define HD_FUSED_DIAG_MAX_PIECES 24
+#define HD_FUSED_DIAG_RING_CAP 64
+struct HdFusedDiagEntry {
+    char path[256] = {0};
+    unsigned texhash = 0, palhash = 0;
+    uint64_t serial = 0;
+    unsigned upload_w = 0, upload_h = 0, upload_fragments = 0;
+};
+struct HdFusedDiagPiece {
+    unsigned x = 0, y = 0, width = 0, height = 0;
+    int has_hd = 0, hd_entry_idx = -1;
+    unsigned hd_src_x = 0, hd_src_y = 0;
+};
+struct HdFusedDiagRingEntry {
+    unsigned qx = 0, qy = 0, qw = 0, qh = 0;
+    int entry_count = 0;
+    HdFusedDiagEntry entries[HD_FUSED_DIAG_MAX_ENTRIES];
+    int piece_count = 0;
+    HdFusedDiagPiece pieces[HD_FUSED_DIAG_MAX_PIECES];
+};
+HdFusedDiagRingEntry g_hd_fused_diag_ring[HD_FUSED_DIAG_RING_CAP];
+int g_hd_fused_diag_ring_pos = 0;
+uint64_t g_hd_fused_diag_total = 0;
+
+/* Ring of the last ~32 hd_texture_pack_match_fused FAILURES, with a reason
+ * code -- 2026-09-08 investigation into why a specific character's mouth
+ * region sometimes falls through to fully-native (visible via the
+ * PSXRECOMP_HD_TEXTURE_DEBUG_MISSING violet overlay) instead of fusing, even
+ * though the same face upload/entry fuses successfully for smaller queries
+ * elsewhere on the same head (per the success ring above, and per
+ * gpu_hd_texture_pack_match_stats' no_candidates counter reading 0 all
+ * session -- ruling out "this VRAM region is untracked"). Reasons:
+ * 1=UV-wrapped/empty query (out of scope by design), 2=ambiguous pack entry,
+ * 3=more than max_entries distinct candidate uploads, 4=no candidate's hash
+ * matched any pack entry, 5=more pieces than max_pieces, 6=fewer than 2
+ * pieces (nothing to fuse -- would have matched or gone plain-native
+ * anyway). */
+#define HD_FUSED_FAIL_RING_CAP 32
+struct HdFusedFailEntry {
+    unsigned qx = 0, qy = 0, qw = 0, qh = 0;
+    int reason = 0;
+};
+HdFusedFailEntry g_hd_fused_fail_ring[HD_FUSED_FAIL_RING_CAP];
+int g_hd_fused_fail_ring_pos = 0;
+uint64_t g_hd_fused_fail_total = 0;
+uint64_t g_hd_fused_fail_reason_counts[8] = {0};
+
+static void hd_fused_record_fail(int reason, unsigned qx, unsigned qy, unsigned qw, unsigned qh) {
+    HdFusedFailEntry& e = g_hd_fused_fail_ring[g_hd_fused_fail_ring_pos];
+    e.qx = qx; e.qy = qy; e.qw = qw; e.qh = qh; e.reason = reason;
+    g_hd_fused_fail_ring_pos = (g_hd_fused_fail_ring_pos + 1) % HD_FUSED_FAIL_RING_CAP;
+    ++g_hd_fused_fail_total;
+    if (reason >= 0 && reason < 8) ++g_hd_fused_fail_reason_counts[reason];
+}
+
 int hd_texture_pack_track_upload(HdTexturePack* pack,
                                  uint16_t x,
                                  uint16_t y,
@@ -1510,30 +1579,44 @@ void rect_intersection(const Rect& a, const Rect& b, Rect* out) {
  * renderer avoids this by compositing every upload a draw's sample region
  * touches into one "fused page" texture before issuing a single draw (see
  * HD_TEXTURE_CACHE.md's "Fused-page path"/FusedPage) -- this is the same
- * idea, scoped down to the dominant real case instead of a fully general
- * multi-upload compositor: exactly one wanted rect (no UV wrap) and exactly
- * one upload/entry whose fragments partially cover it. Reports each covered
- * (HD) and uncovered (native-VRAM) piece so gpu_gl_renderer.c can build the
- * composite and draw once. Returns 0 (not applicable -- caller keeps today's
- * behavior unchanged) for anything outside that scope: UV-wrapped queries,
- * zero or more-than-one matching upload, ambiguous entries, or more pieces
- * than max_pieces. */
+ * idea. Handles one wanted rect (no UV wrap) and up to max_entries distinct
+ * partially-covering uploads/entries (a single upload split into many
+ * fragments by VRAM-invalidation history, or genuinely different uploads
+ * both touching the query, are both routine -- confirmed live on a
+ * character head texture with 7 surviving fragments that exceeded the
+ * original single-candidate/4-piece v1 scope and still showed the seam
+ * with fusion on, 2026-09-08). Candidates are resolved newest-upload-first
+ * (see the serial sort below -- VRAM is last-write-wins): each one's
+ * fragments claim whatever part of the STILL-uncovered region they overlap,
+ * so two candidates' fragments covering the same pixels (rare) never
+ * double-count -- the newer candidate wins. Reports each covered (HD, tagged with which
+ * candidate/entry it came from) and uncovered (native-VRAM) piece so
+ * gpu_gl_renderer.c can build the composite and draw once. Returns 0 (not
+ * applicable -- caller keeps today's behavior unchanged) for anything
+ * outside that scope: UV-wrapped queries, more than max_entries distinct
+ * uploads, an ambiguous entry, or more pieces than max_pieces. */
 int hd_texture_pack_match_fused(HdTexturePack* pack,
                                 const HdTextureDrawQuery* query,
-                                HdTexturePackEntry* out_entry,
+                                HdTexturePackEntry* out_entries,
                                 uint16_t* out_upload_width_words,
                                 uint16_t* out_upload_height,
+                                int max_entries,
+                                int* out_entry_count,
                                 HdFusedPiece* out_pieces,
                                 int max_pieces,
                                 int* out_count) {
     if (out_count) *out_count = 0;
-    if (!pack || !query || !out_entry || !out_pieces || max_pieces <= 0 ||
-        query->depth > HD_TEXTURE_DEPTH_16BPP || !query->vram ||
-        query->vram_word_count < kVramWords)
+    if (out_entry_count) *out_entry_count = 0;
+    if (!pack || !query || !out_entries || !out_pieces || max_pieces <= 0 ||
+        max_entries <= 0 || query->depth > HD_TEXTURE_DEPTH_16BPP ||
+        !query->vram || query->vram_word_count < kVramWords)
         return 0;
     const std::vector<Rect> wanted = query_rectangles(*query);
-    if (wanted.size() != 1 || wanted[0].width == 0 || wanted[0].height == 0)
-        return 0; /* UV wrap or empty query: out of scope for v1 */
+    if (wanted.size() != 1 || wanted[0].width == 0 || wanted[0].height == 0) {
+        hd_fused_record_fail(1, wanted.empty() ? 0 : wanted[0].x, wanted.empty() ? 0 : wanted[0].y,
+                             wanted.empty() ? 0 : wanted[0].width, wanted.empty() ? 0 : wanted[0].height);
+        return 0; /* UV wrap or empty query: out of scope */
+    }
     const Rect& want = wanted[0];
     const uint32_t palette_hash = hd_texture_hash_clut(
         query->vram, query->vram_word_count, query->clut_x, query->clut_y,
@@ -1541,8 +1624,12 @@ int hd_texture_pack_match_fused(HdTexturePack* pack,
 
     std::vector<uint64_t> candidate_serials;
     upload_index_collect(pack, wanted, &candidate_serials);
-    const Upload* candidate = nullptr;
-    const EntryRecord* candidate_entry = nullptr;
+
+    struct Candidate {
+        const Upload* upload;
+        const EntryRecord* entry;
+    };
+    std::vector<Candidate> candidates;
     for (const uint64_t serial : candidate_serials) {
         const auto indexed = pack->upload_by_serial.find(serial);
         if (indexed == pack->upload_by_serial.end() || !indexed->second) continue;
@@ -1550,60 +1637,208 @@ int hd_texture_pack_match_fused(HdTexturePack* pack,
         if (!intersects(upload.bounds, want)) continue;
         const auto record = pack->entries.find(make_key(upload.hash, palette_hash));
         if (record == pack->entries.end()) continue;
-        if (record->second.ambiguous) return 0;
-        if (covered_by_upload(upload, wanted)) return 0; /* fully covered: the plain matcher already handles this */
-        if (candidate) return 0; /* more than one candidate: stay out of scope */
-        candidate = &upload;
-        candidate_entry = &record->second;
+        if (record->second.ambiguous) {
+            hd_fused_record_fail(2, want.x, want.y, want.width, want.height);
+            return 0;
+        }
+        if (static_cast<int>(candidates.size()) >= max_entries) {
+            hd_fused_record_fail(3, want.x, want.y, want.width, want.height);
+            return 0; /* too many distinct uploads: stay out of scope */
+        }
+        candidates.push_back({&upload, &record->second});
     }
-    if (!candidate || !candidate_entry) return 0;
+    if (candidates.empty()) {
+        hd_fused_record_fail(4, want.x, want.y, want.width, want.height);
+        return 0;
+    }
+
+    /* upload_index_collect returns serials sorted ASCENDING (oldest first),
+     * but VRAM semantics are last-write-wins: when two uploads' fragments
+     * both still overlap the same pixels (a coarse broad-phase tile match,
+     * or fragments an older upload kept after being partially overwritten),
+     * the newest upload's content is what's actually in VRAM there. Sort
+     * newest-first so it claims the overlap ahead of any older upload --
+     * without this an older upload could steal pixels out from under a
+     * newer, correct one, which read live as a misaligned patch (2026-09-08,
+     * mouth region of a character face after enabling multi-entry fusion). */
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  return a.upload->serial > b.upload->serial;
+              });
 
     int count = 0;
-    /* HD pieces: this upload's fragments intersected with the wanted rect. */
-    for (const Fragment& fragment : candidate->fragments) {
-        Rect piece;
-        rect_intersection(want, fragment.rect, &piece);
-        if (piece.width == 0 || piece.height == 0) continue;
-        if (count >= max_pieces) return 0;
-        out_pieces[count].x = static_cast<uint16_t>(piece.x);
-        out_pieces[count].y = static_cast<uint16_t>(piece.y);
-        out_pieces[count].width = static_cast<uint16_t>(piece.width);
-        out_pieces[count].height = static_cast<uint16_t>(piece.height);
-        out_pieces[count].has_hd = 1;
-        out_pieces[count].hd_src_x = fragment.source_x + (piece.x - fragment.rect.x);
-        out_pieces[count].hd_src_y = fragment.source_y + (piece.y - fragment.rect.y);
-        ++count;
-    }
-    /* Native (uncovered) pieces: same rectangle-subtraction covered_by_upload
-     * uses, but keeping the remainder instead of discarding it. */
-    std::vector<Rect> uncovered{want};
-    for (const Fragment& fragment : candidate->fragments) {
-        std::vector<Rect> next;
-        for (const Rect& piece : uncovered) {
-            std::vector<Rect> remainder = subtract_rect(piece, fragment.rect);
-            next.insert(next.end(), remainder.begin(), remainder.end());
+    /* Each candidate's fragments claim whatever part of the still-uncovered
+     * region they overlap, in order; whatever no candidate covers becomes
+     * the native pieces at the end. Mirrors covered_by_upload's rectangle-
+     * subtraction technique, generalized to multiple uploads in sequence. */
+    std::vector<Rect> remaining{want};
+    for (size_t ci = 0; ci < candidates.size() && !remaining.empty(); ++ci) {
+        const Upload& upload = *candidates[ci].upload;
+        std::vector<Rect> next_remaining;
+        for (const Rect& region : remaining) {
+            std::vector<Rect> uncovered{region};
+            for (const Fragment& fragment : upload.fragments) {
+                Rect covered;
+                rect_intersection(region, fragment.rect, &covered);
+                if (covered.width != 0 && covered.height != 0) {
+                    if (count >= max_pieces) {
+                        hd_fused_record_fail(5, want.x, want.y, want.width, want.height);
+                        return 0;
+                    }
+                    out_pieces[count].x = static_cast<uint16_t>(covered.x);
+                    out_pieces[count].y = static_cast<uint16_t>(covered.y);
+                    out_pieces[count].width = static_cast<uint16_t>(covered.width);
+                    out_pieces[count].height = static_cast<uint16_t>(covered.height);
+                    out_pieces[count].has_hd = 1;
+                    out_pieces[count].hd_entry_idx = static_cast<int>(ci);
+                    out_pieces[count].hd_src_x = fragment.source_x + (covered.x - fragment.rect.x);
+                    out_pieces[count].hd_src_y = fragment.source_y + (covered.y - fragment.rect.y);
+                    ++count;
+                }
+                std::vector<Rect> next_uncovered;
+                for (const Rect& u : uncovered) {
+                    std::vector<Rect> remainder = subtract_rect(u, fragment.rect);
+                    next_uncovered.insert(next_uncovered.end(), remainder.begin(), remainder.end());
+                }
+                uncovered.swap(next_uncovered);
+                if (uncovered.empty()) break;
+            }
+            next_remaining.insert(next_remaining.end(), uncovered.begin(), uncovered.end());
         }
-        uncovered.swap(next);
-        if (uncovered.empty()) break;
+        remaining.swap(next_remaining);
     }
-    for (const Rect& piece : uncovered) {
+    /* Whatever no candidate's fragments covered: native pieces. */
+    for (const Rect& piece : remaining) {
         if (piece.width == 0 || piece.height == 0) continue;
-        if (count >= max_pieces) return 0;
+        if (count >= max_pieces) {
+            hd_fused_record_fail(5, want.x, want.y, want.width, want.height);
+            return 0;
+        }
         out_pieces[count].x = static_cast<uint16_t>(piece.x);
         out_pieces[count].y = static_cast<uint16_t>(piece.y);
         out_pieces[count].width = static_cast<uint16_t>(piece.width);
         out_pieces[count].height = static_cast<uint16_t>(piece.height);
         out_pieces[count].has_hd = 0;
+        out_pieces[count].hd_entry_idx = -1;
         out_pieces[count].hd_src_x = 0;
         out_pieces[count].hd_src_y = 0;
         ++count;
     }
-    if (count < 2) return 0; /* nothing to fuse (should not happen: not fully covered implies >=1 native piece, and >=1 HD piece was required above) */
+    if (count < 2) {
+        hd_fused_record_fail(6, want.x, want.y, want.width, want.height);
+        return 0; /* nothing to fuse, or this fully resolves to plain native/HD (should not happen: the caller only reaches this after the plain matcher already failed) */
+    }
 
-    fill_entry(*candidate_entry, out_entry);
-    if (out_upload_width_words) *out_upload_width_words = candidate->width;
-    if (out_upload_height) *out_upload_height = candidate->height;
+    for (size_t ci = 0; ci < candidates.size(); ++ci) {
+        fill_entry(*candidates[ci].entry, &out_entries[ci]);
+        out_upload_width_words[ci] = candidates[ci].upload->width;
+        out_upload_height[ci] = candidates[ci].upload->height;
+    }
+    if (out_entry_count) *out_entry_count = static_cast<int>(candidates.size());
     if (out_count) *out_count = count;
+
+    {
+        HdFusedDiagRingEntry& ring = g_hd_fused_diag_ring[g_hd_fused_diag_ring_pos];
+        ring.qx = want.x; ring.qy = want.y;
+        ring.qw = want.width; ring.qh = want.height;
+        const int ecap = std::min<int>(static_cast<int>(candidates.size()), HD_FUSED_DIAG_MAX_ENTRIES);
+        for (int ci = 0; ci < ecap; ci++) {
+            HdFusedDiagEntry& e = ring.entries[ci];
+            std::snprintf(e.path, sizeof(e.path), "%s", candidates[ci].entry->replacement_path.c_str());
+            e.texhash = candidates[ci].upload->hash;
+            e.palhash = palette_hash;
+            e.serial = candidates[ci].upload->serial;
+            e.upload_w = candidates[ci].upload->width;
+            e.upload_h = candidates[ci].upload->height;
+            e.upload_fragments = static_cast<unsigned>(candidates[ci].upload->fragments.size());
+        }
+        ring.entry_count = ecap;
+        const int pcap = std::min(count, HD_FUSED_DIAG_MAX_PIECES);
+        for (int pi = 0; pi < pcap; pi++) {
+            HdFusedDiagPiece& p = ring.pieces[pi];
+            p.x = out_pieces[pi].x; p.y = out_pieces[pi].y;
+            p.width = out_pieces[pi].width; p.height = out_pieces[pi].height;
+            p.has_hd = out_pieces[pi].has_hd;
+            p.hd_entry_idx = out_pieces[pi].hd_entry_idx;
+            p.hd_src_x = static_cast<unsigned>(out_pieces[pi].hd_src_x);
+            p.hd_src_y = static_cast<unsigned>(out_pieces[pi].hd_src_y);
+        }
+        ring.piece_count = pcap;
+        g_hd_fused_diag_ring_pos = (g_hd_fused_diag_ring_pos + 1) % HD_FUSED_DIAG_RING_CAP;
+        ++g_hd_fused_diag_total;
+    }
+    return 1;
+}
+
+static void hd_diag_json_escape(const char* in, char* out, size_t out_cap); /* fwd, defined below */
+
+int hd_texture_pack_diag_dump_fused_last(char* out, size_t out_capacity) {
+    if (!out || out_capacity == 0) return 0;
+    int pos = std::snprintf(out, out_capacity, "\"total\":%llu,\"recent\":[",
+                            (unsigned long long)g_hd_fused_diag_total);
+    const int n = g_hd_fused_diag_total < HD_FUSED_DIAG_RING_CAP
+                      ? static_cast<int>(g_hd_fused_diag_total)
+                      : HD_FUSED_DIAG_RING_CAP;
+    const int start = g_hd_fused_diag_total < HD_FUSED_DIAG_RING_CAP
+                          ? 0
+                          : g_hd_fused_diag_ring_pos;
+    for (int k = 0; k < n && pos < (int)out_capacity - 256; k++) {
+        const HdFusedDiagRingEntry& r = g_hd_fused_diag_ring[(start + k) % HD_FUSED_DIAG_RING_CAP];
+        pos += std::snprintf(out + pos, out_capacity - pos,
+            "%s{\"query\":{\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u},\"entries\":[",
+            k ? "," : "", r.qx, r.qy, r.qw, r.qh);
+        for (int i = 0; i < r.entry_count && pos < (int)out_capacity - 256; i++) {
+            const HdFusedDiagEntry& e = r.entries[i];
+            char escaped_path[512];
+            hd_diag_json_escape(e.path, escaped_path, sizeof(escaped_path));
+            pos += std::snprintf(out + pos, out_capacity - pos,
+                "%s{\"path\":\"%s\",\"texhash\":%u,\"palhash\":%u,\"serial\":%llu,"
+                "\"upload_w\":%u,\"upload_h\":%u,\"upload_fragments\":%u}",
+                i ? "," : "", escaped_path, e.texhash, e.palhash, (unsigned long long)e.serial,
+                e.upload_w, e.upload_h, e.upload_fragments);
+        }
+        pos += std::snprintf(out + pos, out_capacity - pos, "],\"pieces\":[");
+        for (int i = 0; i < r.piece_count && pos < (int)out_capacity - 256; i++) {
+            const HdFusedDiagPiece& p = r.pieces[i];
+            pos += std::snprintf(out + pos, out_capacity - pos,
+                "%s{\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u,\"has_hd\":%d,\"entry_idx\":%d,"
+                "\"hd_src_x\":%u,\"hd_src_y\":%u}",
+                i ? "," : "", p.x, p.y, p.width, p.height, p.has_hd, p.hd_entry_idx,
+                p.hd_src_x, p.hd_src_y);
+        }
+        pos += std::snprintf(out + pos, out_capacity - pos, "]}");
+    }
+    pos += std::snprintf(out + pos, out_capacity - pos, "]");
+    return 1;
+}
+
+int hd_texture_pack_diag_dump_fused_fails(char* out, size_t out_capacity) {
+    if (!out || out_capacity == 0) return 0;
+    int pos = std::snprintf(out, out_capacity,
+        "\"total\":%llu,\"by_reason\":{"
+        "\"uv_wrap\":%llu,\"ambiguous\":%llu,\"too_many_entries\":%llu,"
+        "\"no_hash_match\":%llu,\"too_many_pieces\":%llu,\"nothing_to_fuse\":%llu},"
+        "\"recent\":[",
+        (unsigned long long)g_hd_fused_fail_total,
+        (unsigned long long)g_hd_fused_fail_reason_counts[1],
+        (unsigned long long)g_hd_fused_fail_reason_counts[2],
+        (unsigned long long)g_hd_fused_fail_reason_counts[3],
+        (unsigned long long)g_hd_fused_fail_reason_counts[4],
+        (unsigned long long)g_hd_fused_fail_reason_counts[5],
+        (unsigned long long)g_hd_fused_fail_reason_counts[6]);
+    const int n = g_hd_fused_fail_total < HD_FUSED_FAIL_RING_CAP
+                      ? static_cast<int>(g_hd_fused_fail_total)
+                      : HD_FUSED_FAIL_RING_CAP;
+    const int start = g_hd_fused_fail_total < HD_FUSED_FAIL_RING_CAP
+                          ? 0
+                          : g_hd_fused_fail_ring_pos;
+    for (int k = 0; k < n && pos < (int)out_capacity - 128; k++) {
+        const HdFusedFailEntry& e = g_hd_fused_fail_ring[(start + k) % HD_FUSED_FAIL_RING_CAP];
+        pos += std::snprintf(out + pos, out_capacity - pos,
+            "%s{\"reason\":%d,\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u}",
+            k ? "," : "", e.reason, e.qx, e.qy, e.qw, e.qh);
+    }
+    pos += std::snprintf(out + pos, out_capacity - pos, "]");
     return 1;
 }
 
@@ -1785,15 +2020,18 @@ int hd_texture_pack_match_fused_draw(HdTexturePack* pack,
                                      uint8_t v_last,
                                      const uint16_t* vram,
                                      size_t vram_word_count,
-                                     HdTexturePackEntry* out_entry,
+                                     HdTexturePackEntry* out_entries,
                                      uint16_t* out_upload_width_words,
                                      uint16_t* out_upload_height,
+                                     int max_entries,
+                                     int* out_entry_count,
                                      HdFusedPiece* out_pieces,
                                      int max_pieces,
                                      int* out_count,
                                      HdTextureDrawQuery* out_query) {
     const uint8_t depth = static_cast<uint8_t>((texpage >> 7) & 3u);
     if (out_count) *out_count = 0;
+    if (out_entry_count) *out_entry_count = 0;
     if (depth > HD_TEXTURE_DEPTH_16BPP) return 0;
     HdTextureDrawQuery query{};
     query.page_x = static_cast<uint16_t>((texpage & 0xFu) * 64u);
@@ -1804,8 +2042,9 @@ int hd_texture_pack_match_fused_draw(HdTexturePack* pack,
     query.clut_x = clut_x; query.clut_y = clut_y;
     query.vram = vram; query.vram_word_count = vram_word_count;
     if (out_query) *out_query = query; /* caller needs it again for decode_native_rgba */
-    return hd_texture_pack_match_fused(pack, &query, out_entry, out_upload_width_words,
-                                       out_upload_height, out_pieces, max_pieces, out_count);
+    return hd_texture_pack_match_fused(pack, &query, out_entries, out_upload_width_words,
+                                       out_upload_height, max_entries, out_entry_count,
+                                       out_pieces, max_pieces, out_count);
 }
 
 void hd_texture_pack_set_decode_budget(HdTexturePack* pack,

@@ -2134,6 +2134,40 @@ int gl_renderer_hd_tex_cache_count(void) { return s_hd_tex_cache_count; }
 static int s_hd_debug_missing = 0;
 static GLuint s_hd_debug_missing_tex = 0;
 int gl_renderer_hd_debug_missing(void) { return s_hd_debug_missing; }
+void gl_renderer_hd_debug_missing_set(int on); /* fwd, defined below */
+
+/* 2026-09-08 mouth/eye-seam investigation: on-demand tint markers so a
+ * specific replacement PNG (identified by its cache_key -- the same integer
+ * hd_gl_get_texture keys its cache by, computed from a ring/uploads-dump's
+ * texhash/palhash the same way gpu_hd_texture_pack_match does) or the
+ * native-fallback pieces INSIDE a fused composite can be marked a solid
+ * color live, instead of guessing which panel/piece a visible gap or
+ * misalignment belongs to from screenshots alone. Mirrors
+ * s_hd_debug_missing's "flat violet, same draw pipeline" approach: the plain-
+ * match case reuses draw_hd_replacement_triangle's existing tint multiply
+ * (hd_tint_r/g/b, already plumbed for the DuckStation-format tint feature),
+ * and the fused-composite case reuses the multiply built into the blit
+ * shader below (FUSED_BLIT_FS's u_tint) so both HD and native pieces alike
+ * can be flagged without adding a second shader. Multiply (not a flat
+ * overlay) is deliberate: it keeps enough of the underlying content visible
+ * to judge alignment against the polygon it's drawn on, not just presence. */
+static uint32_t s_hd_tint_entry_cache_key = 0; /* 0 = disabled */
+static float s_hd_tint_entry_r = 1.0f, s_hd_tint_entry_g = 0.0f, s_hd_tint_entry_b = 1.0f;
+static int s_hd_tint_native_fused = 0;
+static float s_hd_tint_native_r = 1.0f, s_hd_tint_native_g = 0.0f, s_hd_tint_native_b = 1.0f;
+
+void gl_renderer_hd_tint_entry_set(uint32_t cache_key, float r, float g, float b) {
+    s_hd_tint_entry_cache_key = cache_key;
+    s_hd_tint_entry_r = r; s_hd_tint_entry_g = g; s_hd_tint_entry_b = b;
+}
+void gl_renderer_hd_tint_native_fused_set(int on, float r, float g, float b) {
+    s_hd_tint_native_fused = on ? 1 : 0;
+    s_hd_tint_native_r = r; s_hd_tint_native_g = g; s_hd_tint_native_b = b;
+}
+void gl_renderer_hd_tint_clear(void) {
+    s_hd_tint_entry_cache_key = 0;
+    s_hd_tint_native_fused = 0;
+}
 
 static void hd_gl_init(void) {
     s_hd_prog = build_program(HD_VS, HD_FS);
@@ -2167,8 +2201,19 @@ static void hd_gl_init(void) {
     p_glUseProgram(0);
 
     const char *debug_missing_env = getenv("PSXRECOMP_HD_TEXTURE_DEBUG_MISSING");
-    s_hd_debug_missing = debug_missing_env && debug_missing_env[0] && debug_missing_env[0] != '0';
-    if (s_hd_debug_missing) {
+    if (debug_missing_env && debug_missing_env[0] && debug_missing_env[0] != '0')
+        gl_renderer_hd_debug_missing_set(1);
+}
+
+/* Live on/off for s_hd_debug_missing (2026-09-08 mouth/eye-seam investigation:
+ * lets a debug command toggle the SAME "solid violet for anything that fails
+ * both the plain and fused match" overlay the PSXRECOMP_HD_TEXTURE_DEBUG_MISSING
+ * env var enables at boot, without needing to relaunch and re-navigate back
+ * to whatever scene is being inspected). Lazily creates the 1x1 texture on
+ * first enable since a boot without the env var never allocated one. */
+void gl_renderer_hd_debug_missing_set(int on) {
+    s_hd_debug_missing = on ? 1 : 0;
+    if (s_hd_debug_missing && !s_hd_debug_missing_tex) {
         static const unsigned char violet[4] = { 200, 0, 220, 255 };
         glGenTextures(1, &s_hd_debug_missing_tex);
         p_glActiveTexture(PSXGL_TEXTURE0);
@@ -2178,8 +2223,9 @@ static void hd_gl_init(void) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, violet);
-        fprintf(stdout, "psxrecomp: HD texture coverage-debug ON -- unreplaced opaque prims render solid violet\n");
     }
+    fprintf(stdout, "psxrecomp: HD texture coverage-debug %s -- unreplaced opaque prims render solid violet\n",
+            s_hd_debug_missing ? "ON" : "OFF");
 }
 
 /* Some pack PNGs (confirmed so far in a subset of Beetle-format assets, e.g.
@@ -2768,7 +2814,7 @@ static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type); 
 static GLuint s_fused_fbo = 0, s_fused_tex = 0;
 static int    s_fused_tex_w = 0, s_fused_tex_h = 0;
 static GLuint s_fused_blit_prog = 0;
-static GLint  s_fused_blit_uTex = -1, s_fused_blit_uTargetSize = -1;
+static GLint  s_fused_blit_uTex = -1, s_fused_blit_uTargetSize = -1, s_fused_blit_uTint = -1;
 static GLuint s_fused_blit_vao = 0, s_fused_blit_vbo = 0;
 
 static const char *FUSED_BLIT_VS =
@@ -2784,7 +2830,8 @@ static const char *FUSED_BLIT_FS =
     "#version 330\n"
     "in vec2 v_uv; out vec4 frag;\n"
     "uniform sampler2D u_tex;\n"
-    "void main(){ frag = texture(u_tex, v_uv); }\n";
+    "uniform vec3 u_tint;\n" /* debug marker multiply, see s_hd_tint_entry_cache_key; (1,1,1) = no-op */
+    "void main(){ vec4 c = texture(u_tex, v_uv); frag = vec4(c.rgb * u_tint, c.a); }\n";
 
 static void fused_blit_init(void) {
     if (s_fused_blit_prog) return;
@@ -2792,6 +2839,7 @@ static void fused_blit_init(void) {
     if (!s_fused_blit_prog) return;
     s_fused_blit_uTex = p_glGetUniformLocation(s_fused_blit_prog, "u_tex");
     s_fused_blit_uTargetSize = p_glGetUniformLocation(s_fused_blit_prog, "u_target_size");
+    s_fused_blit_uTint = p_glGetUniformLocation(s_fused_blit_prog, "u_tint");
     p_glGenVertexArrays(1, &s_fused_blit_vao);
     p_glBindVertexArray(s_fused_blit_vao);
     p_glGenBuffers(1, &s_fused_blit_vbo);
@@ -2806,9 +2854,13 @@ static void fused_blit_init(void) {
 /* Draws one destination rect [dx,dy,dw,dh] (composite pixel space) sampling
  * source UV rect [su,sv,sw,sh] (normalized 0..1) from `tex`, into whatever
  * FBO/viewport is currently bound. Two triangles, immediate VBO upload --
- * this only ever draws a handful of quads per fused composite. */
+ * this only ever draws a handful of quads per fused composite. tr/tg/tb
+ * multiply the sampled color (1,1,1 = unmodified) -- see
+ * s_hd_tint_entry_cache_key/s_hd_tint_native_fused for why a specific piece
+ * might want to stand out from its neighbours. */
 static void fused_blit_quad(GLuint tex, float dx, float dy, float dw, float dh,
-                            float su, float sv, float sw, float sh) {
+                            float su, float sv, float sw, float sh,
+                            float tr, float tg, float tb) {
     const float verts[6 * 4] = {
         dx,      dy,      su,      sv,
         dx + dw, dy,      su + sw, sv,
@@ -2817,6 +2869,7 @@ static void fused_blit_quad(GLuint tex, float dx, float dy, float dw, float dh,
         dx + dw, dy + dh, su + sw, sv + sh,
         dx,      dy + dh, su,      sv + sh,
     };
+    p_glUniform3f(s_fused_blit_uTint, tr, tg, tb);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     p_glBindVertexArray(s_fused_blit_vao);
@@ -2837,8 +2890,9 @@ static void fused_blit_quad(GLuint tex, float dx, float dy, float dw, float dh,
  * u_offset/v_offset the same way it would for any other origin shift:
  * u_offset = -u_first * u_scale, v_offset = -v_first * v_scale. */
 static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
-                                    uint32_t hd_cache_key, const char *hd_png_path,
-                                    float hd_upload_w_texels, float hd_upload_h,
+                                    const uint32_t *hd_cache_keys, const char *const *hd_png_paths,
+                                    const float *hd_upload_w_texels, const float *hd_upload_h,
+                                    int entry_count,
                                     float *u_scale_out, float *v_scale_out) {
     fused_blit_init();
     if (!s_fused_blit_prog) return 0;
@@ -2882,10 +2936,22 @@ static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
     p_glUniform1i(s_fused_blit_uTex, 0);
     p_glUniform2f(s_fused_blit_uTargetSize, (float)comp_w, (float)comp_h);
 
-    GLuint hd_tex = 0;
-    int need_hd = 0;
-    for (int i = 0; i < count; i++) if (pieces[i].has_hd) { need_hd = 1; break; }
-    if (need_hd) hd_tex = hd_gl_get_texture(hd_cache_key, hd_png_path);
+    /* One GL texture lookup per distinct entry a piece actually references
+     * (not per piece -- several pieces routinely share the same upload, e.g.
+     * a heavily-fragmented one), indexed by hd_entry_idx. */
+    GLuint hd_texs[GPU_HD_FUSED_MAX_ENTRIES] = {0};
+    int hd_entry_bad = 0;
+    for (int i = 0; i < count; i++) {
+        if (!pieces[i].has_hd) continue;
+        const int e = pieces[i].hd_entry_idx;
+        if (e < 0 || e >= entry_count) { hd_entry_bad = 1; break; }
+        if (!hd_texs[e])
+            hd_texs[e] = hd_gl_get_texture(hd_cache_keys[e], hd_png_paths[e]);
+    }
+    if (hd_entry_bad) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+        return 0;
+    }
 
     /* Pieces exactly tile `want` in the LOGICAL layout (computed via exact
      * rectangle subtraction in hd_texture_pack.cpp, no gaps or overlaps by
@@ -2921,10 +2987,21 @@ static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
         const float dx = p->x * FUSED_COMPOSITE_SCALE, dy = p->y * FUSED_COMPOSITE_SCALE;
         const float dw = p->width * FUSED_COMPOSITE_SCALE, dh = p->height * FUSED_COMPOSITE_SCALE;
         if (p->has_hd) {
-            if (!hd_tex || hd_upload_w_texels <= 0.0f || hd_upload_h <= 0.0f) { ok = 0; break; }
-            fused_blit_quad(hd_tex, dx, dy, dw, dh,
-                            p->hd_src_x / hd_upload_w_texels, p->hd_src_y / hd_upload_h,
-                            p->width / hd_upload_w_texels, p->height / hd_upload_h);
+            const int e = p->hd_entry_idx;
+            if (e < 0 || e >= entry_count) { ok = 0; break; }
+            const GLuint hd_tex = hd_texs[e];
+            const float w_texels = hd_upload_w_texels[e], h_texels = hd_upload_h[e];
+            if (!hd_tex || w_texels <= 0.0f || h_texels <= 0.0f) { ok = 0; break; }
+            {
+                float tr = 1.0f, tg = 1.0f, tb = 1.0f;
+                if (s_hd_tint_entry_cache_key && hd_cache_keys[e] == s_hd_tint_entry_cache_key) {
+                    tr = s_hd_tint_entry_r; tg = s_hd_tint_entry_g; tb = s_hd_tint_entry_b;
+                }
+                fused_blit_quad(hd_tex, dx, dy, dw, dh,
+                                p->hd_src_x / w_texels, p->hd_src_y / h_texels,
+                                p->width / w_texels, p->height / h_texels,
+                                tr, tg, tb);
+            }
         } else {
             const float ndx = dx - kPiecePadPx, ndy = dy - kPiecePadPx;
             const float ndw = dw + 2.0f * kPiecePadPx, ndh = dh + 2.0f * kPiecePadPx;
@@ -2943,7 +3020,13 @@ static GLuint build_fused_composite(const GpuHdFusedPiece *pieces, int count,
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pw, ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, p->native_rgba);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
             native_tmp_texs[native_tmp_count++] = tmp;
-            fused_blit_quad(tmp, ndx, ndy, ndw, ndh, 0.0f, 0.0f, 1.0f, 1.0f);
+            {
+                float tr = 1.0f, tg = 1.0f, tb = 1.0f;
+                if (s_hd_tint_native_fused) {
+                    tr = s_hd_tint_native_r; tg = s_hd_tint_native_g; tb = s_hd_tint_native_b;
+                }
+                fused_blit_quad(tmp, ndx, ndy, ndw, ndh, 0.0f, 0.0f, 1.0f, 1.0f, tr, tg, tb);
+            }
         }
     }
 
@@ -3050,6 +3133,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             hd_tex = hd_gl_get_texture(hd_entry_id, hd_png_path);
         }
         if (hd_tex) {
+            if (s_hd_tint_entry_cache_key && hd_entry_id == s_hd_tint_entry_cache_key) {
+                hd_tint_r = s_hd_tint_entry_r; hd_tint_g = s_hd_tint_entry_g; hd_tint_b = s_hd_tint_entry_b;
+            }
             flush_flat_batch();
             flush_tex_batch();
             draw_hd_replacement_triangle(xs, ys, us, vs, col, rawtex, hd_tex,
@@ -3064,19 +3150,23 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * (including the feature being off) returns 0 and this whole block
          * is a no-op, falling straight through to native like before. */
         if (hd_backend == 1 && gpu_hd_texture_fusion_enabled()) {
-            uint32_t fused_cache_key = 0;
-            const char *fused_png_path = NULL;
-            float fused_upload_w = 0, fused_upload_h = 0;
+            uint32_t fused_cache_keys[GPU_HD_FUSED_MAX_ENTRIES] = {0};
+            const char *fused_png_paths[GPU_HD_FUSED_MAX_ENTRIES] = {0};
+            float fused_upload_w[GPU_HD_FUSED_MAX_ENTRIES] = {0};
+            float fused_upload_h[GPU_HD_FUSED_MAX_ENTRIES] = {0};
+            int fused_entry_count = 0;
             GpuHdFusedPiece fused_pieces[GPU_HD_FUSED_MAX_PIECES];
             int fused_count = 0;
             if (gpu_hd_texture_pack_match_fused(
                     texpage, clut_x, clut_y, lim[0], lim[2], lim[1], lim[3],
-                    &fused_cache_key, &fused_png_path, &fused_upload_w, &fused_upload_h,
+                    fused_cache_keys, fused_png_paths, fused_upload_w, fused_upload_h,
+                    GPU_HD_FUSED_MAX_ENTRIES, &fused_entry_count,
                     fused_pieces, GPU_HD_FUSED_MAX_PIECES, &fused_count)) {
                 float fused_u_scale = 0, fused_v_scale = 0;
                 GLuint fused_tex = build_fused_composite(
-                    fused_pieces, fused_count, fused_cache_key, fused_png_path,
-                    fused_upload_w, fused_upload_h, &fused_u_scale, &fused_v_scale);
+                    fused_pieces, fused_count, fused_cache_keys, fused_png_paths,
+                    fused_upload_w, fused_upload_h, fused_entry_count,
+                    &fused_u_scale, &fused_v_scale);
                 if (fused_tex) {
                     s_hd_matches_seen++;
                     flush_flat_batch();

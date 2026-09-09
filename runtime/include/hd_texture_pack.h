@@ -197,31 +197,70 @@ void hd_texture_pack_diag_font_region_stats(uint64_t out[5]);
 int hd_texture_pack_diag_dump_uploads(const HdTexturePack* pack, char* out,
                                       size_t out_capacity);
 
+/* 2026-09-08 multi-entry-candidate investigation: ring of the last ~64
+ * successful hd_texture_pack_match_fused calls -- which candidate upload(s)
+ * each picked and the exact pieces it resolved. hd_texture_pack_diag_dump_ring
+ * above only records PLAIN (non-fused) matches, so it says nothing about an
+ * animated (mouth/eye "gif") region that only ever resolves through the
+ * fused path. A ring (not just the last call) matters here because the fused
+ * path also handles small, frequent UI elements (dialogue-box glyphs, HUD
+ * icons) -- the single most recent call is as likely to be one of those as
+ * the specific character draw being investigated. Writes a JSON object BODY
+ * (no surrounding braces) with "total"/"recent" (array of
+ * {query,entries,pieces}) keys into out; truncates silently if out_capacity
+ * is too small. Returns 0 only for a null/zero-capacity out. */
+int hd_texture_pack_diag_dump_fused_last(char* out, size_t out_capacity);
+
+/* Ring of the last ~32 hd_texture_pack_match_fused FAILURES with a reason
+ * code (1=UV-wrapped/empty query, 2=ambiguous pack entry, 3=more than
+ * max_entries distinct candidate uploads, 4=no candidate's hash matched any
+ * pack entry, 5=more pieces than max_pieces, 6=fewer than 2 pieces), plus
+ * cumulative per-reason counts -- see hd_texture_pack_match_fused's
+ * g_hd_fused_fail_ring comment (hd_texture_pack.cpp) for why this exists:
+ * the success ring alone can't tell you why a SPECIFIC query never shows up
+ * in it. Writes a JSON object BODY (no braces) with
+ * "total"/"by_reason"/"recent" keys into out; truncates silently if
+ * out_capacity is too small. */
+int hd_texture_pack_diag_dump_fused_fails(char* out, size_t out_capacity);
+
 /* Fused-page support (opt-in, see gpu_hd_texture_fusion_set): a piece of a
  * partially-HD-covered query, in VRAM-absolute word(x)/texel(y) coordinates
  * -- the same space HdTextureDrawQuery's page_x/page_y + u/v use. has_hd
  * selects which of the two ways to fill it: the shared replacement PNG at
- * (hd_src_x, hd_src_y) within the upload's own texel space (upload width in
- * texels/height come back from hd_texture_pack_match_fused itself), or a
- * hd_texture_pack_decode_native_rgba() call using this rect directly. */
+ * (hd_src_x, hd_src_y) within THAT PNG's own texel space (its width/height
+ * come back in out_upload_width_words[hd_entry_idx]/out_upload_height[
+ * hd_entry_idx]), or a hd_texture_pack_decode_native_rgba() call using this
+ * rect directly. hd_entry_idx indexes out_entries[] -- pieces from
+ * DIFFERENT uploads/entries are common (see hd_texture_pack_match_fused's
+ * comment) and each keeps its own entry, not a single shared one. */
 typedef struct HdFusedPiece {
     uint16_t x, y, width, height;
     int has_hd;
     uint32_t hd_src_x, hd_src_y;
+    int hd_entry_idx; /* valid when has_hd; index into out_entries[]/out_upload_*[] */
 } HdFusedPiece;
 
 /* See hd_texture_pack.cpp's comment above the implementation for the exact
- * scope (one wanted rect, one partially-covering upload/entry -- the
- * dominant real case; anything else returns 0 so the caller keeps today's
- * single-shot hd_texture_pack_match/hd_texture_pack_match_draw behavior
- * unchanged). On success (1), *out_count pieces are written to out_pieces
- * (capacity max_pieces) and out_entry/out_upload_width_words/out_upload_height
- * describe the ONE replacement PNG the has_hd pieces reference. */
+ * scope (one wanted rect -- no UV wrap -- and up to max_entries distinct
+ * partially-covering uploads, each contributing whichever of its own
+ * fragments overlap the query; the FIRST candidate's fragments claim
+ * territory first, later candidates only cover what's left uncovered, so
+ * two candidates' fragments overlapping the same pixels never double-count).
+ * Anything outside that scope (UV wrap, more than max_entries distinct
+ * uploads, an ambiguous entry, more pieces than max_pieces) returns 0 so the
+ * caller keeps today's single-shot hd_texture_pack_match/
+ * hd_texture_pack_match_draw behavior unchanged. On success (1),
+ * *out_count pieces are written to out_pieces (capacity max_pieces) and
+ * *out_entry_count entries are written to out_entries/out_upload_width_words/
+ * out_upload_height (capacity max_entries), one per distinct replacement PNG
+ * referenced by at least one has_hd piece. */
 int hd_texture_pack_match_fused(HdTexturePack* pack,
                                 const HdTextureDrawQuery* query,
-                                HdTexturePackEntry* out_entry,
+                                HdTexturePackEntry* out_entries,
                                 uint16_t* out_upload_width_words,
                                 uint16_t* out_upload_height,
+                                int max_entries,
+                                int* out_entry_count,
                                 HdFusedPiece* out_pieces,
                                 int max_pieces,
                                 int* out_count);
@@ -242,9 +281,11 @@ int hd_texture_pack_match_fused_draw(HdTexturePack* pack,
                                      uint8_t v_last,
                                      const uint16_t* vram,
                                      size_t vram_word_count,
-                                     HdTexturePackEntry* out_entry,
+                                     HdTexturePackEntry* out_entries,
                                      uint16_t* out_upload_width_words,
                                      uint16_t* out_upload_height,
+                                     int max_entries,
+                                     int* out_entry_count,
                                      HdFusedPiece* out_pieces,
                                      int max_pieces,
                                      int* out_count,
