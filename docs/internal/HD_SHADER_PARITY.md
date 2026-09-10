@@ -206,6 +206,53 @@ load landing in an in-game menu instead of applying) and was not completed,
 but there is no code-level reason to expect divergent behavior between the
 two builds for this fix.
 
+### 4. Missing per-primitive clamp (native's real `v_limits`) — 🛠️ fixed
+
+Found via direct user report (a solid blue patch on a character's neck/
+collar, HD-backend-only) and confirmed root-caused by extracting the raw
+disc's ISO9660 filesystem and porting the relevant parts of the
+[morris/vstools](https://github.com/morris/vstools) SHP/WEP texture-decode
+logic (`WEPTextureMap.js`/`WEPPalette.js`/`VSTOOLS.js`'s `parseColor`) to
+Python, then decoding the affected character's `.SHP` file directly from
+the untouched disc data — completely independent of both our renderer and
+the community HD pack. That decode showed the SAME blue lines already
+baked into the ORIGINAL game texture: Vagrant Story packs multiple
+independent body-part UV regions (face, collar, torso, boots) into one
+shared 128x128 texture sheet per character, separated by the original
+game's own padding pixels. The community HD pack's export faithfully
+reproduced this real game content — **the 138 PNGs flagged earlier in this
+investigation as "corrupted" are not corrupted; cropping them would have
+been the wrong fix.**
+
+The real gap: item #2's fix (above) only prevents bleeding ACROSS separate
+pieces/uploads packed into a fused composite. It does nothing for bleeding
+WITHIN a single upload/single-PNG match that itself packs multiple
+independently-textured primitives sharing one texture (exactly this SHP
+case) — `hd_sample_bilinear` still only clamped to the whole texture (or
+whole fused piece), far coarser than native `fetch_texel`'s real clamp,
+which is scoped to `v_limits` — the exact sub-window declared per
+PRIMITIVE, not per upload. That's why `hd_backend none` never showed this:
+native's tight per-primitive clamp excludes the padding entirely; ours
+didn't.
+
+**Fix:** a new `u_prim_limits`/`u_has_prim_limits` uniform pair in
+`HD_FS`, intersected into `hd_sample_bilinear`'s existing bounds
+(`bounds.xy = max(bounds.xy, u_prim_limits.xy)`, similarly for `.zw`).
+Computed on the CPU side in `draw_hd_replacement_triangle` by mapping the
+primitive's own native texel sub-window (`orig_texinfo[5..8]`, i.e.
+`lim_u0/v0/u1/v1` — already threaded through for the mask-bit fix, item #1)
+through the SAME `u_scale`/`u_offset`/`v_scale`/`v_offset` affine remap
+already baked into that draw's vertex UVs, landing on the equivalent tight
+rectangle in the replacement texture's own pixel space. Disabled
+(`u_has_prim_limits=0`) for callers with no real underlying VRAM primitive
+(calibration test, coverage-debug marker), keeping their old behavior
+exactly. Intersects with (never widens beyond) the existing piece/whole-
+texture bound, so it's additive/safe for the fused path too.
+
+Verified live: the user confirmed the reported blue patch is gone after
+this fix, rebuilt and tested on the PGXP build against the exact reported
+scene.
+
 ## What's already confirmed solid (no further action needed)
 
 - Vertex position math: bit-identical between paths, proven with a synthetic
@@ -228,6 +275,15 @@ two builds for this fix.
    test that actually exercises a fused composite with multiple pieces —
    it hasn't been exercised by any scene tested this session since the
    feature is off by default.
+1b. The disc-extraction + vstools-port tooling built for resolved item #4
+   (`tools/`-adjacent scratch scripts, not yet committed anywhere permanent)
+   is a reusable asset: a ground-truth, gameplay-independent way to decode
+   any SHP/WEP character texture straight from the original disc data for
+   comparison against either the community pack or this renderer's own
+   output. Worth formalizing into a real tool if more texture-fidelity
+   questions come up (it already achieves ~92% success across all on-disc
+   .SHP/.WEP files; the ~8% failures are a contiguous ID range the
+   reference vstools implementation itself doesn't fully handle either).
 2. When touching `draw_hd_replacement_triangle` or `HD_FS` again, keep the
    `GL_BLEND`/`frag.a` interaction in mind (see resolved item #1's
    follow-on regression) — any future change that makes `frag.a` vary again

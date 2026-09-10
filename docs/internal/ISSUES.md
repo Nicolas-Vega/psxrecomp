@@ -1618,3 +1618,54 @@ edges, no fringe, cache-busted so the fix was actually exercised. See
 a note that the non-PGXP build shares this exact code path but a live
 non-PGXP repro attempt was cut short by an unrelated test-harness quirk
 (debug-savestate load landing in an in-game menu instead of applying).
+
+### Addendum 4 (same day): a fourth gap, root-caused by extracting the disc
+### itself — a solid color patch was genuine game content, not corruption
+
+A live user screenshot showed a solid blue patch on a character's neck/
+collar, HD-backend-only — visually distinct from Addendum 3's thin edge
+fringe (a filled polygon-shaped patch, not a 1-texel halo). Browsing the
+community HD pack's own PNG files turned up 138 files sharing an identical
+baked-in blue border, clustered into 6 base-texture groups — looked at
+first like pack corruption from whatever export tool processed those
+specific source images.
+
+To get a ground-truth answer independent of both the pack and this
+renderer, the disc's ISO9660 filesystem was extracted directly (reusing
+`probe_disc.py`'s existing sector-reading helpers) and the relevant parts
+of [morris/vstools](https://github.com/morris/vstools) (a Vagrant-Story-
+specific model/texture parser — `WEP.js`/`SHP.js`/`WEPTextureMap.js`/
+`WEPPalette.js`/`VSTOOLS.js`'s `parseColor`) were ported to Python from its
+cloned source, to decode the affected character's `.SHP` file straight
+from the untouched disc data. Result: the SAME blue lines are already
+present in the ORIGINAL game texture — Vagrant Story packs several
+independent body-part UV regions (face, collar, torso, boots) into one
+shared 128x128 sheet per character, separated by the game's own padding
+pixels. **The 138 flagged PNGs are not corrupted; they faithfully
+reproduce real game content.** Cropping them would have been the wrong
+fix entirely.
+
+The real gap was architectural: native `fetch_texel` clamps every sample to
+`v_limits`, the exact sub-window declared per PRIMITIVE (not per upload) —
+tight enough to exclude a neighbouring body part's padding even when it
+shares the same texture page. HD's `hd_sample_bilinear` only ever clamped
+to the whole texture (or, since Addendum 2's fix, the whole fused piece) —
+coarser than native's real per-primitive clamp, so bilinear filtering near
+an internal padding boundary (within a single upload, not just across
+fused pieces) could bleed the padding color into frame. Fixed by adding
+`u_prim_limits`/`u_has_prim_limits` to `HD_FS`, computed from the
+primitive's own native texel sub-window (already threaded through as
+`orig_texinfo` for the mask-bit fix) mapped into the replacement texture's
+pixel space, and intersected into `hd_sample_bilinear`'s existing bounds.
+See `HD_SHADER_PARITY.md`'s "Resolved items" #4 for the full writeup.
+
+User-confirmed live on the PGXP build against the exact reported scene:
+fixed.
+
+Lesson: a "the pack must be corrupted" hypothesis felt obvious from the
+PNG files alone, but disc-level ground truth (independent of both the pack
+and the renderer) is what actually distinguished "bad export" from "real
+game content our renderer doesn't clamp as tightly as native does" — worth
+reaching for that kind of independent verification earlier when a texture
+looks wrong, rather than assuming the most visible candidate (the pack) is
+the culprit.

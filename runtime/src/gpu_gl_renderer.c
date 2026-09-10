@@ -2146,6 +2146,9 @@ static GLint  s_hd_uVram = -1, s_hd_uMaskset = -1, s_hd_uOrigTpage = -1, s_hd_uO
  * ordinary single-PNG match; only the fused path ever sets it. */
 static GLint  s_hd_uPieceRects = -1, s_hd_uPieceCount = -1;
 #define HD_MAX_PIECE_RECTS 24  /* matches GPU_HD_FUSED_MAX_PIECES (gpu.h) */
+/* 2026-09-09: per-primitive clamp rect (mirrors native v_limits), see HD_FS's
+ * u_prim_limits/u_has_prim_limits comment. */
+static GLint  s_hd_uPrimLimits = -1, s_hd_uHasPrimLimits = -1;
 
 static const char *HD_VS =
     "#version 330\n"
@@ -2239,6 +2242,31 @@ static const char *HD_FS =
      * composite texture's own pixel space. */
     "uniform ivec4 u_piece_rects[24];\n"
     "uniform int u_piece_count;\n"
+    /* 2026-09-09: per-PRIMITIVE clamp rect, in this replacement texture's own
+     * pixel space -- mirrors native TEX_FS's v_limits (the exact sub-window a
+     * given primitive is declared to sample from within its VRAM upload,
+     * fetch_texel's own clamp). Computed on the CPU side in
+     * draw_hd_replacement_triangle from the primitive's native u_first/u_last/
+     * v_first/v_last (already threaded through as orig_texinfo for the mask-
+     * bit lookup) mapped through the SAME u_scale/u_offset/v_scale/v_offset
+     * used to bake this draw's vertex UVs. Needed because a single upload
+     * (and so a single replacement PNG, or a single fused piece) can itself
+     * pack MULTIPLE independently-textured primitives sharing one texture --
+     * e.g. a SHP character's 128x128 sheet with face/collar/torso/boots tiled
+     * into one image, separated by the original game's own padding pixels
+     * (confirmed by decoding the raw disc SHP data directly: those separator
+     * pixels are genuine baked-in game content, not a pack-authoring defect).
+     * Native never shows them because fetch_texel clamps every sample to
+     * THIS primitive's own declared sub-window; HD_FS previously only
+     * clamped to the whole texture (or whole piece), so hd_sample_bilinear's
+     * 4-tap footprint could cross a padding boundary into it under bilinear
+     * filtering -- reported live as a solid-colored (blue) patch bleeding
+     * onto a character's collar/neck, HD-backend-only. u_has_prim_limits=0
+     * (the calibration test, coverage-debug marker -- callers with no real
+     * underlying VRAM primitive to derive this from) keeps the old
+     * piece/whole-texture-only behavior exactly. */
+    "uniform ivec4 u_prim_limits;\n"
+    "uniform int u_has_prim_limits;\n"
     "ivec4 hd_piece_bounds(ivec2 texel, ivec2 whole_size) {\n"
     "  for (int i = 0; i < u_piece_count; i++) {\n"
     "    ivec4 r = u_piece_rects[i];\n"
@@ -2262,6 +2290,10 @@ static const char *HD_FS =
      * exists to prevent. */
     "  ivec4 bounds = (u_piece_count > 0) ? hd_piece_bounds(base, size)\n"
     "                                     : ivec4(0, 0, size.x - 1, size.y - 1);\n"
+    "  if (u_has_prim_limits != 0) {\n"
+    "    bounds.xy = max(bounds.xy, u_prim_limits.xy);\n"
+    "    bounds.zw = min(bounds.zw, u_prim_limits.zw);\n"
+    "  }\n"
     "  ivec2 ox = ivec2(int(uv_offs.x), 0), oy = ivec2(0, int(uv_offs.y));\n"
     "  vec4 c00 = hd_texelfetch_clamped(base, bounds);\n"
     "  vec4 c10 = hd_texelfetch_clamped(base + ox, bounds);\n"
@@ -2545,6 +2577,8 @@ static void hd_gl_init(void) {
     s_hd_uOrigLimits = p_glGetUniformLocation(s_hd_prog, "u_orig_limits");
     s_hd_uPieceRects = p_glGetUniformLocation(s_hd_prog, "u_piece_rects");
     s_hd_uPieceCount = p_glGetUniformLocation(s_hd_prog, "u_piece_count");
+    s_hd_uPrimLimits = p_glGetUniformLocation(s_hd_prog, "u_prim_limits");
+    s_hd_uHasPrimLimits = p_glGetUniformLocation(s_hd_prog, "u_has_prim_limits");
     p_glGenVertexArrays(1, &s_hd_vao);
     p_glBindVertexArray(s_hd_vao);
     p_glGenBuffers(1, &s_hd_vbo);
@@ -2572,6 +2606,7 @@ static void hd_gl_init(void) {
     p_glUniform3f(s_hd_uTint, 1.0f, 1.0f, 1.0f);
     p_glUniform1i(s_hd_uOrigDepth, -1);  /* sentinel: no orig-texel info yet -> force stp=1 */
     p_glUniform1i(s_hd_uPieceCount, 0);
+    p_glUniform1i(s_hd_uHasPrimLimits, 0);
     p_glUseProgram(0);
 
     const char *debug_missing_env = getenv("PSXRECOMP_HD_TEXTURE_DEBUG_MISSING");
@@ -3224,8 +3259,29 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
         p_glUniform2i(s_hd_uOrigClut, orig_texinfo[2], orig_texinfo[3]);
         p_glUniform1i(s_hd_uOrigDepth, orig_texinfo[4]);
         p_glUniform4i(s_hd_uOrigLimits, orig_texinfo[5], orig_texinfo[6], orig_texinfo[7], orig_texinfo[8]);
+        /* Map this primitive's own native texel sub-window (lim_u0/v0/u1/v1,
+         * orig_texinfo[5..8]) through the same affine remap already baked
+         * into this draw's vertex UVs (u_scale/u_offset/v_scale/v_offset), to
+         * get the equivalent tight sub-rect in the REPLACEMENT texture's own
+         * pixel space -- see u_prim_limits' shader-side comment for why this
+         * needs to be tighter than the whole-texture/whole-piece bound. */
+        float ru0 = ((float)orig_texinfo[5] * u_scale + u_offset) * (float)tex_w;
+        float ru1 = ((float)orig_texinfo[7] * u_scale + u_offset) * (float)tex_w;
+        float rv0 = ((float)orig_texinfo[6] * v_scale + v_offset) * (float)tex_h;
+        float rv1 = ((float)orig_texinfo[8] * v_scale + v_offset) * (float)tex_h;
+        int px0 = (int)floorf(ru0 < ru1 ? ru0 : ru1);
+        int px1 = (int)floorf(ru0 < ru1 ? ru1 : ru0);
+        int py0 = (int)floorf(rv0 < rv1 ? rv0 : rv1);
+        int py1 = (int)floorf(rv0 < rv1 ? rv1 : rv0);
+        if (px0 < 0) px0 = 0;
+        if (py0 < 0) py0 = 0;
+        if (px1 > tex_w - 1) px1 = tex_w - 1;
+        if (py1 > tex_h - 1) py1 = tex_h - 1;
+        p_glUniform4i(s_hd_uPrimLimits, px0, py0, px1, py1);
+        p_glUniform1i(s_hd_uHasPrimLimits, 1);
     } else {
         p_glUniform1i(s_hd_uOrigDepth, -1);  /* sentinel: no native texel info -> force stp=1 */
+        p_glUniform1i(s_hd_uHasPrimLimits, 0);
     }
     int clamped_piece_count = piece_count;
     if (clamped_piece_count > HD_MAX_PIECE_RECTS) clamped_piece_count = HD_MAX_PIECE_RECTS;
