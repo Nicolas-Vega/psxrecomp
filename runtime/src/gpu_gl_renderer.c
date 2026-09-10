@@ -3221,10 +3221,24 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
      * for the opt-in fused-page compositing caller only. piece_count=0 (the
      * ordinary single-PNG match, and every debug caller) keeps HD_FS's
      * whole-texture clamp, today's behavior. */
+    /* 2026-09-10: PGXP sub-pixel position parity fix. glb_set_precise_triangle
+     * stashes a refined float (16.16 -> float) position for "the next
+     * triangle" in s_pc_valid/s_pc_x/s_pc_y, and every NATIVE draw path
+     * (flush_tex_batch above, the GEO/flat paths) prefers it over the plain
+     * rounded-to-int xs[]/ys[] when present -- this HD-replacement path never
+     * did, always using (float)xs[i]/(float)ys[i] regardless. precise_consumed()
+     * (the caller, after this function returns) is what clears s_pc_valid, so
+     * it is still the correct, not-yet-superseded value for THIS triangle at
+     * this point -- simply never read here. Root-caused live: a character's
+     * arm-edge silhouette (isolated via the debug gradient/coverage overlay,
+     * which bypasses texture content entirely) rendered a genuinely different
+     * polygon shape under an HD backend vs `none`, and disabling GTE geometry
+     * correction (PGXP) made the two pixel-identical -- confirming this gap,
+     * not a shader/texture issue, was the cause. */
     float verts[3 * 10];
     for (int i = 0; i < 3; i++) {
-        verts[i * 10 + 0] = (float)xs[i];
-        verts[i * 10 + 1] = (float)ys[i];
+        verts[i * 10 + 0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
+        verts[i * 10 + 1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
         verts[i * 10 + 2] = (float)us[i] * u_scale + u_offset;
         verts[i * 10 + 3] = (float)vs[i] * v_scale + v_offset;
         verts[i * 10 + 4] = col[i * 3 + 0];

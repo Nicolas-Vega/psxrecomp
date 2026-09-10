@@ -1669,3 +1669,54 @@ game content our renderer doesn't clamp as tightly as native does" — worth
 reaching for that kind of independent verification earlier when a texture
 looks wrong, rather than assuming the most visible candidate (the pack) is
 the culprit.
+
+### Addendum 5 (next day): likely the real explanation for the earlier
+### "second, independent small-shift bug" — PGXP sub-pixel override never
+### reaching the HD draw path
+
+The user spotted, via the debug gradient/coverage overlay (which replaces
+color with a screen-space gradient, showing pure primitive silhouette with
+zero texture-content influence), that a character's arm-edge polygon
+rasterized to a genuinely different SHAPE — not a shift, a different
+taper — between `hd_backend none` and `beetle`. Proposed and ran a
+controlled methodology: since real per-frame animation could confound a
+naive two-screenshot diff, first measured pure-animation drift alone (a
+same-backend back-to-back capture pair, ~21px difference in the character
+region) as a baseline, then compared that against the none-vs-beetle diff
+(~1526px) — a 70x difference, ruling out animation as the explanation.
+User's own suggested next step (deliberately perturb candidate variables
+to isolate which one selectively affects the discrepancy) led straight to
+the answer: toggling GTE geometry correction (PGXP) off collapsed a tight
+before/after crop of the arm shape to 0 diff pixels (pixel-identical),
+down from 166 with it on.
+
+Root cause, confirmed by reading source rather than guessing further:
+`glb_set_precise_triangle` (`gpu_gl_renderer.c`) stashes a per-triangle,
+sub-pixel-accurate float position override (`s_pc_valid`/`s_pc_x`/
+`s_pc_y`) that PGXP computes. Every native draw path already prefers this
+over the plain rounded-to-integer position when present. The HD-
+replacement draw path (`draw_hd_replacement_triangle`) never checked it at
+all, unconditionally using the coarser rounded position — a real, silent
+parity gap, not a theory. Fixed by adding the same check there. Verified
+live: arm-shape tight-crop diff 166→62 (62% reduction), broader
+knight-region diff 1526→375 (75% reduction, vs the ~21px baseline).
+User-confirmed live afterward: no more visible gaps/artifacts on
+characters during casual play. Not fully closed — a smaller residual
+difference remains, cause not yet identified. See `HD_SHADER_PARITY.md`'s
+"Resolved items" #5 for the full technical writeup.
+
+This is very likely the same root cause as the "second, independent
+small-shift bug" documented earlier the same day above (a consistent
++1 to +2px directional shift in HD-replaced content, confirmed via
+burst-median comparison, at the time concluded to be moving texture
+content within a correctly-positioned polygon because HD_VS's position
+FORMULA was confirmed byte-identical to native's). That conclusion was
+correct as far as it went but incomplete in the same way the earlier
+ground-truth calibration test was (ISSUES.md #12's original finding,
+also since revisited by `HD_SHADER_PARITY.md` resolved item #5): an
+identical formula fed a different runtime INPUT is indistinguishable from
+a formula bug by static comparison alone. If so, the "matching real Beetle
+HW's own vertex-shader convention" research direction proposed as that
+issue's follow-up is likely no longer necessary — the actual gap was much
+narrower and specific to this project's own PGXP integration, not a
+fundamental convention mismatch with Beetle's rendering model at all.

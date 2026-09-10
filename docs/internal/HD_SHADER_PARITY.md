@@ -38,7 +38,7 @@ is out of scope by construction, not a gap.
 
 | Native (`TEX_VS`) | HD (`HD_VS`) | Verdict | Notes |
 |---|---|---|---|
-| `a_pos` (vec2) | `a_pos` (vec2) | ✅ | Identical screen-space (VRAM px) coordinates — confirmed byte-identical this session via the ground-truth checkerboard calibration test (ISSUES.md #12). |
+| `a_pos` (vec2) | `a_pos` (vec2) | 🛠️ *(was a real gap, see resolved item #5)* | The calibration test's byte-identical result (ISSUES.md #12) was real but incomplete: it only exercised the plain rounded-integer position, never PGXP's per-triangle sub-pixel override (`s_pc_valid`/`s_pc_x`/`s_pc_y`), which `draw_hd_replacement_triangle` silently never read at all. Fixed this session — see below. |
 | `a_uv` (vec2) | `a_uv` (vec2) | ✅ | Native PS1 texel coords; both paths apply their own remap after (native: `u_twin`/`v_limits` in the fragment shader; HD: `u_scale`/`u_offset` baked into the vertex, see `gpu.c`'s match functions). |
 | `a_col` (vec4) | `a_col` (vec3) | ✅ | Native carries an unused 4th (alpha) component the fragment shader never reads (`v_col.rgb` only) — dropping it in HD is not a functional difference. |
 | `a_tpage` (vec2) | *(none)* | 🔷 | Native needs this to know which VRAM texture-page to sample; HD samples a dedicated bound replacement texture instead, so there's no "page" concept. |
@@ -253,11 +253,58 @@ Verified live: the user confirmed the reported blue patch is gone after
 this fix, rebuilt and tested on the PGXP build against the exact reported
 scene.
 
+### 5. PGXP sub-pixel position never reaching the HD draw path — 🛠️ fixed (mostly)
+
+Found by direct user report: the debug gradient/coverage overlay
+(`u_silhouette_mode=2`, which replaces color with a screen-space gradient
+and so shows pure primitive silhouette with zero texture-content influence)
+revealed that a character's arm-edge polygon rasterized to a **genuinely
+different shape** — not a shift, a different taper/width — under `beetle`
+vs `none`, isolated via a tight before/after screenshot crop. Toggling GTE
+geometry correction (`pgxp geometry 0`) off made the two pixel-identical
+(0 diff in the tight crop, vs 166 with it on), pointing squarely at PGXP.
+
+Root cause, found by reading the source rather than guessing further:
+`glb_set_precise_triangle` stashes a refined, sub-pixel-accurate float
+position for "the next triangle" in file-static `s_pc_valid`/`s_pc_x`/
+`s_pc_y` (16.16 fixed converted to float). Every NATIVE draw path already
+prefers this over the plain rounded-to-int `xs[]`/`ys[]` when present
+(`flush_tex_batch`'s vertex fill: `s_pc_valid ? s_pc_x[i] : (float)xs[i]`).
+`draw_hd_replacement_triangle` never checked it at all — always
+`(float)xs[i]`. Since `precise_consumed()` (the caller, after the draw
+returns) is what clears `s_pc_valid`, the data was still the correct,
+not-yet-superseded value at the moment HD's draw ran; it was simply never
+read. This is the SAME class of "identical formula, different runtime
+inputs" gap as HD_VS's position formula being byte-for-byte identical to
+native's (true, and irrelevant — the bug was upstream of the shader
+entirely, in which position value got handed to it).
+
+**Fix:** `draw_hd_replacement_triangle`'s vertex-fill loop now checks
+`s_pc_valid` and substitutes `s_pc_x[i]`/`s_pc_y[i]` exactly like native's
+own fill logic. Verified live: the arm-shape tight-crop diff dropped from
+166 to 62 pixels (62% reduction) and the broader knight-region diff from
+1526 to 375 (75% reduction, vs a ~21px pure-animation baseline measured
+via a same-backend back-to-back control capture). User-confirmed live
+afterward: no more visible gaps/artifacts on characters in casual
+play-testing.
+
+**Not fully closed**: the reduction is large but not to zero/baseline —
+a smaller, not-yet-identified second contributor remains (candidates not
+yet checked: whether `s_pq`/the perspective-weight override has an
+analogous gap, or something else in the same "override stashed for the
+next triangle, only some consumers read it" family). Worth a dedicated
+follow-up if further artifacts are reported, but the dominant cause is
+fixed and user-verified live.
+
 ## What's already confirmed solid (no further action needed)
 
-- Vertex position math: bit-identical between paths, proven with a synthetic
-  ground-truth test with a known, hand-specified offset (ISSUES.md #12) —
-  this rules out any remaining "character position" concern.
+- Vertex position math: bit-identical between paths for the plain
+  (non-PGXP-overridden) case, proven with a synthetic ground-truth test
+  with a known, hand-specified offset (ISSUES.md #12) — that test used
+  affine-only, non-PGXP-precise content, so it never exercised the real
+  gap found and fixed in resolved item #5 above. With that fix in place,
+  the dominant "character position" concern is resolved, though item #5
+  notes a smaller residual difference not yet fully explained.
 - Perspective-correct vs. affine UV mapping: now matched (this session).
 - Gouraud/vertex-color shading: already matched (earlier session).
 - Texture-window tiling: correctly gated off (HD never attempts to replace a
