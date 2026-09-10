@@ -3273,6 +3273,18 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
         int px1 = (int)floorf(ru0 < ru1 ? ru1 : ru0);
         int py0 = (int)floorf(rv0 < rv1 ? rv0 : rv1);
         int py1 = (int)floorf(rv0 < rv1 ? rv1 : rv0);
+        /* 2026-09-09: a uniform 1px inward safety margin was tried here (to
+         * close a residual thin bleed at a tightly-packed SHP sheet's own
+         * edge) and reverted the same session: some rendered (not FMV --
+         * confirmed live) scenes assemble a background from MANY small
+         * texture chunks/tiles, each its own primitive with its own small
+         * u_prim_limits region, and shrinking every one of those by 1px per
+         * side collapsed them enough to turn the reassembled scene into a
+         * blocky mosaic (confirmed live). The exact rounding noise this was
+         * meant to guard against is real but narrow enough in practice that
+         * a blanket per-primitive erosion is the wrong tool -- if revisited,
+         * it needs to be conditional on region size/context (e.g. only for
+         * primitives well above small-tile size) rather than unconditional. */
         if (px0 < 0) px0 = 0;
         if (py0 < 0) py0 = 0;
         if (px1 > tex_w - 1) px1 = tex_w - 1;
