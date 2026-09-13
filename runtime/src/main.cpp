@@ -25,6 +25,8 @@
 #include "psx_savestate_menu.h"
 #include "psx_texpack_menu.h"
 #include "psx_font_picker_menu.h"
+#include "psx_cheats.h"
+#include "psx_cheats_menu.h"
 #include "host_osd.h"
 #include "host_keymap.h"
 #include "png_write.h"       /* png_write_rgb — present_shot readback */
@@ -6071,6 +6073,11 @@ static int savestate_menu_slot = 0;
 static int savestate_menu_ignore_toggle_release = 0;
 static SDL_Keycode savestate_menu_open_key = 0;
 
+/* Forward-declared here (defined further below, after texpack_menu) so the
+ * mutual-exclusion guards in savestate_menu_toggle/texpack_menu_toggle can
+ * reference it regardless of declaration order. */
+static int cheats_menu_open = 0;
+
 static void savestate_menu_sync_overlay(void) {
     psx_savestate_menu_set_state(savestate_menu_open, savestate_menu_slot);
 }
@@ -6082,7 +6089,7 @@ static void savestate_menu_close(void) {
 }
 
 static void savestate_menu_toggle(SDL_Keycode opened_by_key) {
-    if (psx_rewind_is_open())
+    if (psx_rewind_is_open() || cheats_menu_open)
         return;
     if (savestate_menu_open) {
         savestate_menu_close();
@@ -6329,7 +6336,7 @@ static void texpack_menu_close(void) {
 }
 
 static void texpack_menu_toggle(SDL_Keycode opened_by_key) {
-    if (psx_rewind_is_open() || savestate_menu_open)
+    if (psx_rewind_is_open() || savestate_menu_open || cheats_menu_open)
         return;
     if (texpack_menu_open) {
         texpack_menu_close();
@@ -6389,6 +6396,85 @@ static void texpack_menu_handle_key(SDL_Keycode key, SDL_Scancode scancode,
         texpack_menu_move(-1);
     } else if (key == SDLK_RIGHT || key == SDLK_DOWN) {
         texpack_menu_move(+1);
+    }
+}
+
+/* GameShark cheat browser (F11 default, HOST_KEYMAP_CHEATS_MENU; see
+ * psx_cheats_menu.h). Two navigation axes -- UP/DOWN move within the current
+ * category's item list, LEFT/RIGHT switch category -- mirroring the
+ * texpack menu's "cursor move applies immediately" feel: ENTER/SPACE
+ * toggles the highlighted cheat's enabled state right away via
+ * psx_cheats_set_enabled (effective next guest VBlank, see
+ * psx_cheats_apply_all in gpu.c), no separate confirm step. Keyboard-only
+ * for now, like the texpack menu. */
+static int cheats_menu_category = 0;
+static int cheats_menu_item = 0;
+static SDL_Keycode cheats_menu_open_key = 0;
+
+static void cheats_menu_sync_overlay(void) {
+    psx_cheats_menu_set_state(cheats_menu_open, cheats_menu_category, cheats_menu_item);
+}
+
+static void cheats_menu_close(void) {
+    cheats_menu_open = 0;
+    cheats_menu_sync_overlay();
+    host_osd_push("Cheats menu closed", 800);
+}
+
+static void cheats_menu_toggle(SDL_Keycode opened_by_key) {
+    if (psx_rewind_is_open() || savestate_menu_open || texpack_menu_open)
+        return;
+    if (cheats_menu_open) {
+        cheats_menu_close();
+        return;
+    }
+    cheats_menu_category = 0;
+    cheats_menu_item = 0;
+    cheats_menu_open = 1;
+    cheats_menu_open_key = opened_by_key;
+    cheats_menu_sync_overlay();
+}
+
+static void cheats_menu_move_item(int delta) {
+    const int count = psx_cheats_menu_category_item_count(cheats_menu_category);
+    if (count <= 0) return;
+    cheats_menu_item = (cheats_menu_item + delta + count) % count;
+    cheats_menu_sync_overlay();
+}
+
+static void cheats_menu_move_category(int delta) {
+    const int cat_count = psx_cheats_menu_category_count();
+    if (cat_count <= 0) return;
+    cheats_menu_category = (cheats_menu_category + delta + cat_count) % cat_count;
+    cheats_menu_item = 0;
+    cheats_menu_sync_overlay();
+}
+
+static void cheats_menu_toggle_selected(void) {
+    const int idx = psx_cheats_menu_absolute_index(cheats_menu_category, cheats_menu_item);
+    if (idx < 0) return;
+    psx_cheats_set_enabled(idx, !psx_cheats_is_enabled(idx));
+    cheats_menu_sync_overlay();
+}
+
+static void cheats_menu_handle_key(SDL_Keycode key, SDL_Scancode scancode,
+                                   int mod, int repeat) {
+    if (cheats_menu_open_key && key == cheats_menu_open_key) return;
+    if (!repeat &&
+        (host_keymap_match_event(HOST_KEYMAP_CHEATS_MENU, (int)key,
+                                 (int)scancode, mod) ||
+         key == SDLK_ESCAPE || key == SDLK_BACKSPACE)) {
+        cheats_menu_close();
+    } else if (key == SDLK_UP) {
+        cheats_menu_move_item(-1);
+    } else if (key == SDLK_DOWN) {
+        cheats_menu_move_item(+1);
+    } else if (!repeat && key == SDLK_LEFT) {
+        cheats_menu_move_category(-1);
+    } else if (!repeat && key == SDLK_RIGHT) {
+        cheats_menu_move_category(+1);
+    } else if (!repeat && (key == SDLK_RETURN || key == SDLK_SPACE)) {
+        cheats_menu_toggle_selected();
     }
 }
 
@@ -7039,6 +7125,51 @@ static void texpack_menu_host_pause_loop(void) {
     savestate_input_guard_arm();
 }
 
+/* Freeze guest in vblank present while the cheat browser is open, mirroring
+ * texpack_menu_host_pause_loop above. */
+static void cheats_menu_host_pause_loop(void) {
+    while (cheats_menu_open) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                psx_crash_trace_set_exit_origin("sdl_window_close");
+                shutdown_runtime();
+                std::exit(0);
+            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+                refresh_player_devices();
+            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                close_controller();
+                refresh_player_devices();
+            } else if (ev.type == SDL_KEYDOWN) {
+#if defined(PSX_SDL3)
+                const SDL_Keymod mod = ev.key.mod;
+                const SDL_Keycode key = ev.key.key;
+                const SDL_Scancode scancode = ev.key.scancode;
+                const int repeat = ev.key.repeat ? 1 : 0;
+#else
+                const Uint16 mod = ev.key.keysym.mod;
+                const SDL_Keycode key = ev.key.keysym.sym;
+                const SDL_Scancode scancode = ev.key.keysym.scancode;
+                const int repeat = ev.key.repeat ? 1 : 0;
+#endif
+                cheats_menu_handle_key(key, scancode, (int)mod, repeat);
+            } else if (ev.type == SDL_KEYUP) {
+#if defined(PSX_SDL3)
+                const SDL_Keycode key = ev.key.key;
+#else
+                const SDL_Keycode key = ev.key.keysym.sym;
+#endif
+                if (cheats_menu_open_key == key)
+                    cheats_menu_open_key = 0;
+            }
+        }
+        rewind_pause_present();
+        starvation_watchdog_heartbeat();
+        SDL_Delay(8);
+    }
+    savestate_input_guard_arm();
+}
+
 /* Spawns generate_font_pack.py for the currently-selected font and blocks
  * (this whole menu is already modal, so a synchronous wait here reads as
  * part of "generating," not as an unexplained freeze -- same reasoning as
@@ -7378,6 +7509,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     texpack_menu_toggle(key);
                 }
                 else if (!key_repeat &&
+                         host_keymap_match_event(HOST_KEYMAP_CHEATS_MENU,
+                                                 (int)key, (int)scancode,
+                                                 (int)mod)) {
+                    cheats_menu_toggle(key);
+                }
+                else if (!key_repeat &&
                          host_keymap_match_event(HOST_KEYMAP_RESTART_GAME,
                                                  (int)key, (int)scancode,
                                                  (int)mod)) {
@@ -7497,6 +7634,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             savestate_menu_host_pause_loop();
         if (texpack_menu_open)
             texpack_menu_host_pause_loop();
+        if (cheats_menu_open)
+            cheats_menu_host_pause_loop();
         if (psx_rewind_is_open())
             rewind_host_pause_loop();
     }
@@ -15038,6 +15177,10 @@ session_reboot:
         psx_rewind_set_depth((uint32_t)g_rewind_depth);
         psx_rewind_set_interval((uint32_t)g_rewind_interval);
         psx_rewind_configure(memory_get_bios_checksum(), game_entry_pc);
+        /* Enabled GameShark cheats persist as a small id-list sidecar beside
+         * the save states, same directory convention as savestate_configure
+         * just above. */
+        psx_cheats_configure((memcard_dir / "cheats.cfg").string().c_str());
         /* Headless / agent load: PSX_LOAD_SLOT=N stages slot load (0..11)
          * at the next safe block boundary after boot. */
         if (const char *ls = std::getenv("PSX_LOAD_SLOT")) {

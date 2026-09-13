@@ -105,6 +105,8 @@ static void apply_defaults(void) {
         add_bind(HOST_KEYMAP_TEXPACK_MENU, (int)SDLK_F10, (int)SDL_SCANCODE_F10, 0);
     if (s_actions[HOST_KEYMAP_RESTART_GAME].count == 0)
         add_bind(HOST_KEYMAP_RESTART_GAME, (int)SDLK_ESCAPE, (int)SDL_SCANCODE_ESCAPE, KMOD_SHIFT);
+    if (s_actions[HOST_KEYMAP_CHEATS_MENU].count == 0)
+        add_bind(HOST_KEYMAP_CHEATS_MENU, (int)SDLK_F11, (int)SDL_SCANCODE_F11, 0);
 }
 
 /* Parse one "Ctrl+Alt+PageUp" token into key+mods. */
@@ -166,6 +168,7 @@ static HostKeymapAction action_for_key(const char *name) {
     if (ieq(name, "TurboToggle")) return HOST_KEYMAP_TURBO_TOGGLE;
     if (ieq(name, "TexturePackMenu")) return HOST_KEYMAP_TEXPACK_MENU;
     if (ieq(name, "RestartGame")) return HOST_KEYMAP_RESTART_GAME;
+    if (ieq(name, "CheatsMenu")) return HOST_KEYMAP_CHEATS_MENU;
     return HOST_KEYMAP_ACTION_COUNT;
 }
 
@@ -340,6 +343,8 @@ const char *host_keymap_label(HostKeymapAction action, char *out, size_t cap) {
             snprintf(out, cap, "F10");
         else if (action == HOST_KEYMAP_RESTART_GAME)
             snprintf(out, cap, "Shift+Escape");
+        else if (action == HOST_KEYMAP_CHEATS_MENU)
+            snprintf(out, cap, "F11");
         return out;
     }
     b = &a->binds[0];

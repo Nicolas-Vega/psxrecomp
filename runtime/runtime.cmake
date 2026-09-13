@@ -350,6 +350,9 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_texpack_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_font_picker_menu.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_cheats.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_cheats_db.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_cheats_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
     ${PSXRECOMP_ROOT}/runtime/src/host_keymap.c

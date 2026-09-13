@@ -25,6 +25,7 @@
 #include "event_ring.h"
 #include "color_lut.h"
 #include "mod_runtime.h"
+#include "psx_cheats.h"
 #include "sio.h"
 #include "ws_cull_detect.h"
 #include "ws_aspect_cone_math.h"
@@ -3842,6 +3843,12 @@ void gpu_vblank_tick(void) {
     /* Trusted package-selected plugins run on guest VBlank, independent of
      * host presentation, pacing, turbo, or skipped frames. */
     mod_runtime_on_vblank();
+    /* GameShark-style cheats re-poke every enabled code's writes here too --
+     * same cadence real GameShark hardware uses, and independent of the
+     * mod_plugins activation/manifest system (cheats are individually
+     * toggled at runtime from psx_cheats_menu, not a launcher feature
+     * flag). */
+    psx_cheats_apply_all();
     /* Ape LOAD: RAM-only libcard waiter + idle-skip can starve sio_tick /
      * interrupt-check pumps; VBlank always runs. */
     {
