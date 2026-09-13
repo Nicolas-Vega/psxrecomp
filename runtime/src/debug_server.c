@@ -5637,6 +5637,18 @@ static void handle_hd_gradient_diag(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"diag\":%s}", id, buf);
 }
 
+static void handle_hd_recolor_diag(int id, const char *json)
+{
+    (void)json;
+    /* 2026-09-12: bumped from 2048 -- once per-index transparent_indices
+     * arrays were added to each entry's dump, HD_RECOLOR_DIAG_CAP (32)
+     * entries could exceed 2048 bytes and silently truncate mid-string,
+     * producing unparseable JSON on the debug_client.py side. */
+    char buf[16384];
+    gpu_hd_texture_recolor_diag_dump(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"diag\":%s}", id, buf);
+}
+
 /* Draw only (no synchronous capture) -- a same-call capture was tried and
  * confirmed WRONG (2026-09-09): it caught the frame mid-draw, before the
  * game's own GP0 stream for the currently-targeted half had finished (that
@@ -6562,6 +6574,712 @@ static void handle_gpu_frame_dump(int id, const char *json)
     debug_server_send_line(buf);
     free(buf);
     free(entries);
+}
+
+/* ---- Minimal self-contained PNG writer ------------------------------------
+ * Emits a valid 8-bit truecolor (RGB) PNG with zero external dependencies: the
+ * IDAT payload is a zlib stream whose DEFLATE body is "stored" (uncompressed)
+ * blocks. Bigger on disk than a compressed PNG, but a real PNG that every
+ * viewer (and the harness Read tool) accepts, and nothing new to link against
+ * — which keeps the self-contained static runtime self-contained. Moved up
+ * to here (its first use used to be the canonical screenshot handler further
+ * down) so gpu_capture_state's own screenshot.png write below has it in
+ * scope too. */
+#include "png_write.h"   /* png_write_rgb + zlib/CRC helpers (shared with Beetle) */
+
+/* gpu_capture_state -- deterministic-replay A/B capture, step 1 (see
+ * docs/internal/HD_RECOLOR_DETERMINISTIC_AB_CAPTURE_PLAN.md). Snapshots, as
+ * one bundle written under `dir` (must already exist -- caller creates it,
+ * same convention as gpu_frame_capture.py's --out handling):
+ *
+ *   vram.bin        raw 1024x512 uint16 VRAM mirror, row-major, LE
+ *   uploads.bin     the HD texture pack's upload-tracking wire blob
+ *   gp0_stream.json this frame's GP0 ring entries (same schema as
+ *                   gpu_frame_dump's response)
+ *   screenshot.png  reference image, only written for the live/newest frame
+ *   meta.json       counts, truncation flags, hd_backend, format note
+ *
+ * All four/five files are written from a single synchronous handler call so
+ * the bundle is internally consistent -- the game does not get a chance to
+ * advance between the VRAM read, the upload-tracker read, and the GP0 ring
+ * read, unlike issuing three separate round-trip commands would.
+ *
+ * gp0_stream.json includes VRAM-transfer opcodes (0x80 VRAM->VRAM copy, 0xA0
+ * CPU->VRAM image load) verbatim for attribution, but -- same as
+ * gpu_frame_dump -- their payload beyond the ring's GPU_GP0_RING_MAX_WORDS
+ * cap is NOT captured there. A replay must source VRAM CONTENT from
+ * vram.bin, never by replaying those opcodes from this stream; only the
+ * small drawing/state-setting opcodes (polygons, lines, rects, texpage/
+ * texwindow/mask-bit setters) are meant to be replayed through gpu_write_gp0. */
+static void handle_gpu_capture_state(int id, const char *json)
+{
+    char dir[480];
+    if (!json_get_str(json, "dir", dir, sizeof(dir))) {
+        send_err(id, "missing dir");
+        return;
+    }
+
+    if (gpu_gp0_ring_total() == 0) {
+        send_err(id, "gp0 ring empty -- is a game running?");
+        return;
+    }
+    uint32_t oldest = 0, newest = 0;
+    gpu_gp0_ring_frame_span(&oldest, &newest);
+    int frame_arg = json_get_int(json, "frame", -1);
+    uint32_t frame = frame_arg >= 0 ? (uint32_t)frame_arg : newest;
+
+    /* Sync the GPU-side FBO down to the CPU VRAM mirror first, same as
+     * screenshot_file -- otherwise a capture under the GL backend can read
+     * stale VRAM content that doesn't match what's actually on screen. */
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();
+    extern void vk_renderer_sync_cpu(void);
+    vk_renderer_sync_cpu();
+
+    char path[560];
+
+    /* --- vram.bin --- */
+    uint16_t *vram_buf = (uint16_t *)malloc(1024u * 512u * sizeof(uint16_t));
+    if (!vram_buf) { send_err(id, "alloc failed (vram)"); return; }
+    gpu_vram_snapshot(vram_buf);
+    snprintf(path, sizeof(path), "%s/vram.bin", dir);
+    FILE *fv = fopen(path, "wb");
+    if (!fv) { free(vram_buf); send_err(id, "cannot open vram.bin for write"); return; }
+    size_t vram_bytes = 1024u * 512u * sizeof(uint16_t);
+    size_t vram_written = fwrite(vram_buf, 1, vram_bytes, fv);
+    fclose(fv);
+    free(vram_buf);
+    if (vram_written != vram_bytes) { send_err(id, "vram.bin short write"); return; }
+
+    /* --- gpu_regs.bin -- draw-mode (E1-E6) + GP1 display-config registers,
+     * NOT covered by vram.bin/uploads.bin. See GpuCaptureRegs's comment
+     * (gpu.h) for why a replay needs this explicitly. */
+    GpuCaptureRegs regs;
+    gpu_regs_snapshot(&regs);
+    snprintf(path, sizeof(path), "%s/gpu_regs.bin", dir);
+    FILE *fr = fopen(path, "wb");
+    if (fr) {
+        fwrite(&regs, 1, sizeof(regs), fr);
+        fclose(fr);
+    }
+
+    /* --- uploads.bin --- */
+    uint8_t *upload_data = NULL;
+    size_t upload_size = 0;
+    int upload_ok = gpu_hd_texture_tracking_state_save(&upload_data, &upload_size);
+    if (upload_ok) {
+        snprintf(path, sizeof(path), "%s/uploads.bin", dir);
+        FILE *fu = fopen(path, "wb");
+        if (fu) {
+            fwrite(upload_data, 1, upload_size, fu);
+            fclose(fu);
+        }
+        free(upload_data);
+    }
+
+    /* --- gp0_stream.json (same field names as gpu_frame_dump's response,
+     * so existing tooling/parsers for that schema work unchanged here). --- */
+    int max_entries = 65536;
+    GpuGp0RingEntry *entries = (GpuGp0RingEntry *)malloc(
+        (size_t)max_entries * sizeof(GpuGp0RingEntry));
+    int n = 0;
+    if (entries) n = gpu_gp0_ring_dump_frame(frame, entries, max_entries);
+
+    int truncated = 0;
+    snprintf(path, sizeof(path), "%s/gp0_stream.json", dir);
+    FILE *fg = fopen(path, "wb");
+    if (fg) {
+        fprintf(fg, "{\"frame\":%u,\"count\":%d,\"max_words\":%u,\"entries\":[",
+                frame, n, gpu_gp0_ring_max_words());
+        for (int i = 0; i < n; i++) {
+            const GpuGp0RingEntry *e = &entries[i];
+            int this_truncated = e->n_words > GPU_GP0_RING_MAX_WORDS;
+            if (this_truncated) truncated++;
+            fprintf(fg,
+                "%s{\"seq\":%u,\"op\":\"0x%02X\",\"n\":%u,\"truncated\":%s,"
+                "\"src\":\"0x%08X\",\"ot\":%u,\"pc\":\"0x%08X\","
+                "\"func\":\"0x%08X\",\"ra\":\"0x%08X\",\"w\":[",
+                i ? "," : "", e->seq, e->opcode, e->n_words,
+                this_truncated ? "true" : "false",
+                e->src_addr, (unsigned)e->ot_rank, e->pc, e->func, e->ra);
+            int show = e->n_words < GPU_GP0_RING_MAX_WORDS
+                     ? e->n_words : GPU_GP0_RING_MAX_WORDS;
+            for (int k = 0; k < show; k++)
+                fprintf(fg, "%s\"0x%08X\"", k ? "," : "", e->cmd[k]);
+            fprintf(fg, "]");
+            if (e->opcode == 0x80) {
+                fprintf(fg, ",\"csp\":\"0x%08X\",\"bld\":[", e->csp);
+                for (int k = 0; k < 6 && e->bld[k]; k++)
+                    fprintf(fg, "%s\"0x%08X\"", k ? "," : "", e->bld[k]);
+                fprintf(fg, "]");
+            }
+            fprintf(fg, "}");
+        }
+        fprintf(fg, "]}");
+        fclose(fg);
+    }
+    free(entries);
+
+    /* --- screenshot.png (reference only; only meaningful for the live/
+     * newest frame -- a historical frame's framebuffer is long gone, same
+     * caveat as gpu_frame_capture.py's --no-shot logic). --- */
+    int wrote_screenshot = 0;
+    if (frame == newest) {
+        GpuDisplayInfo di;
+        gpu_get_display_info(&di);
+        if (!di.disabled && di.width && di.height) {
+            uint32_t w = di.width;  if (w > 640) w = 640;
+            uint32_t h = di.height; if (h > 512) h = 512;
+            uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+            if (rgb) {
+                for (uint32_t y = 0; y < h; y++) {
+                    for (uint32_t x = 0; x < w; x++) {
+                        uint8_t r, g, b;
+                        gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+                        uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+                        p[0] = r; p[1] = g; p[2] = b;
+                    }
+                }
+                snprintf(path, sizeof(path), "%s/screenshot.png", dir);
+                FILE *fs = fopen(path, "wb");
+                if (fs) {
+                    wrote_screenshot = png_write_rgb(fs, rgb, w, h);
+                    fclose(fs);
+                }
+                free(rgb);
+            }
+        }
+    }
+
+    /* --- meta.json --- */
+    snprintf(path, sizeof(path), "%s/meta.json", dir);
+    FILE *fm = fopen(path, "wb");
+    if (fm) {
+        fprintf(fm,
+            "{\"kind\":\"psx-gpu-capture-state\",\"version\":1,\"frame\":%u,"
+            "\"ring_oldest\":%u,\"ring_newest\":%u,\"gp0_entries\":%d,"
+            "\"gp0_truncated_entries\":%d,\"vram_bytes\":%llu,"
+            "\"uploads_bytes\":%llu,\"uploads_ok\":%s,\"hd_backend\":%d,"
+            "\"has_screenshot\":%s,\"max_words\":%u,"
+            "\"note\":\"gp0_stream.json includes VRAM-transfer opcodes "
+            "(0x80/0xA0/0xC0) verbatim for attribution, but their payload "
+            "beyond the ring's word cap is NOT captured there -- a replay "
+            "must source VRAM content from vram.bin, never by replaying "
+            "those opcodes from this stream.\"}\n",
+            frame, oldest, newest, n, truncated,
+            (unsigned long long)vram_bytes, (unsigned long long)upload_size,
+            upload_ok ? "true" : "false", gpu_hd_texture_get_backend(),
+            wrote_screenshot ? "true" : "false",
+            gpu_gp0_ring_max_words());
+        fclose(fm);
+    }
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"dir\":\"%s\",\"frame\":%u,"
+             "\"ring_oldest\":%u,\"ring_newest\":%u,\"gp0_entries\":%d,"
+             "\"gp0_truncated_entries\":%d,\"vram_bytes\":%llu,"
+             "\"uploads_bytes\":%llu,\"uploads_ok\":%s,\"has_screenshot\":%s}",
+             id, dir, frame, oldest, newest, n, truncated,
+             (unsigned long long)vram_bytes, (unsigned long long)upload_size,
+             upload_ok ? "true" : "false", wrote_screenshot ? "true" : "false");
+}
+
+/* Loads a whole file into a malloc'd buffer. Returns NULL (and leaves
+ * *out_size untouched) on any failure, including a zero-byte file -- callers
+ * that need to distinguish "absent" from "empty" check the file's presence
+ * themselves first. */
+static uint8_t *read_whole_file(const char *path, size_t *out_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    uint8_t *buf = (uint8_t *)malloc((size_t)size);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) { free(buf); return NULL; }
+    *out_size = (size_t)size;
+    return buf;
+}
+
+static int gp0_opcode_is_drawing_for_isolate(uint8_t op) {
+    return op == 0x02 || (op >= 0x20 && op <= 0x7F);
+}
+
+/* One backend's isolation pass -- factored out of handle_gpu_replay_isolate
+ * so both backends run inside ONE atomic debug-command call (see that
+ * function's header comment for why: two separate round-trips left a gap
+ * for the LIVE game to run real frames in between, leaving backend B's pass
+ * starting from different ambient GL-renderer state -- batched-but-not-yet-
+ * flushed primitives, in particular -- than backend A's pass saw. Nothing
+ * about VRAM/tracker/backend selection explains that; it was a leftover
+ * side effect of splitting the two passes across two calls.)
+ *
+ * `cap_vram`/`cap_uploads`/`cap_regs` are re-applied fresh for THIS pass
+ * (never shared with a sibling pass's mutations). `cap_regs` restores the
+ * draw-mode + GP1 display-config registers (see GpuCaptureRegs's comment,
+ * gpu.h) -- without this, gpu_get_display_info() below reads whatever the
+ * LIVE game's display config happens to be at call time, which is a
+ * SEPARATE state machine the replayed GP0 words never touch, and made
+ * fill-rect/readback bounds silently drift between otherwise-identical
+ * replay passes. Before drawing anything, this also forces an extra
+ * sync-and-discard: whatever the live game had queued in the renderer's
+ * flat/tex batches in the moments just before this command ran gets
+ * flushed out here, so it can't be silently swept up into THIS pass's
+ * first primitive's diff. */
+static void isolate_one_backend(const uint16_t *cap_vram, const uint8_t *cap_uploads,
+                                size_t cap_uploads_size, const GpuCaptureRegs *cap_regs,
+                                int has_regs, const uint32_t *words,
+                                size_t words_count, int backend, const char *out_dir,
+                                uint32_t chroma_r, uint32_t chroma_g, uint32_t chroma_b,
+                                int *out_total_drawing, int *out_wrote_files)
+{
+    extern void gl_renderer_sync_cpu(void);
+    extern void vk_renderer_sync_cpu(void);
+
+    gpu_vram_restore(cap_vram);
+    gpu_hd_texture_tracking_state_load(cap_uploads, cap_uploads_size);
+    gpu_hd_texture_set_backend(backend);
+    if (has_regs) gpu_regs_restore(cap_regs);
+    /* MUST run before replaying a single word below: without it, a stuck
+     * GP0 command-assembly state left over from a PREVIOUS pass (or from
+     * whatever the live game was mid-command on when this debug command
+     * ran) silently corrupts this pass's entire replay. See
+     * gpu_gp0_parser_reset's header comment in gpu.h. */
+    gpu_gp0_parser_reset();
+
+    /* Flush-and-discard: clears any batch the live game left mid-flight
+     * right before this command ran. The readback itself is thrown away --
+     * only its side effect (forcing flush_flat_batch/flush_tex_batch) is
+     * wanted here. */
+    gl_renderer_sync_cpu();
+    vk_renderer_sync_cpu();
+
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    uint32_t w = 0, h = 0;
+    int ok = !di.disabled && di.width && di.height;
+    if (ok) {
+        w = di.width;  if (w > 640) w = 640;
+        h = di.height; if (h > 512) h = 512;
+    }
+    if (!ok) return;
+
+    uint8_t *prev_rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    uint8_t *cur_rgb  = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!prev_rgb || !cur_rgb) { free(prev_rgb); free(cur_rgb); return; }
+
+    int total_drawing = 0, wrote_files = 0;
+    char path[560];
+
+    /* Synthetic GP0(02) fill, exact same encoding gp0_exec_fill_rect
+     * decodes (word0=0x02BBGGRR, word1=Y<<16|X, word2=H<<16|W, all in
+     * ABSOLUTE VRAM coordinates -- fill ignores draw area/offset). */
+    gpu_write_gp0(0x02000000u | (chroma_b << 16) | (chroma_g << 8) | chroma_r);
+    gpu_write_gp0(((uint32_t)di.display_y << 16) | ((uint32_t)di.display_x & 0x3F0u));
+    gpu_write_gp0((h << 16) | w);
+
+    gl_renderer_sync_cpu();
+    vk_renderer_sync_cpu();
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t r, g, b;
+            gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+            uint8_t *p = prev_rgb + ((size_t)y * w + x) * 3;
+            p[0] = r; p[1] = g; p[2] = b;
+        }
+
+    snprintf(path, sizeof(path), "%s/isolate_manifest.json", out_dir);
+    FILE *manifest = fopen(path, "wb");
+    if (manifest) {
+        fprintf(manifest, "{\"backend\":%d,\"width\":%u,\"height\":%u,"
+                "\"chroma\":[%u,%u,%u],\"entries\":[",
+                backend, w, h, chroma_r, chroma_g, chroma_b);
+    }
+
+    size_t i = 0;
+    int first_entry = 1;
+    while (i < words_count) {
+        if (i + 2 > words_count) break;
+        uint32_t seq = words[i++];
+        uint32_t n = words[i++];
+        if (n == 0 || i + n > words_count) break;
+        uint8_t opcode = (uint8_t)(words[i] >> 24);
+        for (uint32_t k = 0; k < n; k++) gpu_write_gp0(words[i + k]);
+        i += n;
+
+        if (!gp0_opcode_is_drawing_for_isolate(opcode)) continue;
+        int index = total_drawing++;
+
+        gl_renderer_sync_cpu();
+        vk_renderer_sync_cpu();
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                uint8_t r, g, b;
+                gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+                uint8_t *p = cur_rgb + ((size_t)y * w + x) * 3;
+                p[0] = r; p[1] = g; p[2] = b;
+            }
+
+        int minx = -1, miny = -1, maxx = -1, maxy = -1, changed_px = 0;
+        for (uint32_t y = 0; y < h; y++) {
+            for (uint32_t x = 0; x < w; x++) {
+                size_t o = ((size_t)y * w + x) * 3;
+                if (cur_rgb[o] != prev_rgb[o] || cur_rgb[o + 1] != prev_rgb[o + 1] ||
+                    cur_rgb[o + 2] != prev_rgb[o + 2]) {
+                    if (minx < 0 || (int)x < minx) minx = (int)x;
+                    if (miny < 0 || (int)y < miny) miny = (int)y;
+                    if ((int)x > maxx) maxx = (int)x;
+                    if ((int)y > maxy) maxy = (int)y;
+                    changed_px++;
+                }
+            }
+        }
+
+        char filename[32];
+        filename[0] = '\0';
+        if (minx >= 0) {
+            uint32_t cw = (uint32_t)(maxx - minx + 1), ch = (uint32_t)(maxy - miny + 1);
+            uint8_t *crop = (uint8_t *)malloc((size_t)cw * ch * 3);
+            if (crop) {
+                for (uint32_t y = 0; y < ch; y++)
+                    memcpy(crop + (size_t)y * cw * 3,
+                           cur_rgb + ((size_t)(miny + y) * w + (uint32_t)minx) * 3,
+                           (size_t)cw * 3);
+                snprintf(filename, sizeof(filename), "iso_%04d.png", index);
+                snprintf(path, sizeof(path), "%s/%s", out_dir, filename);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    if (png_write_rgb(fp, crop, cw, ch)) wrote_files++;
+                    else filename[0] = '\0';
+                    fclose(fp);
+                } else {
+                    filename[0] = '\0';
+                }
+                free(crop);
+            }
+        }
+
+        if (manifest) {
+            if (filename[0]) {
+                fprintf(manifest,
+                    "%s{\"index\":%d,\"seq\":%u,\"op\":\"0x%02X\",\"file\":\"%s\","
+                    "\"bbox\":[%d,%d,%d,%d],\"changed_px\":%d}",
+                    first_entry ? "" : ",", index, seq, opcode, filename,
+                    minx, miny, maxx, maxy, changed_px);
+            } else {
+                fprintf(manifest,
+                    "%s{\"index\":%d,\"seq\":%u,\"op\":\"0x%02X\",\"file\":null,"
+                    "\"bbox\":null,\"changed_px\":%d}",
+                    first_entry ? "" : ",", index, seq, opcode, changed_px);
+            }
+            first_entry = 0;
+        }
+
+        uint8_t *tmp = prev_rgb; prev_rgb = cur_rgb; cur_rgb = tmp;
+    }
+
+    if (manifest) {
+        fprintf(manifest, "]}");
+        fclose(manifest);
+    }
+
+    free(prev_rgb); free(cur_rgb);
+    *out_total_drawing = total_drawing;
+    *out_wrote_files = wrote_files;
+}
+
+/* gpu_replay_isolate -- deterministic-replay A/B, step 3 (see
+ * docs/internal/HD_RECOLOR_DETERMINISTIC_AB_CAPTURE_PLAN.md). Same restored
+ * VRAM/tracker/backend + replay_words.bin as gpu_replay_capture, but instead
+ * of one composited screenshot, isolates each drawing primitive's OWN pixel
+ * contribution: clear the display region to a flat chroma-key color via a
+ * synthetic GP0(02) fill (fed through gpu_write_gp0, so it's the real
+ * fill-rect handler, not a raw memset), then replay the stream in order,
+ * snapshotting the display after every drawing-opcode entry (0x02 fill,
+ * 0x20-0x7F polygon/line/rect). Each snapshot is diffed against the
+ * PREVIOUS one (or the chroma-cleared canvas for the first) -- the changed
+ * pixels are exactly that primitive's contribution, real rasterization
+ * output from the real draw calls, never a reimplementation. Writes one
+ * cropped RGB PNG per primitive that changed any pixels (iso_NNNN.png) plus
+ * isolate_manifest.json indexing EVERY drawing entry (seq/op/bbox/changed
+ * pixel count, file or null) so results line up against gp0_stream.json's
+ * own per-entry attribution (func/pc/ra).
+ *
+ * BOTH backends run inside this ONE atomic call (see isolate_one_backend's
+ * comment for why a two-call split was wrong) -- backend_a/out_dir_a and
+ * backend_b/out_dir_b, mirroring gpu_replay_capture's two-pass shape.
+ * Restores the live game's VRAM/tracker/backend unconditionally before
+ * returning, same discipline as gpu_replay_capture. */
+static void handle_gpu_replay_isolate(int id, const char *json)
+{
+    char dir[480];
+    if (!json_get_str(json, "dir", dir, sizeof(dir))) {
+        send_err(id, "missing dir");
+        return;
+    }
+    /* Inputs (vram.bin/uploads.bin/replay_words.bin) always come from `dir`
+     * -- one bundle, shared by both backends compared against it. Outputs
+     * (iso_*.png, isolate_manifest.json) go to out_dir_a/out_dir_b instead
+     * -- distinct per-backend subdirectories (created client-side
+     * beforehand, same convention as gpu_capture_state.py) so the two
+     * backends' outputs never collide. */
+    char out_dir_a[480], out_dir_b[480];
+    if (!json_get_str(json, "out_dir_a", out_dir_a, sizeof(out_dir_a)) ||
+        !json_get_str(json, "out_dir_b", out_dir_b, sizeof(out_dir_b))) {
+        send_err(id, "missing out_dir_a/out_dir_b");
+        return;
+    }
+    int backend_a = json_get_int(json, "backend_a", 0);
+    int backend_b = json_get_int(json, "backend_b", 2);
+    uint32_t chroma_r = (uint32_t)json_get_int(json, "chroma_r", 255);
+    uint32_t chroma_g = (uint32_t)json_get_int(json, "chroma_g", 0);
+    uint32_t chroma_b = (uint32_t)json_get_int(json, "chroma_b", 255);
+
+    char path[560];
+    const size_t vram_bytes = 1024u * 512u * sizeof(uint16_t);
+
+    snprintf(path, sizeof(path), "%s/vram.bin", dir);
+    size_t got_size = 0;
+    uint8_t *cap_vram_raw = read_whole_file(path, &got_size);
+    if (!cap_vram_raw || got_size != vram_bytes) {
+        free(cap_vram_raw);
+        send_err(id, "cannot read vram.bin (missing or wrong size)");
+        return;
+    }
+    uint16_t *cap_vram = (uint16_t *)cap_vram_raw;
+
+    snprintf(path, sizeof(path), "%s/uploads.bin", dir);
+    size_t cap_uploads_size = 0;
+    uint8_t *cap_uploads = read_whole_file(path, &cap_uploads_size);
+
+    snprintf(path, sizeof(path), "%s/gpu_regs.bin", dir);
+    size_t cap_regs_size = 0;
+    uint8_t *cap_regs_raw = read_whole_file(path, &cap_regs_size);
+    int has_regs = cap_regs_raw && cap_regs_size == sizeof(GpuCaptureRegs);
+    GpuCaptureRegs cap_regs;
+    if (has_regs) memcpy(&cap_regs, cap_regs_raw, sizeof(cap_regs));
+    free(cap_regs_raw);
+
+    snprintf(path, sizeof(path), "%s/replay_words.bin", dir);
+    size_t words_bytes = 0;
+    uint8_t *words_raw = read_whole_file(path, &words_bytes);
+    if (!words_raw || words_bytes < 2 * sizeof(uint32_t)) {
+        free(cap_vram); free(cap_uploads); free(words_raw);
+        send_err(id, "cannot read replay_words.bin (run gpu_replay_capture.py first)");
+        return;
+    }
+    const uint32_t *words = (const uint32_t *)words_raw;
+    const size_t words_count = words_bytes / sizeof(uint32_t);
+
+    uint16_t *live_vram = (uint16_t *)malloc(vram_bytes);
+    if (!live_vram) {
+        free(cap_vram); free(cap_uploads); free(words_raw);
+        send_err(id, "alloc failed (live vram snapshot)");
+        return;
+    }
+    gpu_vram_snapshot(live_vram);
+    uint8_t *live_uploads = NULL;
+    size_t live_uploads_size = 0;
+    int live_uploads_ok = gpu_hd_texture_tracking_state_save(&live_uploads, &live_uploads_size);
+    int live_backend = gpu_hd_texture_get_backend();
+    GpuCaptureRegs live_regs;
+    gpu_regs_snapshot(&live_regs);
+
+    int total_drawing[2] = { 0, 0 };
+    int wrote_files[2] = { 0, 0 };
+    isolate_one_backend(cap_vram, cap_uploads, cap_uploads_size, has_regs ? &cap_regs : NULL,
+                        has_regs, words, words_count,
+                        backend_a, out_dir_a, chroma_r, chroma_g, chroma_b,
+                        &total_drawing[0], &wrote_files[0]);
+    isolate_one_backend(cap_vram, cap_uploads, cap_uploads_size, has_regs ? &cap_regs : NULL,
+                        has_regs, words, words_count,
+                        backend_b, out_dir_b, chroma_r, chroma_g, chroma_b,
+                        &total_drawing[1], &wrote_files[1]);
+
+    /* Restore the live game's real state unconditionally. */
+    gpu_vram_restore(live_vram);
+    if (live_uploads_ok) gpu_hd_texture_tracking_state_load(live_uploads, live_uploads_size);
+    gpu_hd_texture_set_backend(live_backend);
+    gpu_regs_restore(&live_regs);
+
+    free(cap_vram); free(cap_uploads); free(words_raw);
+    free(live_vram); free(live_uploads);
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"dir\":\"%s\","
+             "\"backend_a\":%d,\"out_dir_a\":\"%s\",\"total_drawing_a\":%d,\"wrote_files_a\":%d,"
+             "\"backend_b\":%d,\"out_dir_b\":\"%s\",\"total_drawing_b\":%d,\"wrote_files_b\":%d}",
+             id, dir, backend_a, out_dir_a, total_drawing[0], wrote_files[0],
+             backend_b, out_dir_b, total_drawing[1], wrote_files[1]);
+}
+
+/* gpu_replay_capture -- deterministic-replay A/B, step 2 (see
+ * docs/internal/HD_RECOLOR_DETERMINISTIC_AB_CAPTURE_PLAN.md). Takes a
+ * gpu_capture_state bundle directory (vram.bin, uploads.bin) plus a
+ * replay_words.bin the client pre-computes from that bundle's
+ * gp0_stream.json (tools/gpu_replay_capture.py) -- a flat (count, word...)*
+ * stream of ONLY the entries safe to replay verbatim: state-setting and
+ * drawing opcodes, never the VRAM-transfer family (0x80-0xDF), whose payload
+ * either isn't captured in full (0xA0 CPU->VRAM streams its pixels as
+ * separate words the ring never records) or is already fully accounted for
+ * by vram.bin itself (0x80 VRAM->VRAM, 0xC0-0xDF VRAM->CPU) -- replaying
+ * those verbatim would desync gpu_write_gp0's own word-count state machine
+ * or double-apply an effect vram.bin already reflects.
+ *
+ * Runs the SAME captured word stream through gpu_write_gp0 -- the real,
+ * single entry point every live GP0 write goes through, not a
+ * reimplementation -- once per requested backend, from an identical
+ * restored VRAM + upload-tracker state each time, so the only thing that
+ * can differ between replay_a.png and replay_b.png is the rendering logic
+ * itself. The live game's own VRAM/tracker/backend are snapshotted first
+ * and unconditionally restored before returning, so this never corrupts
+ * what the running game goes on to render next. */
+static void handle_gpu_replay_capture(int id, const char *json)
+{
+    char dir[480];
+    if (!json_get_str(json, "dir", dir, sizeof(dir))) {
+        send_err(id, "missing dir");
+        return;
+    }
+    int backend_a = json_get_int(json, "backend_a", 0);
+    int backend_b = json_get_int(json, "backend_b", 2);
+
+    char path[560];
+    const size_t vram_bytes = 1024u * 512u * sizeof(uint16_t);
+
+    snprintf(path, sizeof(path), "%s/vram.bin", dir);
+    size_t got_size = 0;
+    uint8_t *cap_vram_raw = read_whole_file(path, &got_size);
+    if (!cap_vram_raw || got_size != vram_bytes) {
+        free(cap_vram_raw);
+        send_err(id, "cannot read vram.bin (missing or wrong size)");
+        return;
+    }
+    uint16_t *cap_vram = (uint16_t *)cap_vram_raw;
+
+    snprintf(path, sizeof(path), "%s/uploads.bin", dir);
+    size_t cap_uploads_size = 0;
+    uint8_t *cap_uploads = read_whole_file(path, &cap_uploads_size);
+    /* Absent/empty uploads.bin is valid -- no HD pack was loaded at capture
+     * time; gpu_hd_texture_tracking_state_load(NULL, 0) below clears
+     * tracking for that case rather than failing. */
+
+    /* gpu_regs.bin -- draw-mode + GP1 display-config registers (see
+     * GpuCaptureRegs's comment, gpu.h). Absent is tolerated (older bundles
+     * captured before this file existed) -- regs are simply left live/
+     * un-restored for those, same as before this fix. */
+    snprintf(path, sizeof(path), "%s/gpu_regs.bin", dir);
+    size_t cap_regs_size = 0;
+    uint8_t *cap_regs_raw = read_whole_file(path, &cap_regs_size);
+    int has_regs = cap_regs_raw && cap_regs_size == sizeof(GpuCaptureRegs);
+    GpuCaptureRegs cap_regs;
+    if (has_regs) memcpy(&cap_regs, cap_regs_raw, sizeof(cap_regs));
+    free(cap_regs_raw);
+
+    snprintf(path, sizeof(path), "%s/replay_words.bin", dir);
+    size_t words_bytes = 0;
+    uint8_t *words_raw = read_whole_file(path, &words_bytes);
+    if (!words_raw || words_bytes < sizeof(uint32_t)) {
+        free(cap_vram); free(cap_uploads); free(words_raw);
+        send_err(id, "cannot read replay_words.bin (run gpu_replay_capture.py first)");
+        return;
+    }
+    const uint32_t *words = (const uint32_t *)words_raw;
+    const size_t words_count = words_bytes / sizeof(uint32_t);
+
+    /* Snapshot the LIVE state so it can be restored unconditionally once
+     * both passes are done -- this command must never leave the actually-
+     * running game's VRAM/tracker/backend/regs in a replayed, not-live
+     * state. */
+    uint16_t *live_vram = (uint16_t *)malloc(vram_bytes);
+    if (!live_vram) {
+        free(cap_vram); free(cap_uploads); free(words_raw);
+        send_err(id, "alloc failed (live vram snapshot)");
+        return;
+    }
+    gpu_vram_snapshot(live_vram);
+    uint8_t *live_uploads = NULL;
+    size_t live_uploads_size = 0;
+    int live_uploads_ok = gpu_hd_texture_tracking_state_save(&live_uploads, &live_uploads_size);
+    int live_backend = gpu_hd_texture_get_backend();
+    GpuCaptureRegs live_regs;
+    gpu_regs_snapshot(&live_regs);
+
+    extern void gl_renderer_sync_cpu(void);
+    extern void vk_renderer_sync_cpu(void);
+
+    const int backends[2] = { backend_a, backend_b };
+    const char *names[2] = { "replay_a.png", "replay_b.png" };
+    int wrote[2] = { 0, 0 };
+    int replayed_words[2] = { 0, 0 };
+
+    for (int pass = 0; pass < 2; pass++) {
+        gpu_vram_restore(cap_vram);
+        gpu_hd_texture_tracking_state_load(cap_uploads, cap_uploads_size);
+        gpu_hd_texture_set_backend(backends[pass]);
+        if (has_regs) gpu_regs_restore(&cap_regs);
+        /* See gpu_gp0_parser_reset's header comment: without this, a stuck
+         * GP0 command-assembly state (e.g. from a polyline header whose
+         * body was never captured) silently corrupts this pass's replay,
+         * and would otherwise leak into pass 2 as well. */
+        gpu_gp0_parser_reset();
+
+        size_t i = 0;
+        int count = 0;
+        while (i < words_count) {
+            if (i + 2 > words_count) break;  /* malformed -- stop this pass safely */
+            i++;  /* seq -- unused by this replay, kept only for step 3's manifest */
+            uint32_t n = words[i++];
+            if (n == 0 || i + n > words_count) break;
+            for (uint32_t k = 0; k < n; k++) gpu_write_gp0(words[i + k]);
+            i += n;
+            count++;
+        }
+        replayed_words[pass] = count;
+
+        gl_renderer_sync_cpu();
+        vk_renderer_sync_cpu();
+
+        GpuDisplayInfo di;
+        gpu_get_display_info(&di);
+        if (!di.disabled && di.width && di.height) {
+            uint32_t w = di.width;  if (w > 640) w = 640;
+            uint32_t h = di.height; if (h > 512) h = 512;
+            uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+            if (rgb) {
+                for (uint32_t y = 0; y < h; y++) {
+                    for (uint32_t x = 0; x < w; x++) {
+                        uint8_t r, g, b;
+                        gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+                        uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+                        p[0] = r; p[1] = g; p[2] = b;
+                    }
+                }
+                snprintf(path, sizeof(path), "%s/%s", dir, names[pass]);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    wrote[pass] = png_write_rgb(fp, rgb, w, h);
+                    fclose(fp);
+                }
+                free(rgb);
+            }
+        }
+    }
+
+    /* Restore the live game's real state unconditionally. */
+    gpu_vram_restore(live_vram);
+    if (live_uploads_ok) gpu_hd_texture_tracking_state_load(live_uploads, live_uploads_size);
+    gpu_hd_texture_set_backend(live_backend);
+    gpu_regs_restore(&live_regs);
+
+    free(cap_vram); free(cap_uploads); free(words_raw);
+    free(live_vram); free(live_uploads);
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"dir\":\"%s\",\"backend_a\":%d,\"backend_b\":%d,"
+             "\"replayed_words_a\":%d,\"replayed_words_b\":%d,"
+             "\"wrote_a\":%s,\"wrote_b\":%s}",
+             id, dir, backend_a, backend_b, replayed_words[0], replayed_words[1],
+             wrote[0] ? "true" : "false", wrote[1] ? "true" : "false");
 }
 
 static void handle_capture_quads(int id, const char *json)
@@ -8880,14 +9598,6 @@ static void handle_get_snapshots(int id, const char *json)
              s_snapshot_addrs[2], s_snapshot_active[2],
              s_snapshot_addrs[3], s_snapshot_active[3]);
 }
-
-/* ---- Minimal self-contained PNG writer ------------------------------------
- * Emits a valid 8-bit truecolor (RGB) PNG with zero external dependencies: the
- * IDAT payload is a zlib stream whose DEFLATE body is "stored" (uncompressed)
- * blocks. Bigger on disk than a compressed PNG, but a real PNG that every
- * viewer (and the harness Read tool) accepts, and nothing new to link against
- * — which keeps the self-contained static runtime self-contained. */
-#include "png_write.h"   /* png_write_rgb + zlib/CRC helpers (shared with Beetle) */
 
 /* Canonical screenshot: writes an 8-bit RGB PNG of the current PSX display to
  * "path" (default psx_screenshot.png in the runtime cwd) and answers with a
@@ -13966,6 +14676,7 @@ static const CmdEntry s_commands[] = {
     { "hd_scale_diag_clear", handle_hd_scale_diag_clear },
     { "hd_silhouette_mode", handle_hd_silhouette_mode },
     { "hd_gradient_diag", handle_hd_gradient_diag },
+    { "hd_recolor_diag",  handle_hd_recolor_diag },
     { "calib_test",        handle_calib_test },
     { "hdtex_recent",      handle_hdtex_recent },
     { "geom_correction",   handle_geom_correction },
@@ -14179,6 +14890,9 @@ static const CmdEntry s_commands[] = {
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },
+    { "gpu_capture_state", handle_gpu_capture_state },
+    { "gpu_replay_capture", handle_gpu_replay_capture },
+    { "gpu_replay_isolate", handle_gpu_replay_isolate },
     { "a0_history",        handle_a0_history },
     { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },

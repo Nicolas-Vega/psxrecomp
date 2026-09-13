@@ -64,6 +64,10 @@ extern int hd_texture_dump_get_recent_entry(const HdTextureDump* dump, int index
 extern void hd_texture_dump_note_upload(HdTextureDump* dump, uint16_t x, uint16_t y,
                                         uint16_t width_words, uint16_t height,
                                         uint64_t hash);
+extern int hd_texture_dump_tracking_state_save(const HdTextureDump* dump,
+                                                uint8_t** out_data, size_t* out_size);
+extern int hd_texture_dump_tracking_state_load(HdTextureDump* dump,
+                                                const uint8_t* data, size_t size);
 /* Mirrors hd_texture_dump.h's HdTextureDumpMatch layout exactly (field
  * types and order) so this declaration and the real definition are the same
  * type for linking purposes without gpu.c including that downstream-project
@@ -262,6 +266,137 @@ void gpu_hd_texture_gradient_diag_dump(char *out, size_t cap) {
     gl_renderer_gradient_diag_dump(out, cap);
 }
 
+extern void gl_renderer_hd_recolor_diag_dump(char *out, size_t cap);
+void gpu_hd_texture_recolor_diag_dump(char *out, size_t cap) {
+    gl_renderer_hd_recolor_diag_dump(out, cap);
+}
+
+/* Combines BOTH independent HD-replacement backends' upload-residency
+ * trackers into one wire blob -- hd_texture_pack's (Beetle format) own
+ * self-describing blob (magic 0x31544448) plus hd_texture_dump's (DuckStation
+ * format) own self-describing blob (magic 0x55445448), each length-prefixed
+ * so they can be sliced apart again. Both are host-only bookkeeping with no
+ * hardware analog, built only by OBSERVING real CPU->VRAM traffic during
+ * play; without restoring BOTH after a savestate load, HD replacement under
+ * whichever backend wasn't covered stops matching ANYTHING the instant a
+ * state loads (confirmed live: hd_texture_dump's own match_stats showed
+ * "no_tracked_upload" for 100% of attempts right after a load, even though
+ * hd_texture_pack's tracker -- fixed first -- was restoring correctly).
+ *
+ * kEnvelopeMagic (0x54325448, distinct from both inner blobs' own magics)
+ * lets load() tell a combined blob apart from an OLDER savestate's
+ * pack-only blob (written before this combining existed): on a magic
+ * mismatch, the whole buffer is handed to hd_texture_pack's loader as-is
+ * (the pre-existing format) and hd_texture_dump's tracker is simply left at
+ * whatever it already was, same graceful behaviour as every other
+ * unknown/old section in this codebase. */
+#define GPU_HD_TRACKING_ENVELOPE_MAGIC 0x54325448u /* "HT2T" LE */
+
+int gpu_hd_texture_tracking_state_save(uint8_t **out_data, size_t *out_size) {
+    if (!out_data || !out_size) return 0;
+    *out_data = NULL;
+    *out_size = 0;
+
+    uint8_t *pack_data = NULL; size_t pack_size = 0;
+    if (!hd_texture_pack_tracking_state_save(g_hd_texture_pack, &pack_data, &pack_size))
+        return 0;
+    uint8_t *dump_data = NULL; size_t dump_size = 0;
+    if (!hd_texture_dump_tracking_state_save(g_hd_texture_dump, &dump_data, &dump_size)) {
+        free(pack_data);
+        return 0;
+    }
+
+    const size_t total = 8u /* envelope magic+version */
+                        + 4u + pack_size
+                        + 4u + dump_size;
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) { free(pack_data); free(dump_data); return 0; }
+
+    uint8_t *p = buf;
+    uint32_t magic = GPU_HD_TRACKING_ENVELOPE_MAGIC, version = 1;
+    memcpy(p, &magic, 4); p += 4;
+    memcpy(p, &version, 4); p += 4;
+    uint32_t psz = (uint32_t)pack_size;
+    memcpy(p, &psz, 4); p += 4;
+    memcpy(p, pack_data, pack_size); p += pack_size;
+    uint32_t dsz = (uint32_t)dump_size;
+    memcpy(p, &dsz, 4); p += 4;
+    memcpy(p, dump_data, dump_size); p += dump_size;
+
+    free(pack_data);
+    free(dump_data);
+    *out_data = buf;
+    *out_size = total;
+    return 1;
+}
+
+int gpu_hd_texture_tracking_state_load(const uint8_t *data, size_t size) {
+    if (!data || size == 0) {
+        hd_texture_pack_reset_tracking(g_hd_texture_pack);
+        return 1;
+    }
+    if (size < 8) return hd_texture_pack_tracking_state_load(g_hd_texture_pack, data, size);
+    uint32_t magic, version;
+    memcpy(&magic, data, 4);
+    memcpy(&version, data + 4, 4);
+    if (magic != GPU_HD_TRACKING_ENVELOPE_MAGIC || version != 1) {
+        /* Older, pack-only savestate blob -- see the comment above. */
+        return hd_texture_pack_tracking_state_load(g_hd_texture_pack, data, size);
+    }
+    const uint8_t *p = data + 8;
+    const uint8_t *end = data + size;
+    if (p + 4 > end) return 0;
+    uint32_t psz; memcpy(&psz, p, 4); p += 4;
+    if (p + psz > end) return 0;
+    const uint8_t *pack_blob = p; p += psz;
+    if (p + 4 > end) return 0;
+    uint32_t dsz; memcpy(&dsz, p, 4); p += 4;
+    if (p + dsz > end) return 0;
+    const uint8_t *dump_blob = p; p += dsz;
+    if (p != end) return 0;
+
+    int ok = hd_texture_pack_tracking_state_load(g_hd_texture_pack, pack_blob, psz);
+    ok = hd_texture_dump_tracking_state_load(g_hd_texture_dump, dump_blob, dsz) && ok;
+    return ok;
+}
+
+/* Adapters onto boot_state.c's write_module_section(tag, bytes_fn, write_fn)
+ * two-call convention (query size, then fill a buffer of that size) for
+ * BS_SEC_HD_TRACKER -- see that section's comment (boot_state.h) for why a
+ * savestate needs to carry this at all. hd_texture_pack_tracking_state_save
+ * computes size and allocates in one call, so the size query caches the
+ * result for the write call right after it (boot_state_save is single-
+ * threaded/synchronous, same as every other module snapshot here -- see
+ * gpu_snapshot_bytes/gpu_snapshot_write's identical two-call shape just
+ * above for precedent). */
+static uint8_t *s_hd_tracking_snap_cache = NULL;
+static size_t   s_hd_tracking_snap_cache_size = 0;
+
+uint32_t gpu_hd_tracking_snapshot_bytes(void) {
+    free(s_hd_tracking_snap_cache);
+    s_hd_tracking_snap_cache = NULL;
+    s_hd_tracking_snap_cache_size = 0;
+    uint8_t *data = NULL;
+    size_t size = 0;
+    if (gpu_hd_texture_tracking_state_save(&data, &size)) {
+        s_hd_tracking_snap_cache = data;
+        s_hd_tracking_snap_cache_size = size;
+    }
+    return (uint32_t)s_hd_tracking_snap_cache_size;
+}
+
+void gpu_hd_tracking_snapshot_write(uint8_t *p) {
+    if (s_hd_tracking_snap_cache && s_hd_tracking_snap_cache_size)
+        memcpy(p, s_hd_tracking_snap_cache, s_hd_tracking_snap_cache_size);
+    free(s_hd_tracking_snap_cache);
+    s_hd_tracking_snap_cache = NULL;
+    s_hd_tracking_snap_cache_size = 0;
+}
+
+int gpu_hd_tracking_snapshot_read(const uint8_t *p, uint32_t len) {
+    return gpu_hd_texture_tracking_state_load(p, (size_t)len);
+}
+
 extern int gl_renderer_calib_test(int dx_offset);
 int gpu_hd_texture_calib_test(int dx_offset) {
     return gl_renderer_calib_test(dx_offset);
@@ -341,6 +476,15 @@ int  gpu_hd_texture_fusion_enabled(void) { return g_hd_fused_pages_enabled; }
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
 
+void gpu_vram_snapshot(uint16_t *out) {
+    memcpy(out, vram, sizeof(vram));
+}
+
+void gpu_vram_restore(const uint16_t *in) {
+    memcpy(vram, in, sizeof(vram));
+    gr_vram_transfer_in(0, 0, 1024, 512, vram);
+}
+
 /* Diagnostic-only counters (see gpu_hd_texture_pack_match_stats): whether
  * this backend's matcher is even being asked (attempts), and where a draw
  * that could have been HD-replaced actually falls through -- mirrors
@@ -373,7 +517,10 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
                               int u_first, int u_last, int v_first, int v_last,
                               uint32_t* cache_key, const char** png_path,
                               float* u_scale, float* u_offset,
-                              float* v_scale, float* v_offset) {
+                              float* v_scale, float* v_offset,
+                              uint32_t* miss_texture_hash, int* has_miss_texture_hash) {
+    if (miss_texture_hash) *miss_texture_hash = 0;
+    if (has_miss_texture_hash) *has_miss_texture_hash = 0;
     if (!g_hd_texture_pack) return 0;
     ++g_hd_pack_attempts;
     HdTextureMatch m;
@@ -385,6 +532,30 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
         if (status == HD_TEXTURE_LOOKUP_AMBIGUOUS) ++g_hd_pack_ambiguous;
         else if (status == HD_TEXTURE_LOOKUP_ERROR) ++g_hd_pack_error;
         else ++g_hd_pack_none;
+        /* Even on a miss, hd_texture_pack_match_draw/hd_texture_pack_match may
+         * have populated m.miss_texture_hash + the covering upload's own
+         * width/height/source_word_x/source_y (see hd_texture_pack.cpp's
+         * comment in the miss branch) -- surface u_scale/u_offset/v_scale/
+         * v_offset here too, using the EXACT same formula as the FOUND branch
+         * below, so a live-recolor caller can map into the master's
+         * hd_rgba/index textures without duplicating this math. */
+        if (m.has_miss_texture_hash) {
+            if (miss_texture_hash) *miss_texture_hash = m.miss_texture_hash;
+            if (has_miss_texture_hash) *has_miss_texture_hash = 1;
+            const int depth_bits = (texpage >> 7) & 3;
+            const unsigned ppw = depth_bits == 0 ? 4u : depth_bits == 1 ? 2u : 1u;
+            const unsigned upload_w_texels = (unsigned)m.upload_width_words * ppw;
+            const unsigned upload_h = m.upload_height;
+            if (upload_w_texels != 0 && upload_h != 0) {
+                if (u_scale) *u_scale = 1.0f / (float)upload_w_texels;
+                if (v_scale) *v_scale = 1.0f / (float)upload_h;
+                if (u_offset)
+                    *u_offset = (float)(((unsigned)m.source_word_x - (unsigned)u_first / ppw) * ppw) /
+                                (float)upload_w_texels;
+                if (v_offset)
+                    *v_offset = ((float)m.source_y - (float)v_first) / (float)upload_h;
+            }
+        }
         return 0;
     }
 
@@ -453,6 +624,30 @@ int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
         *v_offset = ((float)m.source_y - (float)v_first) / (float)upload_h;
     ++g_hd_pack_matched;
     return 1;
+}
+
+int gpu_hd_texture_pack_get_recolor_master(uint32_t texture_hash, GpuHdRecolorMasterInfo* out_info) {
+    if (out_info) memset(out_info, 0, sizeof(*out_info));
+    if (!g_hd_texture_pack || !out_info) return 0;
+    HdRecolorMasterInfo info;
+    if (!hd_texture_pack_get_recolor_master(g_hd_texture_pack, texture_hash, &info)) return 0;
+    out_info->hd_rgba = info.hd_rgba;
+    out_info->hd_width = info.hd_width;
+    out_info->hd_height = info.hd_height;
+    out_info->index = info.index;
+    out_info->native_width = info.native_width;
+    out_info->native_height = info.native_height;
+    out_info->palette_count = info.palette_count;
+    return 1;
+}
+
+uint32_t gpu_hd_texture_pack_compute_recolor_table(uint32_t texture_hash,
+                                                   int clut_x, int clut_y, int depth,
+                                                   float* out_scale, float* out_offset) {
+    if (!g_hd_texture_pack) return 0;
+    return hd_texture_pack_compute_recolor_table(
+        g_hd_texture_pack, texture_hash, vram, sizeof(vram) / sizeof(vram[0]),
+        (uint16_t)clut_x, (uint16_t)clut_y, (uint8_t)depth, out_scale, out_offset);
 }
 
 /* Fused-page path (opt-in, see gpu_hd_texture_fusion_set): reached only after
@@ -5030,6 +5225,58 @@ static void gp0_exec_mask_bit(void) {
     gr_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
 }
 
+/* See GpuCaptureRegs's comment (gpu.h) for why this exists: gpu_get_
+ * display_info() reads display_area_x/hres1/h_display_x1/etc. LIVE, and
+ * they are a GP1 state machine the GP0 replay stream never touches, so a
+ * replay must snapshot and force them explicitly rather than relying on
+ * anything in the captured word stream to re-establish them. */
+void gpu_regs_snapshot(GpuCaptureRegs *out) {
+    out->hres2 = hres2; out->hres1 = hres1; out->vres = vres;
+    out->video_mode = video_mode; out->display_depth = display_depth;
+    out->vertical_interlace = vertical_interlace;
+    out->display_disabled = display_disabled;
+    out->display_area_x = display_area_x; out->display_area_y = display_area_y;
+    out->h_display_x1 = h_display_x1; out->h_display_x2 = h_display_x2;
+    out->v_display_y1 = v_display_y1; out->v_display_y2 = v_display_y2;
+    out->dma_direction = dma_direction;
+    out->lcf = lcf;
+    out->texpage_x = texpage_x; out->texpage_y = texpage_y;
+    out->semi_transparency = semi_transparency; out->texpage_colors = texpage_colors;
+    out->dither_enabled = dither_enabled; out->draw_to_display = draw_to_display;
+    out->texture_disable = texture_disable;
+    out->texture_window_value = texture_window_value;
+    out->draw_area_left = draw_area_left; out->draw_area_top = draw_area_top;
+    out->draw_area_right = draw_area_right; out->draw_area_bottom = draw_area_bottom;
+    out->draw_offset_x = draw_offset_x; out->draw_offset_y = draw_offset_y;
+    out->set_mask_bit = set_mask_bit; out->check_mask_bit = check_mask_bit;
+}
+
+void gpu_regs_restore(const GpuCaptureRegs *in) {
+    hres2 = in->hres2; hres1 = in->hres1; vres = in->vres;
+    video_mode = in->video_mode; display_depth = in->display_depth;
+    vertical_interlace = in->vertical_interlace;
+    display_disabled = in->display_disabled;
+    display_area_x = in->display_area_x; display_area_y = in->display_area_y;
+    h_display_x1 = in->h_display_x1; h_display_x2 = in->h_display_x2;
+    v_display_y1 = in->v_display_y1; v_display_y2 = in->v_display_y2;
+    dma_direction = in->dma_direction;
+    lcf = in->lcf;
+    texpage_x = in->texpage_x; texpage_y = in->texpage_y;
+    semi_transparency = in->semi_transparency; texpage_colors = in->texpage_colors;
+    dither_enabled = in->dither_enabled; draw_to_display = in->draw_to_display;
+    texture_disable = in->texture_disable;
+    texture_window_value = in->texture_window_value;
+    gr_set_texture_window(texture_window_value);
+    draw_area_left = in->draw_area_left; draw_area_top = in->draw_area_top;
+    draw_area_right = in->draw_area_right; draw_area_bottom = in->draw_area_bottom;
+    gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
+                     (int)draw_area_right, (int)draw_area_bottom);
+    draw_offset_x = in->draw_offset_x; draw_offset_y = in->draw_offset_y;
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
+    set_mask_bit = in->set_mask_bit; check_mask_bit = in->check_mask_bit;
+    gr_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
+}
+
 /* A0 upload history for debug inspection */
 #define A0_HISTORY_CAP 128
 typedef struct {
@@ -6243,6 +6490,39 @@ void gpu_write_gp0(uint32_t val) {
     g_exec_phase = 4;
     gpu_write_gp0_body(val);
     g_exec_phase = prev_phase;
+}
+
+/* Reset the low-level GP0 command-assembly parser (state/word-count/polyline/
+ * VRAM-write progress) without touching VRAM, draw-mode, or display-config
+ * registers. Real hardware equivalent: GP1(01h) Reset Command Buffer.
+ *
+ * The debug-server replay/isolate commands (gpu_replay_capture,
+ * gpu_replay_isolate) need this because they feed raw captured GP0 words
+ * back through this SAME stateful parser gpu_write_gp0() uses for live
+ * traffic. A polyline command (0x48-0x4F/0x58-0x5F) only ever has its
+ * header word captured in gp0_stream.json -- the vertex/terminator words
+ * that would normally follow are deliberately not recorded (variable
+ * length, unbounded). Replaying just that header word flips gp0_state to
+ * GP0_POLYLINE_MONO/SHADED with no terminator ever coming, which silently
+ * swallows every subsequent replayed word as fake polyline vertex/color
+ * data for the rest of that replay pass -- corrupting every primitive
+ * after it (each looks like it drew nothing). Without resetting here
+ * before each pass, that corruption also leaks into the NEXT pass of a
+ * gpu_replay_isolate call, since gpu_vram_restore/gpu_regs_restore never
+ * touch this parser state. Root-caused live: a captured "Ashley!!" scene's
+ * mono-polyline header corrupted its own pass's tail and then the next
+ * pass's entire replay, exactly matching a coverage-loss finding (real
+ * content in one backend's isolated pass, nothing in the other's) that a
+ * long investigation had otherwise pinned on the HD-recolor renderer
+ * itself -- see tools/gpu_replay_capture.py's build_replay_words, which
+ * now also drops polyline headers from the replay stream so they can
+ * never re-trigger this even without the reset. */
+void gpu_gp0_parser_reset(void) {
+    gp0_state = GP0_IDLE;
+    gp0_words_collected = 0;
+    gp0_words_needed = 0;
+    polyline_has_prev = 0;
+    vram_write_remaining = 0;
 }
 
 /* ---- GP1 write (0x1F801814 write) ---- */

@@ -72,6 +72,7 @@
 #include "psx_savestate_menu.h"
 #include "psx_texpack_menu.h"
 #include "psx_font_picker_menu.h"
+#include "psx_cheats_menu.h"
 #include "host_time.h"
 #include "latency_ring.h"
 #include "frame_pacing.h"
@@ -103,6 +104,14 @@
 #ifndef GL_RGBA8
 #define GL_RGBA8 0x8058
 #endif
+#ifndef GL_RGBA32F
+#define GL_RGBA32F 0x8814
+#endif
+/* R8UI: the recolorable-master index map's own texture format (one
+ * palette-index byte per native pixel, fetched as an integer -- see
+ * HD_RECOLOR_FS's u_index). Absent from MinGW's GL 1.1 headers like
+ * PSXGL_R16UI (VRAM's own format) just above. */
+#define PSXGL_R8UI                   0x8232
 /* GL 1.4+ enums absent from MinGW's GL 1.1 headers. */
 #define PSXGL_FRAGMENT_SHADER       0x8B30
 #define PSXGL_VERTEX_SHADER         0x8B31
@@ -2150,6 +2159,33 @@ static GLint  s_hd_uPieceRects = -1, s_hd_uPieceCount = -1;
  * u_prim_limits/u_has_prim_limits comment. */
 static GLint  s_hd_uPrimLimits = -1, s_hd_uHasPrimLimits = -1;
 
+/* 2026-09-11: live-GPU-recolor program (see hd_texture_pack.h's
+ * HdRecolorMasterInfo/hd_texture_pack_get_recolor_master comment for the full
+ * rationale -- replaces an earlier CPU pre-bake-and-cache-to-disk approach
+ * that could not keep up with a whole-scene retint like Vagrant Story's
+ * battle mode asking for a brand-new palette on many textures every frame).
+ * Reuses HD_VS unchanged (same vertex layout/attributes, same v_uv/v_persp/
+ * v_col/v_orig_uv varyings -- see HD_RECOLOR_FS's comment for why a second
+ * vertex shader isn't needed) with a new fragment shader, HD_RECOLOR_FS. */
+static GLuint s_hd_recolor_prog = 0;
+static GLint  s_hdr_uXoff = -1, s_hdr_uXhalf = -1, s_hdr_uShift = -1,
+             s_hdr_uTex = -1, s_hdr_uTexSize = -1,
+             s_hdr_uIndex = -1, s_hdr_uIndexSize = -1, s_hdr_uIndexLimits = -1,
+             s_hdr_uRecolorTable = -1, s_hdr_uRaw = -1,
+             s_hdr_uPrimLimits = -1, s_hdr_uHasPrimLimits = -1,
+             s_hdr_uSilhouette = -1;
+/* One shared 256x2 RGBA32F texture, re-filled via glTexSubImage2D once per
+ * recolor draw (row 0 = per-index scale.rgba, row 1 = per-index offset.rgb,
+ * .a unused) -- computing/uploading this table is the cheap replacement for
+ * the old approach's whole-image CPU recolor + PNG encode, so redoing it
+ * every draw (rather than trying to cache it keyed by (texture_hash,
+ * palette_hash), which today's cheap masters/hd_gl_get_texture caches never
+ * needed to do for a plain replacement PNG) is deliberate: simpler, and the
+ * actual cost (256 floats computed on CPU, an 8KB texture upload) is
+ * negligible next to what it replaced. */
+static GLuint s_hd_recolor_table_tex = 0;
+#define HD_RECOLOR_TABLE_CAP 256
+
 static const char *HD_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;\n"
@@ -2413,6 +2449,129 @@ static const char *HD_FS =
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "}\n";
 
+/* 2026-09-11: live-GPU-recolor fragment shader -- the GPU-shader-tint
+ * counterpart to hd_texture_pack.cpp's compute_recolor_table, replacing an
+ * earlier CPU-side whole-image bake for a "recolorable master" fallback (a
+ * texture_hash with a tracked upload but no exact (texture_hash,
+ * palette_hash) replacement file -- see HD_FS's own u_tint for the OTHER,
+ * unrelated shading-approximation fallback this project already had, which
+ * this does not replace). Deliberately reuses HD_VS unchanged: this only
+ * needs the same v_uv/v_uv_p/v_persp/v_col/v_orig_uv/v_orig_uv_p varyings
+ * HD_FS already gets from it, so a second vertex shader would just be a
+ * verbatim copy for no benefit -- see build_program(HD_VS, HD_RECOLOR_FS) in
+ * hd_gl_init.
+ *
+ * u_tex/u_tex_size are the master's hd_rgba upscale (same bilinear-clamped
+ * texelFetch blend as HD_FS's hd_sample_bilinear, same premultiplied-alpha
+ * undo -- both ported verbatim, see HD_FS's own comments for why each exists).
+ * u_index/u_index_size are the SAME master's native-resolution palette-index
+ * map -- v_uv (already normalized 0..1 across the whole native upload by the
+ * SAME u_scale/u_offset this draw's vertex UVs used for u_tex) doubles as the
+ * index lookup coordinate with no separate attribute needed, just a
+ * different size vector and a NEAREST fetch (a palette index has no
+ * meaningful "in-between" value to blend). u_recolor_table is the small
+ * (256x2) per-index (scale, offset) table hd_texture_pack_compute_recolor_
+ * table just computed for the CURRENT live palette -- row 0 sample .rgb is
+ * the color multiplier, .a is the opacity mask (0 or 1: whether this index is
+ * opaque under the live palette, see hd_texture_pack.cpp's compute_recolor_
+ * table comment for why this can never come from the master's own reference
+ * alpha); row 1 sample .rgb is the additive offset (near-black reference
+ * colors use an additive correction instead of a scale ratio, since a ratio
+ * against near-zero is meaningless/unstable -- same rationale). */
+static const char *HD_RECOLOR_FS =
+    "#version 330\n"
+    "noperspective in vec2 v_uv; smooth in vec2 v_uv_p; flat in int v_persp;\n"
+    "noperspective in vec3 v_col; out vec4 frag;\n"
+    "noperspective in vec2 v_orig_uv; smooth in vec2 v_orig_uv_p;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform vec2 u_tex_size;\n"
+    "uniform usampler2D u_index;\n"
+    "uniform vec2 u_index_size;\n"
+    /* Per-primitive native-space sub-window (mirrors HD_FS's u_prim_limits,
+     * but directly in native texel space -- u_first/u_last/v_first/v_last
+     * ARE native texel coordinates already, no u_scale/u_offset remap needed
+     * the way HD_FS needs one to reach the replacement PNG's own pixel
+     * space). Same multi-primitives-per-upload rationale as HD_FS's version:
+     * a single master can cover an upload that itself packs more than one
+     * primitive's content (a character sheet's face/collar/torso tiles). */
+    "uniform ivec4 u_index_limits;\n"
+    "uniform sampler2D u_recolor_table;\n"
+    "uniform int u_raw;\n"
+    "uniform ivec4 u_prim_limits;\n"
+    "uniform int u_has_prim_limits;\n"
+    /* Debug-visualization mode, matching HD_FS/TEX_FS's u_silhouette_mode
+     * (see TEX_FS's comment for the value table). Added 2026-09-12 purely to
+     * diagnose a character (bcf02fd0) whose torso vanished under this path
+     * while rendering fine natively: mode 1 skips the scale.a<0.5 cutout
+     * below (keeping the real sampled color) so a live F1 toggle can show
+     * whether the underlying UV/index/master mapping is actually correct
+     * (something coherent appears, just wrongly discarded) or wrong (nothing
+     * useful appears even with the cutout bypassed, pointing at a master/UV
+     * mismatch instead of an alpha-table bug). Off (0) by default. */
+    "uniform int u_silhouette_mode;\n"
+    "vec4 hd_texelfetch_clamped(ivec2 texel, ivec4 bounds) {\n"
+    "  texel = clamp(texel, bounds.xy, bounds.zw);\n"
+    "  return texelFetch(u_tex, texel, 0);\n"
+    "}\n"
+    "vec4 hd_sample_bilinear(vec2 texel_uv, ivec4 bounds) {\n"
+    "  vec2 uv_frac = fract(texel_uv) - vec2(0.5, 0.5);\n"
+    "  vec2 uv_offs = sign(uv_frac);\n"
+    "  uv_frac = abs(uv_frac);\n"
+    "  ivec2 base = ivec2(floor(texel_uv));\n"
+    "  ivec2 ox = ivec2(int(uv_offs.x), 0), oy = ivec2(0, int(uv_offs.y));\n"
+    "  vec4 c00 = hd_texelfetch_clamped(base, bounds);\n"
+    "  vec4 c10 = hd_texelfetch_clamped(base + ox, bounds);\n"
+    "  vec4 c01 = hd_texelfetch_clamped(base + oy, bounds);\n"
+    "  vec4 c11 = hd_texelfetch_clamped(base + ox + oy, bounds);\n"
+    "  return c00*(1.0-uv_frac.x)*(1.0-uv_frac.y) + c10*uv_frac.x*(1.0-uv_frac.y)\n"
+    "       + c01*(1.0-uv_frac.x)*uv_frac.y + c11*uv_frac.x*uv_frac.y;\n"
+    "}\n"
+    "void main(){\n"
+    "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+    "  ivec4 bounds = ivec4(0, 0, ivec2(u_tex_size) - ivec2(1, 1));\n"
+    "  if (u_has_prim_limits != 0) {\n"
+    "    bounds.xy = max(bounds.xy, u_prim_limits.xy);\n"
+    "    bounds.zw = min(bounds.zw, u_prim_limits.zw);\n"
+    "  }\n"
+    "  vec4 c = hd_sample_bilinear(uv * u_tex_size, bounds);\n"
+    "  vec3 c_rgb = (c.a > (1.0/255.0)) ? clamp(c.rgb / c.a, 0.0, 1.0) : c.rgb;\n"
+    "  ivec2 itex = clamp(ivec2(floor(uv * u_index_size)), u_index_limits.xy, u_index_limits.zw);\n"
+    "  int idx = int(texelFetch(u_index, itex, 0).r);\n"
+    "  vec4 scale = texelFetch(u_recolor_table, ivec2(idx, 0), 0);\n"
+    "  vec3 offset = texelFetch(u_recolor_table, ivec2(idx, 1), 0).rgb;\n"
+    /* scale.a is this index's live-palette opacity mask (0 or 1), derived
+     * directly from the SAME live CLUT word this whole draw's colors come
+     * from (word==0 -> transparent) -- exactly the same "raw==0 discard"
+     * rule native TEX_FS's own fetch_texel applies, just checked per palette
+     * INDEX here instead of per already-CLUT-resolved native texel. A
+     * surviving pixel is therefore ALREADY known-opaque by the same
+     * criterion native rendering itself uses; there is nothing left for a
+     * separate native mask-bit (stp) re-check to add.
+     *
+     * 2026-09-11 bugfix: this used to ALSO gate frag.a on the ORIGINAL
+     * native texel's own mask bit (stp, ported from HD_FS's parity fix),
+     * requiring BOTH scale.a AND stp to agree before showing a pixel. HD_FS
+     * needs that second check because a replacement PNG's own alpha channel
+     * has no reliable relationship to the real PS1 mask bit at all (it's
+     * authored art, not derived from any live palette) -- but this path's
+     * scale.a IS already derived straight from the live palette's own
+     * opacity, so requiring stp on top is redundant at best. At worst it is
+     * actively wrong: the mask bit (PS1's semi-transparency-processing flag)
+     * and "is this index meant to be visible" are unrelated hardware
+     * concepts that only happen to correlate for typical opaque content --
+     * confirmed live, a character (SHP texture bcf02fd0) whose real content
+     * legitimately sets that flag on most of its own texels rendered
+     * completely invisible through this path (native rendering, which never
+     * consulted the mask bit for basic visibility, showed her normally the
+     * whole time). Dropping the redundant, occasionally-wrong second check
+     * fixes that without weakening the real cutout, which discard above
+     * already enforces. */
+    "  if (u_silhouette_mode == 0 && scale.a < 0.5) discard;\n"
+    "  vec3 rgb = clamp(c_rgb * scale.rgb + offset, 0.0, 1.0);\n"
+    "  if (u_raw == 0) rgb = clamp(rgb * v_col * 2.0, 0.0, 1.0);\n"
+    "  frag = vec4(rgb, 1.0);\n"
+    "}\n";
+
 /* entry_id -> decoded/uploaded GL texture. Small in practice (one entry per
  * distinct replacement PNG actually drawn this session), so linear scan is
  * fine; grows by doubling. Never shrinks/evicts -- a whole session's worth
@@ -2428,6 +2587,88 @@ uint64_t gl_renderer_hd_draws_issued(void) { return s_hd_draws_issued; }
 uint64_t gl_renderer_hd_matches_seen(void) { return s_hd_matches_seen; }
 int gl_renderer_hd_prog_ready(void) { return s_hd_prog != 0; }
 int gl_renderer_hd_tex_cache_count(void) { return s_hd_tex_cache_count; }
+
+/* texture_hash -> the master's hd_rgba/index as GL textures (2026-09-11 live-
+ * GPU-recolor path). Keyed by texture_hash directly (not the (texture_hash,
+ * palette_hash) cache_key hd_gl_get_texture uses) since one master serves
+ * every live palette a texture_hash is ever seen under -- see
+ * hd_texture_pack.h's HdRecolorMasterInfo comment. Same never-evicts
+ * rationale as s_hd_tex_cache: a whole session's worth of distinct
+ * recolorable masters is not a meaningful GPU-memory concern. */
+typedef struct { uint32_t texture_hash; GLuint hd_tex, index_tex; int failed;
+                 int hd_w, hd_h, native_w, native_h; uint32_t palette_count; } HdRecolorGlEntry;
+static HdRecolorGlEntry *s_hd_recolor_cache = NULL;
+static int s_hd_recolor_cache_count = 0, s_hd_recolor_cache_cap = 0;
+
+/* GL-context-thread-only. Returns 1 (and fills *out) on success, 0 (leaving
+ * *out zeroed) if there is no master for texture_hash or its textures failed
+ * to upload. */
+static int hd_gl_get_recolor_master(uint32_t texture_hash, HdRecolorGlEntry *out) {
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < s_hd_recolor_cache_count; i++) {
+        if (s_hd_recolor_cache[i].texture_hash != texture_hash) continue;
+        if (s_hd_recolor_cache[i].failed) return 0;
+        *out = s_hd_recolor_cache[i];
+        return 1;
+    }
+    GpuHdRecolorMasterInfo info;
+    HdRecolorGlEntry entry = {0};
+    entry.texture_hash = texture_hash;
+    entry.failed = 1;
+    if (gpu_hd_texture_pack_get_recolor_master(texture_hash, &info) &&
+        info.hd_rgba && info.hd_width && info.hd_height &&
+        info.index && info.native_width && info.native_height && info.palette_count) {
+        GLuint hd_tex = 0, index_tex = 0;
+        glGenTextures(1, &hd_tex);
+        if (hd_tex) {
+            p_glActiveTexture(PSXGL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, hd_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)info.hd_width, (GLsizei)info.hd_height,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, info.hd_rgba);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        }
+        glGenTextures(1, &index_tex);
+        if (index_tex) {
+            p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+            glBindTexture(GL_TEXTURE_2D, index_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_R8UI, (GLsizei)info.native_width, (GLsizei)info.native_height,
+                         0, PSXGL_RED_INTEGER, GL_UNSIGNED_BYTE, info.index);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            p_glActiveTexture(PSXGL_TEXTURE0);
+        }
+        if (hd_tex && index_tex) {
+            entry.hd_tex = hd_tex; entry.index_tex = index_tex;
+            entry.hd_w = (int)info.hd_width; entry.hd_h = (int)info.hd_height;
+            entry.native_w = (int)info.native_width; entry.native_h = (int)info.native_height;
+            entry.palette_count = info.palette_count;
+            entry.failed = 0;
+        } else {
+            if (hd_tex) glDeleteTextures(1, &hd_tex);
+            if (index_tex) glDeleteTextures(1, &index_tex);
+        }
+    }
+    if (s_hd_recolor_cache_count == s_hd_recolor_cache_cap) {
+        int new_cap = s_hd_recolor_cache_cap ? s_hd_recolor_cache_cap * 2 : 16;
+        HdRecolorGlEntry *grown = (HdRecolorGlEntry *)realloc(
+            s_hd_recolor_cache, (size_t)new_cap * sizeof(HdRecolorGlEntry));
+        if (grown) { s_hd_recolor_cache = grown; s_hd_recolor_cache_cap = new_cap; }
+    }
+    if (s_hd_recolor_cache_count < s_hd_recolor_cache_cap)
+        s_hd_recolor_cache[s_hd_recolor_cache_count++] = entry;
+    if (entry.failed) return 0;
+    *out = entry;
+    return 1;
+}
 
 /* 2026-09-09 body-shift investigation: per-entry scale-ratio ring. Checks a
  * specific hypothesis for the RESIDUAL shift left after switching HD_FS/
@@ -2608,6 +2849,52 @@ static void hd_gl_init(void) {
     p_glUniform1i(s_hd_uPieceCount, 0);
     p_glUniform1i(s_hd_uHasPrimLimits, 0);
     p_glUseProgram(0);
+
+    /* Live-GPU-recolor program/state (2026-09-11) -- see HD_RECOLOR_FS's
+     * header comment. Shares s_hd_vao/s_hd_vbo with s_hd_prog (identical
+     * vertex layout, both built from the same HD_VS) rather than duplicating
+     * them. */
+    s_hd_recolor_prog = build_program(HD_VS, HD_RECOLOR_FS);
+    if (s_hd_recolor_prog) {
+        s_hdr_uXoff  = p_glGetUniformLocation(s_hd_recolor_prog, "u_xoff");
+        s_hdr_uXhalf = p_glGetUniformLocation(s_hd_recolor_prog, "u_xhalf");
+        s_hdr_uShift = p_glGetUniformLocation(s_hd_recolor_prog, "u_shift");
+        s_hdr_uTex   = p_glGetUniformLocation(s_hd_recolor_prog, "u_tex");
+        s_hdr_uTexSize = p_glGetUniformLocation(s_hd_recolor_prog, "u_tex_size");
+        s_hdr_uIndex = p_glGetUniformLocation(s_hd_recolor_prog, "u_index");
+        s_hdr_uIndexSize = p_glGetUniformLocation(s_hd_recolor_prog, "u_index_size");
+        s_hdr_uIndexLimits = p_glGetUniformLocation(s_hd_recolor_prog, "u_index_limits");
+        s_hdr_uRecolorTable = p_glGetUniformLocation(s_hd_recolor_prog, "u_recolor_table");
+        s_hdr_uRaw = p_glGetUniformLocation(s_hd_recolor_prog, "u_raw");
+        s_hdr_uPrimLimits = p_glGetUniformLocation(s_hd_recolor_prog, "u_prim_limits");
+        s_hdr_uHasPrimLimits = p_glGetUniformLocation(s_hd_recolor_prog, "u_has_prim_limits");
+        s_hdr_uSilhouette = p_glGetUniformLocation(s_hd_recolor_prog, "u_silhouette_mode");
+        p_glUseProgram(s_hd_recolor_prog);
+        p_glUniform1f(s_hdr_uXoff, 0.0f);
+        p_glUniform1f(s_hdr_uXhalf, 512.0f);
+        p_glUniform1f(s_hdr_uShift, 0.5f / (float)s_scale - 1.0f / 64.0f);
+        p_glUniform1i(s_hdr_uTex, 0);
+        p_glUniform1i(s_hdr_uIndex, 2);
+        p_glUniform1i(s_hdr_uRecolorTable, 3);
+        p_glUniform1i(s_hdr_uHasPrimLimits, 0);
+        p_glUseProgram(0);
+
+        /* Allocated once at a fixed size (covers every legal palette_count --
+         * 16 for 4bpp, up to 256 for 8bpp) and re-filled per draw via
+         * glTexSubImage2D (see draw_hd_recolor_triangle) rather than
+         * recreated -- a plain data texture, not mipmapped/filtered (NEAREST,
+         * CLAMP_TO_EDGE), so there is nothing size-dependent to reallocate. */
+        glGenTextures(1, &s_hd_recolor_table_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0 + 3);
+        glBindTexture(GL_TEXTURE_2D, s_hd_recolor_table_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, HD_RECOLOR_TABLE_CAP, 2, 0,
+                     GL_RGBA, GL_FLOAT, NULL);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+    }
 
     const char *debug_missing_env = getenv("PSXRECOMP_HD_TEXTURE_DEBUG_MISSING");
     if (debug_missing_env && debug_missing_env[0] && debug_missing_env[0] != '0')
@@ -3298,11 +3585,19 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
          * meant to guard against is real but narrow enough in practice that
          * a blanket per-primitive erosion is the wrong tool -- if revisited,
          * it needs to be conditional on region size/context (e.g. only for
-         * primitives well above small-tile size) rather than unconditional. */
-        if (px0 < 0) px0 = 0;
-        if (py0 < 0) py0 = 0;
-        if (px1 > tex_w - 1) px1 = tex_w - 1;
-        if (py1 > tex_h - 1) py1 = tex_h - 1;
+         * primitives well above small-tile size) rather than unconditional.
+         *
+         * Both bounds of both px0/px1 and py0/py1 must be clamped -- see
+         * draw_hd_recolor_triangle's matching u_index_limits comment: only
+         * clamping px0/py0's lower bound and px1/py1's upper bound (as this
+         * used to do) inverts the range whenever the whole raw range sits
+         * entirely outside [0, tex_w/h - 1] on one side, which clamp(minVal,
+         * maxVal) with minVal > maxVal then collapses to a single fixed
+         * texel for the whole triangle regardless of uv. */
+        if (px0 < 0) px0 = 0; else if (px0 > tex_w - 1) px0 = tex_w - 1;
+        if (px1 < 0) px1 = 0; else if (px1 > tex_w - 1) px1 = tex_w - 1;
+        if (py0 < 0) py0 = 0; else if (py0 > tex_h - 1) py0 = tex_h - 1;
+        if (py1 < 0) py1 = 0; else if (py1 > tex_h - 1) py1 = tex_h - 1;
         p_glUniform4i(s_hd_uPrimLimits, px0, py0, px1, py1);
         p_glUniform1i(s_hd_uHasPrimLimits, 1);
     } else {
@@ -3377,6 +3672,284 @@ static void draw_hd_replacement_triangle(const int *xs, const int *ys,
     }
     hr_end();
     s_hd_draws_issued++;
+}
+
+static uint64_t s_hd_recolor_draws_issued = 0;
+uint64_t gl_renderer_hd_recolor_draws_issued(void) { return s_hd_recolor_draws_issued; }
+
+/* 2026-09-11 investigation: a character (texture_hash d0189fef) reported
+ * live as rendering "mostly transparent" through the new recolor path, even
+ * though its master's index map never references an out-of-range palette
+ * slot (ruled out separately) -- this records, per DISTINCT texture_hash,
+ * how many of the CURRENT live-palette read's table entries came out opaque
+ * (scale.a==1) vs not, so a live debug query can tell whether the cause is
+ * the live CLUT read looking mostly empty/transparent at this clut_x/clut_y
+ * (this counter would show few/no opaque entries) or something else
+ * entirely further down the pipeline (native mask-bit cutout, discard logic)
+ * that this counter can't see (it would show mostly-opaque here despite the
+ * character still vanishing on screen). Deduplicated by texture_hash (not a
+ * chronological ring) for the same reason hd_scale_diag is: one frequently-
+ * redrawn texture would otherwise crowd out everything else between queries. */
+#define HD_RECOLOR_DIAG_CAP 32
+#define HD_RECOLOR_DIAG_MAX_TRANSPARENT 24
+typedef struct {
+    uint32_t texture_hash;
+    int clut_x, clut_y, depth;
+    uint32_t palette_count, opaque_count;
+    /* 2026-09-12 bcf02fd0-invisible-torso investigation: first few indices
+     * (in ascending order) whose scale.a came out < 0.5, so a live query can
+     * be cross-checked against the master's own index.png actual used-value
+     * range -- if any of THOSE specific index values show up transparent
+     * here, the per-index live-alpha rule itself is wrong for real content;
+     * if the transparent indices are all outside index.png's used range, the
+     * bug is elsewhere (e.g. an idx/table misalignment upstream). */
+    uint16_t transparent_indices[HD_RECOLOR_DIAG_MAX_TRANSPARENT];
+    uint32_t transparent_indices_count; /* how many of the array slots are valid */
+    /* 2026-09-12: last-drawn triangle's computed u_index_limits/u_prim_limits
+     * (see draw_hd_recolor_triangle) -- checking whether ix0<=ix1/iy0<=iy1
+     * actually hold. If a per-primitive limits computation goes inverted for
+     * some triangle (e.g. a bad u_first/u_last from the miss-branch anchor
+     * search), GLSL's clamp(x, minVal, maxVal) with minVal>maxVal silently
+     * collapses to a single fixed value for the WHOLE triangle regardless of
+     * its real uv, which would explain a whole mesh part (torso) reading one
+     * wrong index and vanishing while a sibling part (face) on the same
+     * texture_hash renders fine. */
+    int ix0, iy0, ix1, iy1, px0, py0, px1, py1;
+} HdRecolorDiagEntry;
+
+static HdRecolorDiagEntry s_hd_recolor_diag[HD_RECOLOR_DIAG_CAP];
+static int s_hd_recolor_diag_count = 0;
+
+static void hd_recolor_diag_record_limits(uint32_t texture_hash,
+                                          int ix0, int iy0, int ix1, int iy1,
+                                          int px0, int py0, int px1, int py1) {
+    for (int i = 0; i < s_hd_recolor_diag_count; i++) {
+        if (s_hd_recolor_diag[i].texture_hash != texture_hash) continue;
+        s_hd_recolor_diag[i].ix0 = ix0; s_hd_recolor_diag[i].iy0 = iy0;
+        s_hd_recolor_diag[i].ix1 = ix1; s_hd_recolor_diag[i].iy1 = iy1;
+        s_hd_recolor_diag[i].px0 = px0; s_hd_recolor_diag[i].py0 = py0;
+        s_hd_recolor_diag[i].px1 = px1; s_hd_recolor_diag[i].py1 = py1;
+        return;
+    }
+}
+
+static void hd_recolor_diag_record(uint32_t texture_hash, int clut_x, int clut_y, int depth,
+                                   uint32_t palette_count, const float *scale_table) {
+    uint32_t opaque = 0;
+    uint16_t transparent_indices[HD_RECOLOR_DIAG_MAX_TRANSPARENT];
+    uint32_t transparent_count = 0;
+    for (uint32_t i = 0; i < palette_count; i++) {
+        if (scale_table[i * 4 + 3] >= 0.5f) {
+            opaque++;
+        } else if (transparent_count < HD_RECOLOR_DIAG_MAX_TRANSPARENT) {
+            transparent_indices[transparent_count++] = (uint16_t)i;
+        }
+    }
+    for (int i = 0; i < s_hd_recolor_diag_count; i++) {
+        if (s_hd_recolor_diag[i].texture_hash != texture_hash) continue;
+        s_hd_recolor_diag[i].clut_x = clut_x; s_hd_recolor_diag[i].clut_y = clut_y;
+        s_hd_recolor_diag[i].depth = depth;
+        s_hd_recolor_diag[i].palette_count = palette_count;
+        s_hd_recolor_diag[i].opaque_count = opaque;
+        memcpy(s_hd_recolor_diag[i].transparent_indices, transparent_indices, sizeof(transparent_indices));
+        s_hd_recolor_diag[i].transparent_indices_count = transparent_count;
+        return;
+    }
+    if (s_hd_recolor_diag_count < HD_RECOLOR_DIAG_CAP) {
+        HdRecolorDiagEntry *e = &s_hd_recolor_diag[s_hd_recolor_diag_count++];
+        e->texture_hash = texture_hash; e->clut_x = clut_x; e->clut_y = clut_y;
+        e->depth = depth; e->palette_count = palette_count; e->opaque_count = opaque;
+        memcpy(e->transparent_indices, transparent_indices, sizeof(transparent_indices));
+        e->transparent_indices_count = transparent_count;
+    }
+}
+
+void gl_renderer_hd_recolor_diag_dump(char *out, size_t cap) {
+    size_t pos = 0;
+    int written = snprintf(out, cap, "{\"count\":%d,\"entries\":[", s_hd_recolor_diag_count);
+    if (written < 0) { if (cap) out[0] = '\0'; return; }
+    pos = (size_t)written;
+    for (int i = 0; i < s_hd_recolor_diag_count && pos < cap; i++) {
+        const HdRecolorDiagEntry *e = &s_hd_recolor_diag[i];
+        written = snprintf(out + pos, cap - pos,
+                           "%s{\"texhash\":\"%08x\",\"clut_x\":%d,\"clut_y\":%d,\"depth\":%d,"
+                           "\"palette_count\":%u,\"opaque_count\":%u,"
+                           "\"index_limits\":[%d,%d,%d,%d],\"prim_limits\":[%d,%d,%d,%d],"
+                           "\"transparent_indices\":[",
+                           i == 0 ? "" : ",", e->texture_hash, e->clut_x, e->clut_y, e->depth,
+                           e->palette_count, e->opaque_count,
+                           e->ix0, e->iy0, e->ix1, e->iy1, e->px0, e->py0, e->px1, e->py1);
+        if (written < 0) break;
+        pos += (size_t)written;
+        for (uint32_t j = 0; j < e->transparent_indices_count && pos < cap; j++) {
+            written = snprintf(out + pos, cap - pos, "%s%u", j == 0 ? "" : ",", e->transparent_indices[j]);
+            if (written < 0) break;
+            pos += (size_t)written;
+        }
+        if (pos < cap) { written = snprintf(out + pos, cap - pos, "]}"); if (written > 0) pos += (size_t)written; }
+    }
+    if (pos < cap) snprintf(out + pos, cap - pos, "]}");
+}
+
+/* Draws ONE textured triangle through the live-GPU-recolor pipeline (2026-
+ * 09-11) -- the recolorable-master counterpart to draw_hd_replacement_
+ * triangle above, reached only when the exact-match path missed but a master
+ * exists for the covering upload's texture_hash (see the call site's
+ * has_miss_texture_hash check). master, scale_table (palette_count*4 floats,
+ * RGBA)/offset_table (palette_count*3, RGB) come from
+ * gpu_hd_texture_pack_get_recolor_master/gpu_hd_texture_pack_compute_
+ * recolor_table; orig_texinfo is REQUIRED here (unlike the replacement path's
+ * optional one) since a recolor draw only ever originates from a real VRAM
+ * primitive -- there is no calibration-test/coverage-debug-marker caller for
+ * this path. u_scale/u_offset/v_scale/v_offset are the SAME values
+ * gpu_hd_texture_pack_match already computed for the covering upload (see
+ * gpu.c's miss branch), since the master's native_width/native_height are by
+ * construction that same upload's own texel dimensions. */
+static void draw_hd_recolor_triangle(const int *xs, const int *ys,
+                                     const int *us, const int *vs,
+                                     const float *col, int rawtex,
+                                     const HdRecolorGlEntry *master,
+                                     float u_scale, float u_offset,
+                                     float v_scale, float v_offset,
+                                     const float *scale_table, const float *offset_table,
+                                     const float *qs,
+                                     const int *orig_texinfo) {
+    float verts[3 * 10];
+    for (int i = 0; i < 3; i++) {
+        verts[i * 10 + 0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
+        verts[i * 10 + 1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
+        verts[i * 10 + 2] = (float)us[i] * u_scale + u_offset;
+        verts[i * 10 + 3] = (float)vs[i] * v_scale + v_offset;
+        verts[i * 10 + 4] = col[i * 3 + 0];
+        verts[i * 10 + 5] = col[i * 3 + 1];
+        verts[i * 10 + 6] = col[i * 3 + 2];
+        verts[i * 10 + 7] = qs ? qs[i] : 0.0f;
+        verts[i * 10 + 8] = (float)us[i];
+        verts[i * 10 + 9] = (float)vs[i];
+    }
+    hr_begin(1);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, master->hd_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+    glBindTexture(GL_TEXTURE_2D, master->index_tex);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 3);
+    glBindTexture(GL_TEXTURE_2D, s_hd_recolor_table_tex);
+    {
+        /* Expand offset_table (tightly packed RGB) into RGBA for the
+         * texture-row upload -- the alpha lane is unused (see
+         * HD_RECOLOR_FS's u_recolor_table comment), but glTexSubImage2D with
+         * GL_RGBA needs 4 components/texel regardless. count is at most
+         * HD_RECOLOR_TABLE_CAP (256, palette_count's own hard ceiling --
+         * 8bpp's 256 entries -- see hd_texture_pack.h), so a fixed on-stack
+         * buffer here is safe. */
+        uint32_t count = master->palette_count;
+        if (count > HD_RECOLOR_TABLE_CAP) count = HD_RECOLOR_TABLE_CAP;
+        float offset_rgba[HD_RECOLOR_TABLE_CAP * 4];
+        for (uint32_t i = 0; i < count; i++) {
+            offset_rgba[i * 4 + 0] = offset_table[i * 3 + 0];
+            offset_rgba[i * 4 + 1] = offset_table[i * 3 + 1];
+            offset_rgba[i * 4 + 2] = offset_table[i * 3 + 2];
+            offset_rgba[i * 4 + 3] = 0.0f;
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)count, 1, GL_RGBA, GL_FLOAT, scale_table);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 1, (GLsizei)count, 1, GL_RGBA, GL_FLOAT, offset_rgba);
+    }
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    p_glUseProgram(s_hd_recolor_prog);
+    p_glUniform1i(s_hdr_uRaw, rawtex);
+    p_glUniform1i(s_hdr_uSilhouette, s_silhouette_mode);
+    p_glUniform2f(s_hdr_uTexSize, (float)master->hd_w, (float)master->hd_h);
+    p_glUniform2f(s_hdr_uIndexSize, (float)master->native_w, (float)master->native_h);
+    /* Native-space (index.png resolution) clamp. orig_texinfo[5..8]
+     * (u_first/v_first/u_last/v_last) are native texel coordinates relative
+     * to the CURRENT draw's own texpage -- NOT relative to the master's own
+     * anchor upload, which is a DIFFERENT upload sharing the same
+     * texture_hash whenever this draw took the miss/live-recolor fallback
+     * (the whole reason this function runs instead of draw_hd_replacement_
+     * triangle). u_scale/u_offset/v_scale/v_offset already carry exactly the
+     * affine remap from this draw's native space into the anchor upload's
+     * own (source_word_x/source_y-relative) space -- gpu_hd_texture_pack_
+     * match's miss branch computes them for precisely this purpose, and the
+     * u_prim_limits block just below already applies them (scaled by hd_w/
+     * hd_h) to find the matching window in the UPSCALED replacement image.
+     * This block used to skip that remap entirely and clamp the RAW
+     * orig_texinfo values straight into [0, native_w/h-1], which is only
+     * correct when u_offset/v_offset are exactly 0 (this draw's own upload
+     * IS the anchor). Confirmed live via bcf02fd0's invisible-torso bug: the
+     * raw v_first/v_last (213/300ish) fell entirely outside the anchor's
+     * 128-tall native space, clamping to a single degenerate row (127) that
+     * sampled one fixed, wrong palette index for the WHOLE triangle instead
+     * of the real per-pixel content -- while the matching u_prim_limits
+     * block (which DOES apply the remap) simultaneously reported a valid,
+     * non-degenerate window ([160,340]-[196,420] in HD space), proving the
+     * remap itself is correct and this block's omission of it was the actual
+     * bug (see HD_RECOLOR_INVISIBLE_TORSO_INVESTIGATION.md). */
+    {
+        float ru0 = (float)orig_texinfo[5] * u_scale + u_offset;
+        float ru1 = (float)orig_texinfo[7] * u_scale + u_offset;
+        float rv0 = (float)orig_texinfo[6] * v_scale + v_offset;
+        float rv1 = (float)orig_texinfo[8] * v_scale + v_offset;
+        int ix0 = (int)floorf((ru0 < ru1 ? ru0 : ru1) * (float)master->native_w);
+        int ix1 = (int)floorf((ru0 < ru1 ? ru1 : ru0) * (float)master->native_w);
+        int iy0 = (int)floorf((rv0 < rv1 ? rv0 : rv1) * (float)master->native_h);
+        int iy1 = (int)floorf((rv0 < rv1 ? rv1 : rv0) * (float)master->native_h);
+        /* Both bounds of both ix0/ix1 and iy0/iy1 clamped into [0,
+         * native_w/h-1] -- clamp is monotonic, so clamping both bounds of
+         * both values guarantees lo<=hi holds even if the remapped range
+         * still falls partly or wholly out of range. */
+        if (ix0 < 0) ix0 = 0; else if (ix0 > master->native_w - 1) ix0 = master->native_w - 1;
+        if (ix1 < 0) ix1 = 0; else if (ix1 > master->native_w - 1) ix1 = master->native_w - 1;
+        if (iy0 < 0) iy0 = 0; else if (iy0 > master->native_h - 1) iy0 = master->native_h - 1;
+        if (iy1 < 0) iy1 = 0; else if (iy1 > master->native_h - 1) iy1 = master->native_h - 1;
+        p_glUniform4i(s_hdr_uIndexLimits, ix0, iy0, ix1, iy1);
+        hd_recolor_diag_record_limits(master->texture_hash, ix0, iy0, ix1, iy1, 0, 0, 0, 0);
+    }
+    /* Hd_rgba-space clamp -- verbatim port of draw_hd_replacement_triangle's
+     * u_prim_limits computation (see its comment for the full rationale),
+     * just against this program's own uniform locations. */
+    {
+        float ru0 = ((float)orig_texinfo[5] * u_scale + u_offset) * (float)master->hd_w;
+        float ru1 = ((float)orig_texinfo[7] * u_scale + u_offset) * (float)master->hd_w;
+        float rv0 = ((float)orig_texinfo[6] * v_scale + v_offset) * (float)master->hd_h;
+        float rv1 = ((float)orig_texinfo[8] * v_scale + v_offset) * (float)master->hd_h;
+        int px0 = (int)floorf(ru0 < ru1 ? ru0 : ru1);
+        int px1 = (int)floorf(ru0 < ru1 ? ru1 : ru0);
+        int py0 = (int)floorf(rv0 < rv1 ? rv0 : rv1);
+        int py1 = (int)floorf(rv0 < rv1 ? rv1 : rv0);
+        /* Both bounds of both px0/px1 and py0/py1 -- see the matching
+         * u_index_limits comment above for why asymmetric clamping (only
+         * px0/py0's lower bound, only px1/py1's upper bound) can invert the
+         * range. */
+        if (px0 < 0) px0 = 0; else if (px0 > master->hd_w - 1) px0 = master->hd_w - 1;
+        if (px1 < 0) px1 = 0; else if (px1 > master->hd_w - 1) px1 = master->hd_w - 1;
+        if (py0 < 0) py0 = 0; else if (py0 > master->hd_h - 1) py0 = master->hd_h - 1;
+        if (py1 < 0) py1 = 0; else if (py1 > master->hd_h - 1) py1 = master->hd_h - 1;
+        p_glUniform4i(s_hdr_uPrimLimits, px0, py0, px1, py1);
+        p_glUniform1i(s_hdr_uHasPrimLimits, 1);
+        for (int di = 0; di < s_hd_recolor_diag_count; di++) {
+            if (s_hd_recolor_diag[di].texture_hash != master->texture_hash) continue;
+            s_hd_recolor_diag[di].px0 = px0; s_hd_recolor_diag[di].py0 = py0;
+            s_hd_recolor_diag[di].px1 = px1; s_hd_recolor_diag[di].py1 = py1;
+            break;
+        }
+    }
+    glDisable(GL_BLEND);
+    mask_stencil(s_mask_set);
+    p_glBindVertexArray(s_hd_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_hd_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+        !mirror_geo_center_only(xs, 3)) {
+        int dx = wide_dx();
+        gl_perf_mirror_begin();
+        wide_target_begin(dx, s_hdr_uXoff, s_hdr_uXhalf);
+        if (s_ws_ablate != 2) glDrawArrays(GL_TRIANGLES, 0, 3);
+        wide_target_end(s_hdr_uXoff, s_hdr_uXhalf);
+        gl_perf_mirror_end();
+    }
+    hr_end();
+    s_hd_recolor_draws_issued++;
 }
 
 static void gpu_textured_rect(int x,int y,int w,int h,
@@ -3908,6 +4481,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * trackers stay fed every frame regardless (gp0_commit_cpu_to_vram),
          * so this is the only place that needs to know which mode is
          * active. */
+        uint32_t hd_miss_texture_hash = 0;
+        int hd_has_miss_texture_hash = 0;
         const int hd_backend = gpu_hd_texture_get_backend();
         if (hd_backend == 2) {
             hd_hit = 0;
@@ -3916,7 +4491,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                                lim[0], lim[2], lim[1], lim[3],
                                                &hd_entry_id, &hd_png_path,
                                                &hd_u_scale, &hd_u_offset,
-                                               &hd_v_scale, &hd_v_offset);
+                                               &hd_v_scale, &hd_v_offset,
+                                               &hd_miss_texture_hash, &hd_has_miss_texture_hash);
         } else {
             hd_hit = gpu_hd_texture_dump_match(base_x, base_y, depth, lim[0], lim[2], lim[1], lim[3],
                                                clut_x, clut_y,
@@ -3949,6 +4525,42 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                              orig_texinfo, NULL, 0);
             }
             return;
+        }
+        /* Live-GPU-recolor fallback (2026-09-11, Beetle-format only -- see
+         * hd_texture_pack.h's HdRecolorMasterInfo comment): the plain match
+         * above missed, but gpu_hd_texture_pack_match still reports which
+         * texture_hash a covering upload WOULD have needed. If that
+         * texture_hash has a recolorable master, recolor it live against the
+         * CURRENT clut instead of falling through to native -- this is what
+         * makes a status-flash tint or Vagrant Story's whole-scene battle-
+         * mode retint show correctly on HD-replaced content instead of
+         * either a stale/wrong-colored cached bake or a native-only fallback.
+         * Tried before the fused-page path below since a recolorable master,
+         * when one exists, is a strictly better answer than compositing
+         * native fallback pieces alongside unrelated HD fragments. */
+        if (hd_backend == 1 && hd_has_miss_texture_hash) {
+            HdRecolorGlEntry master;
+            if (hd_gl_get_recolor_master(hd_miss_texture_hash, &master)) {
+                float scale_table[HD_RECOLOR_TABLE_CAP * 4];
+                float offset_table[HD_RECOLOR_TABLE_CAP * 3];
+                uint32_t count = gpu_hd_texture_pack_compute_recolor_table(
+                    hd_miss_texture_hash, clut_x, clut_y, depth, scale_table, offset_table);
+                if (count > 0 && count == master.palette_count) {
+                    s_hd_matches_seen++;
+                    hd_recolor_diag_record(hd_miss_texture_hash, clut_x, clut_y, depth,
+                                           count, scale_table);
+                    flush_flat_batch();
+                    flush_tex_batch();
+                    /* {tpage_x,tpage_y,clut_x,clut_y,depth,u_first,v_first,u_last,v_last} */
+                    int orig_texinfo[9] = { base_x, base_y, clut_x, clut_y, depth,
+                                            lim[0], lim[1], lim[2], lim[3] };
+                    draw_hd_recolor_triangle(xs, ys, us, vs, col, rawtex, &master,
+                                             hd_u_scale, hd_u_offset, hd_v_scale, hd_v_offset,
+                                             scale_table, offset_table,
+                                             s_pq_valid ? s_pq : NULL, orig_texinfo);
+                    return;
+                }
+            }
         }
         /* Fused-page fallback (opt-in, off by default -- see
          * gpu_hd_texture_fusion_set): only tried for Beetle-format when the
@@ -6124,6 +6736,8 @@ static void gl_swap_with_osd(void) {
             if (psx_texpack_menu_overlay_image(&px, &ow, &oh) && px)
                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
             if (psx_font_picker_menu_overlay_image(&px, &ow, &oh) && px)
+                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+            if (psx_cheats_menu_overlay_image(&px, &ow, &oh) && px)
                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
         }
     }

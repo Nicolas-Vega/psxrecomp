@@ -162,11 +162,54 @@ int  gpu_hd_texture_get_backend(void);
  * combination of the entry's texture_hash/palette_hash, suitable as
  * gpu_gl_renderer.c's hd_gl_get_texture cache key in place of hd_texture_dump's
  * per-entry array index (Beetle's format has no such stable small integer). */
+/* miss_texture_hash/has_miss_texture_hash are filled EVEN ON A MISS (return
+ * 0): see hd_texture_pack.h's HdTextureMatch::miss_texture_hash comment. When
+ * set, u_scale/u_offset/v_scale/v_offset are ALSO still filled (from the
+ * covering-but-unmatched upload's own dimensions/anchor, same formula as the
+ * FOUND case below) so a caller doing live GPU recoloring can map this
+ * primitive's native texel coords into the recolorable master's hd_rgba/index
+ * textures without re-deriving that math -- see
+ * gpu_hd_texture_pack_get_recolor_master/gpu_hd_texture_pack_compute_recolor_
+ * table just below. */
 int gpu_hd_texture_pack_match(int texpage, int clut_x, int clut_y,
                               int u_first, int u_last, int v_first, int v_last,
                               uint32_t* cache_key, const char** png_path,
                               float* u_scale, float* u_offset,
-                              float* v_scale, float* v_offset);
+                              float* v_scale, float* v_offset,
+                              uint32_t* miss_texture_hash, int* has_miss_texture_hash);
+
+/* Live-GPU-recolor support (2026-09-11), reached only when
+ * gpu_hd_texture_pack_match above returns 0 but sets *has_miss_texture_hash --
+ * see hd_texture_pack.h's HdRecolorMasterInfo/hd_texture_pack_get_recolor_master
+ * comment for the full rationale (a status-flash or whole-scene retint can
+ * ask for a brand-new palette on many textures every single frame; baking a
+ * new HD image and encoding it to disk for each is too slow to do
+ * synchronously that often). hd_rgba/index mirror HdRecolorMasterInfo exactly
+ * (valid until the pack is destroyed -- safe to cache as GL textures keyed by
+ * texture_hash for the pack's lifetime, same convention as hd_gl_get_texture's
+ * cache for ordinary replacement PNGs). */
+typedef struct GpuHdRecolorMasterInfo {
+    const uint8_t* hd_rgba;
+    uint32_t hd_width, hd_height;
+    const uint8_t* index;
+    uint32_t native_width, native_height;
+    uint32_t palette_count;
+} GpuHdRecolorMasterInfo;
+
+int gpu_hd_texture_pack_get_recolor_master(uint32_t texture_hash, GpuHdRecolorMasterInfo* out_info);
+
+/* Computes the master's per-palette-index (scale, offset) table against the
+ * CURRENTLY ACTIVE vram/clut (this module's own vram[], not the caller's) --
+ * out_scale must hold at least palette_count*4 floats (RGBA, A = opacity
+ * mask), out_offset at least palette_count*3 (RGB). Returns the palette_count
+ * actually used (matches GpuHdRecolorMasterInfo::palette_count from the
+ * matching gpu_hd_texture_pack_get_recolor_master call), or 0 if there's no
+ * master for texture_hash or depth has no palette (16bpp). Cheap (at most 256
+ * entries) -- meant to be called once per (texture_hash, palette_hash)
+ * combination actually drawn, not cached across frames. */
+uint32_t gpu_hd_texture_pack_compute_recolor_table(uint32_t texture_hash,
+                                                   int clut_x, int clut_y, int depth,
+                                                   float* out_scale, float* out_offset);
 
 /* Fused-page opt-in (title-configurable, [video] hd_texture_page_fusion in
  * game.toml) -- off by default so no existing title's rendering changes.
@@ -287,6 +330,47 @@ void gpu_hd_texture_silhouette_mode_set(int mode);
  * gl_renderer_gradient_diag_dump. Writes a small JSON object into out. */
 void gpu_hd_texture_gradient_diag_dump(char *out, size_t cap);
 
+/* 2026-09-11 investigation: per-texture_hash snapshot of the live recolor
+ * table's opaque/transparent split (see gpu_gl_renderer.c's
+ * hd_recolor_diag_record) -- lets a live debug query tell whether a
+ * character rendering "mostly transparent" through the recolor path is
+ * because the live CLUT read at that clut_x/clut_y looks mostly empty
+ * (opaque_count near 0) or because something later in the pipeline (the
+ * native mask-bit cutout) is discarding it despite the table itself being
+ * mostly opaque. Writes a JSON object into out. */
+void gpu_hd_texture_recolor_diag_dump(char *out, size_t cap);
+
+/* Upload-tracking-state wire blob for BOTH independent HD texture backends
+ * (hd_texture_pack's Beetle-format tracker and hd_texture_dump's DuckStation-
+ * format tracker, combined -- see BS_SEC_HD_TRACKER's comment in boot_state.h
+ * for the wire shape) -- lets a capture tool snapshot exactly which VRAM
+ * uploads EITHER matcher currently knows about, alongside a VRAM snapshot
+ * and the frame's GP0 stream (gpu_capture_state debug command), so a later
+ * deterministic replay can restore matching behavior identically instead of
+ * silently falling back to native (the savestate trap documented in the
+ * psx-recomp-render-ab-testing-methodology memory: upload tracking is
+ * runtime-only and NOT part of a savestate). Returns 0 and leaves *out_data
+ * untouched on failure (e.g. neither pack loaded still succeeds with an
+ * empty blob; this only fails on internal bounds checks). Caller must
+ * free() *out_data on success. */
+int gpu_hd_texture_tracking_state_save(uint8_t **out_data, size_t *out_size);
+
+/* Inverse of gpu_hd_texture_tracking_state_save. A NULL data / zero size
+ * (an empty uploads.bin capture, meaning no HD pack was loaded at capture
+ * time) clears tracking rather than failing, matching what an empty upload
+ * history actually means. Returns 0 only when `data` is non-empty but fails
+ * to parse. */
+int gpu_hd_texture_tracking_state_load(const uint8_t *data, size_t size);
+
+/* boot_state.c BS_SEC_HD_TRACKER adapters -- see that section's comment
+ * (boot_state.h) for why a savestate needs to carry the HD upload tracker
+ * at all: it's host-side bookkeeping with no hardware analog, built only by
+ * observing real GP0 traffic, and without it a loaded state leaves HD
+ * texture matching unable to find anything not re-uploaded since the load. */
+uint32_t gpu_hd_tracking_snapshot_bytes(void);
+void     gpu_hd_tracking_snapshot_write(uint8_t *p);
+int      gpu_hd_tracking_snapshot_read(const uint8_t *p, uint32_t len);
+
 /* One-off synthetic ground-truth calibration test (see gpu_gl_renderer.c's
  * gl_renderer_calib_test comment): draws a static, fully-opaque checkerboard
  * through the native path at a fixed spot, and through a hand-built exact
@@ -346,6 +430,91 @@ void gpu_get_draw_area(GpuDrawArea* out);
 int  gpu_last_frame_vertical_split_screen(void);
 void gpu_vertical_split_debug(int *active, int *left_age, int *right_age);
 uint16_t gpu_vram_peek(int x, int y);
+
+/* Bulk VRAM read for capture/replay tooling (gpu_capture_state debug
+ * command): copies the full 1024x512 CPU VRAM mirror (row-major,
+ * out[y*1024+x]) into `out`, which must hold 1024*512 uint16_t. Caller must
+ * have already synced the GPU-side FBO down (gl_renderer_sync_cpu /
+ * vk_renderer_sync_cpu), same as screenshot_file -- this reads the CPU
+ * mirror directly, it does not sync itself. */
+void gpu_vram_snapshot(uint16_t *out);
+
+/* Inverse of gpu_vram_snapshot, for deterministic replay (gpu_replay_capture
+ * debug command, see docs/internal/HD_RECOLOR_DETERMINISTIC_AB_CAPTURE_PLAN.md
+ * step 2): restores the full 1024x512 CPU VRAM mirror from `in` AND pushes
+ * the same content to the active render backend via gr_vram_transfer_in, so
+ * the backend's own native-texture mirror is restored too, not just the CPU
+ * array -- otherwise native (non-HD) sampling would keep reading whatever
+ * was resident before the restore. Deliberately bypasses HD-pack upload
+ * tracking (unlike a real GP0(A0) commit): a replay restores the tracker's
+ * exact prior state separately (gpu_hd_texture_tracking_state_load), and
+ * re-tracking this as one monolithic whole-VRAM upload would destroy that
+ * fine-grained history. */
+void gpu_vram_restore(const uint16_t *in);
+
+/* The single GP0 command-word entry point (see gpu_write_gp0's own
+ * definition for the state machine). Exposed here so gpu_replay_capture can
+ * feed a captured word stream back through the SAME code every real GP0
+ * write goes through, rather than a second reimplementation. */
+void gpu_write_gp0(uint32_t val);
+
+/* Reset the low-level GP0 command-assembly parser (collecting-state/word-
+ * count/polyline/VRAM-write progress) without touching VRAM or any draw-
+ * mode/display-config register -- the real-hardware equivalent of
+ * GP1(01h) Reset Command Buffer. A replay pass (gpu_replay_capture,
+ * gpu_replay_isolate) MUST call this before feeding a captured word stream
+ * through gpu_write_gp0: a polyline command (GP0 0x48-0x4F/0x58-0x5F) only
+ * ever has its 1-word header captured (see build_replay_words in
+ * tools/gpu_replay_capture.py), so replaying it flips this parser into a
+ * polyline-collecting state with no terminator ever coming, silently
+ * swallowing every subsequent replayed word (draw calls AND state-setters
+ * alike) for the rest of that pass -- and, without this reset, leaking
+ * into the next pass too, since gpu_vram_restore/gpu_regs_restore don't
+ * touch this state. */
+void gpu_gp0_parser_reset(void);
+
+/* Full GPU register/display-config state NOT covered by vram.bin/
+ * uploads.bin -- draw-mode (GP0 E1h-E6h) and GP1 display-config registers.
+ * Plain, fixed-layout struct: gpu_capture_state/gpu_replay_* read/write it
+ * as a raw memcpy'd blob (gpu_regs.bin), same convention as vram.bin.
+ *
+ * Why this exists (see docs/internal/HD_RECOLOR_DETERMINISTIC_AB_CAPTURE_
+ * PLAN.md's "ambient GPU state" finding): a captured GP0 stream's own
+ * leading E1-E6 commands usually re-establish draw-mode state on replay
+ * (real captures were observed starting every frame with a full E1-E6
+ * reset), so those fields are captured mainly for completeness/safety on a
+ * capture that DOESN'T happen to start that way. But GP1 display-config
+ * registers are a SEPARATE state machine the GP0 stream never touches at
+ * all, and gpu_get_display_info() (used throughout replay/isolate for
+ * fill-rect and readback bounds) reads them LIVE, from the game's current,
+ * still-running state -- capturing them explicitly, once, and forcing them
+ * before every replay pass, is the only way to make a replay's display
+ * geometry independent of whatever the live game's GP1 state happens to be
+ * at call time. Without this, two isolate passes -- or even two runs of the
+ * same analysis against an unchanged bundle -- can silently compute
+ * fill-rect/readback bounds against two different live display
+ * configurations and produce wildly different, seemingly nondeterministic
+ * results despite replaying byte-identical GP0 words. */
+typedef struct {
+    /* GP1(08h) display mode (GPUSTAT bits 16-22) */
+    uint32_t hres2, hres1, vres, video_mode, display_depth, vertical_interlace;
+    uint32_t display_disabled;               /* GP1(03h) */
+    uint32_t display_area_x, display_area_y; /* GP1(05h) */
+    uint32_t h_display_x1, h_display_x2;     /* GP1(06h) */
+    uint32_t v_display_y1, v_display_y2;     /* GP1(07h) */
+    uint32_t dma_direction;                  /* GP1(04h) */
+    uint32_t lcf;                            /* interlace field parity */
+    /* GP0(E1h-E6h) draw-mode state */
+    uint32_t texpage_x, texpage_y, semi_transparency, texpage_colors;
+    uint32_t dither_enabled, draw_to_display, texture_disable;
+    uint32_t texture_window_value;
+    uint32_t draw_area_left, draw_area_top, draw_area_right, draw_area_bottom;
+    int32_t  draw_offset_x, draw_offset_y;
+    uint32_t set_mask_bit, check_mask_bit;
+} GpuCaptureRegs;
+
+void gpu_regs_snapshot(GpuCaptureRegs *out);
+void gpu_regs_restore(const GpuCaptureRegs *in);
 
 /* Shaded quad vertex capture (Phase 4.5 debug). */
 typedef struct {

@@ -105,6 +105,31 @@ enum {
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
                               old blobs (left untouched when absent).          */
+    BS_SEC_HD_TRACKER = 0x11, /* BOTH independent HD-texture-replacement backends'
+                              upload-residency trackers, combined into one wire by
+                              gpu_hd_texture_tracking_state_save/_load (gpu.c):
+                              hd_texture_pack's (Beetle format) own self-describing
+                              blob plus hd_texture_dump's (DuckStation format) own
+                              self-describing blob, length-prefixed so load() can
+                              tell an OLD pack-only blob (written before the second
+                              backend got its own tracking_state_save/_load) apart
+                              from a combined one and fall back gracefully. Both are
+                              host-side bookkeeping with no hardware analog (which
+                              VRAM regions the HD matcher currently believes hold
+                              which content hash), built only by OBSERVING real
+                              GP0 CPU->VRAM/VRAM->VRAM traffic during play. Without
+                              this section, loading a state jumps straight to a
+                              scene the tracker(s) never saw populate, so HD texture
+                              matching finds nothing for anything not re-uploaded
+                              since the load -- a known, previously-undiagnosed
+                              cause of "HD textures don't work after loading a
+                              save" (confirmed for hd_texture_dump specifically:
+                              100% of its match attempts came back "no_tracked_
+                              upload" right after a load, even with hd_texture_
+                              pack's tracker -- fixed first -- restoring fine).
+                              Optional on load for old blobs (tracker(s) simply
+                              left at whatever they already were, same as before
+                              this section existed).                          */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */

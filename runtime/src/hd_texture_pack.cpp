@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -435,6 +437,25 @@ struct EntryRecord {
     bool ambiguous = false;
 };
 
+/* A recolorable master: one reference upscale for a texture_hash that shows
+ * up under many different runtime-computed palettes (room lighting tints,
+ * flicker) -- built offline by tools/disc_texture_export, one per texture,
+ * instead of one PNG per (texture_hash, palette_hash) combination (which for
+ * some textures runs into the hundreds and is unbounded for anything tinted
+ * continuously). index[] is the native-resolution pixel-index grid the
+ * reference upscale was built from (same layout hd_texture_crc32_words_le
+ * hashed into texture_hash), so a newly-seen palette can be recolored
+ * against it live in the GPU shader -- see hd_texture_pack_get_recolor_master
+ * and hd_texture_pack_compute_recolor_table. */
+struct RecolorableMaster {
+    std::vector<uint8_t> hd_rgba;   /* hd_width*hd_height*4 */
+    uint32_t hd_width = 0, hd_height = 0;
+    std::vector<uint8_t> index;     /* native_width*native_height, 1 byte/pixel */
+    uint32_t native_width = 0, native_height = 0;
+    std::vector<uint8_t> ref_palette_rgba; /* ref_palette_count*4, index-ordered */
+    uint32_t ref_palette_count = 0;
+};
+
 struct DecodedImage {
     std::vector<uint8_t> rgba;
     uint32_t width = 0;
@@ -601,6 +622,84 @@ void parse_hashes_ini(const fs::path& path,
     }
 }
 
+/* Defined later in this file (with the rest of the missing-texture-export
+ * helpers); forward-declared here so the master loader below -- which runs
+ * during hd_texture_pack_create, textually earlier in the file -- can decode
+ * a master's reference palette with the exact same PS1 555-color convention
+ * used everywhere else (transparent iff the raw word is all-zero). */
+void hd_texture_rgba5551_to_rgba8(uint16_t c, uint8_t* out4);
+
+#ifndef HD_TEXTURE_PACK_DISABLE_PNG_DECODE
+bool read_whole_file(const fs::path& path, std::vector<uint8_t>* out) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return false;
+    const std::streamoff length = input.tellg();
+    if (length <= 0) return false;
+    out->resize(static_cast<size_t>(length));
+    input.seekg(0);
+    return static_cast<bool>(input.read(reinterpret_cast<char*>(out->data()), length));
+}
+
+/* Loads every masters/<texture_hash>/ bundle (hd.png + index.png + palette.bin,
+ * written by tools/disc_texture_export) into `out`, keyed by the texture_hash
+ * parsed from the directory name. A bundle that fails to load or validate is
+ * skipped silently -- the pack still works with whatever exact-match PNGs
+ * loaded normally, this is a purely additive fallback tier. */
+void load_recolorable_masters(const fs::path& replacement_root,
+                              std::unordered_map<uint32_t, RecolorableMaster>* out) {
+    if (!out) return;
+    std::error_code ec;
+    const fs::path masters_dir = replacement_root / "masters";
+    if (!fs::is_directory(masters_dir, ec)) return;
+    for (fs::directory_iterator it(masters_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec)) continue;
+        const std::string dir_name = it->path().filename().string();
+        if (dir_name.size() != 8) continue;
+        uint32_t texture_hash = 0;
+        if (std::sscanf(dir_name.c_str(), "%8x", &texture_hash) != 1) continue;
+
+        std::vector<uint8_t> hd_encoded, index_encoded, palette_raw;
+        if (!read_whole_file(it->path() / "hd.png", &hd_encoded)) continue;
+        if (!read_whole_file(it->path() / "index.png", &index_encoded)) continue;
+        if (!read_whole_file(it->path() / "palette.bin", &palette_raw)) continue;
+        if (palette_raw.size() < 4) continue;
+        uint32_t palette_count = 0;
+        std::memcpy(&palette_count, palette_raw.data(), 4);
+        if (palette_count == 0 || palette_count > 256 ||
+            palette_raw.size() != 4u + size_t{palette_count} * 2u)
+            continue;
+
+        int hd_w = 0, hd_h = 0, hd_comp = 0;
+        stbi_uc* hd_pixels = stbi_load_from_memory(hd_encoded.data(),
+            static_cast<int>(hd_encoded.size()), &hd_w, &hd_h, &hd_comp, 4);
+        int idx_w = 0, idx_h = 0, idx_comp = 0;
+        stbi_uc* idx_pixels = hd_pixels ? stbi_load_from_memory(index_encoded.data(),
+            static_cast<int>(index_encoded.size()), &idx_w, &idx_h, &idx_comp, 1) : nullptr;
+
+        if (hd_pixels && idx_pixels && hd_w > 0 && hd_h > 0 && idx_w > 0 && idx_h > 0 &&
+            hd_w % idx_w == 0 && hd_h % idx_h == 0 && (hd_w / idx_w) == (hd_h / idx_h)) {
+            RecolorableMaster m;
+            m.hd_width = static_cast<uint32_t>(hd_w);
+            m.hd_height = static_cast<uint32_t>(hd_h);
+            m.hd_rgba.assign(hd_pixels, hd_pixels + static_cast<size_t>(hd_w) * hd_h * 4);
+            m.native_width = static_cast<uint32_t>(idx_w);
+            m.native_height = static_cast<uint32_t>(idx_h);
+            m.index.assign(idx_pixels, idx_pixels + static_cast<size_t>(idx_w) * idx_h);
+            m.ref_palette_count = palette_count;
+            m.ref_palette_rgba.assign(size_t{palette_count} * 4, 0);
+            for (uint32_t i = 0; i < palette_count; ++i) {
+                uint16_t word = 0;
+                std::memcpy(&word, palette_raw.data() + 4 + size_t{i} * 2, 2);
+                hd_texture_rgba5551_to_rgba8(word, m.ref_palette_rgba.data() + size_t{i} * 4);
+            }
+            (*out)[texture_hash] = std::move(m);
+        }
+        if (hd_pixels) stbi_image_free(hd_pixels);
+        if (idx_pixels) stbi_image_free(idx_pixels);
+    }
+}
+#endif
+
 std::vector<Rect> query_rectangles(const HdTextureDrawQuery& query) {
     const unsigned pixels_per_word = query.depth == HD_TEXTURE_DEPTH_4BPP ? 4u :
                                      query.depth == HD_TEXTURE_DEPTH_8BPP ? 2u : 1u;
@@ -649,6 +748,7 @@ struct HdTexturePack {
     std::string asset_root;
     std::string replacement_root;
     std::unordered_map<uint64_t, EntryRecord> entries;
+    std::unordered_map<uint32_t, RecolorableMaster> masters;
     size_t replacement_file_count = 0;
     size_t ambiguous_key_count = 0;
     size_t logical_mapping_count = 0;
@@ -881,6 +981,10 @@ int hd_texture_pack_create(const char* explicit_root,
             if (mapping != mappings.end()) record.logical_path = mapping->second;
             pack->entries.emplace(key, std::move(record));
         }
+
+#ifndef HD_TEXTURE_PACK_DISABLE_PNG_DECODE
+        load_recolorable_masters(replacement, &pack->masters);
+#endif
 
         *out_pack = pack.release();
         return 1;
@@ -1409,25 +1513,37 @@ void hd_texture_pack_export_missing(const HdTexturePack* pack,
                                     uint32_t palette_hash,
                                     const Rect& rect) {
     if (!pack || pack->replacement_root.empty()) return;
-    /* Per-process dedup: a missing texture gets queried again every frame
-     * it's drawn, but decode+encode+disk-existence-check on every one of
-     * those would be wasteful -- only the first sighting per session does
-     * any of that work. */
+    /* Deduped by texture_hash ALONE: the runtime matches HD replacements by
+     * texture_hash and recolors to whatever palette_hash it actually sees
+     * (see the recolorable-master match tier below), so we never need more
+     * than one capture per master -- a second sighting of the same texture
+     * under a different room-lighting tint is not a new asset to chase.
+     * The filename still carries the palette_hash it happened to be drawn
+     * with, though: that's the reference palette a recolorable master gets
+     * built from, and keeping it in the name means no separate sidecar file
+     * is needed to record it. */
     static std::mutex s_export_mutex;
-    static std::unordered_set<uint64_t> s_exported;
-    const uint64_t key = make_key(texture_hash, palette_hash);
+    static std::unordered_set<uint32_t> s_exported;
     {
         std::lock_guard<std::mutex> lock(s_export_mutex);
-        if (!s_exported.insert(key).second) return;
+        if (!s_exported.insert(texture_hash).second) return;
     }
 
     std::error_code ec;
     const fs::path dir = fs::path(pack->replacement_root) / "missing_textures";
     fs::create_directories(dir, ec);
+    char prefix[16];
+    std::snprintf(prefix, sizeof(prefix), "%08x-", texture_hash);
+    /* A prior session may have captured this texture_hash under a DIFFERENT
+     * palette_hash than this one -- can't check via fs::exists on the exact
+     * name we'd write, so scan for any file already claiming this prefix. */
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().filename().string().rfind(prefix, 0) == 0) return;
+    }
+
     char name[64];
     std::snprintf(name, sizeof(name), "%08x-%08x.png", texture_hash, palette_hash);
     const fs::path path = dir / name;
-    if (fs::exists(path, ec)) return; /* already captured in an earlier session */
 
     unsigned w = 0, h = 0;
     std::vector<uint8_t> rgba;
@@ -1435,6 +1551,104 @@ void hd_texture_pack_export_missing(const HdTexturePack* pack,
     if (w == 0 || h == 0) return;
     stbi_write_png(path.string().c_str(), static_cast<int>(w), static_cast<int>(h),
                    4, rgba.data(), static_cast<int>(w) * 4);
+}
+
+/* Computes, per palette index, the affine transform (scale, offset) such
+ * that applying it to the master's reference HD pixel reproduces the LIVE
+ * palette's color for that index -- a ratio scale for normal reference
+ * colors, an additive shift when the reference channel is too close to zero
+ * for a ratio to mean anything (matches this pack's earlier per-pixel CPU
+ * recolor exactly, just evaluated once per PALETTE ENTRY, 16-256 of them,
+ * instead of once per image pixel). Meant to run in a GPU fragment shader:
+ * out_rgb = sample(hd_tex).rgb * scale.rgb + offset, out_a = scale.a
+ * (scale.a is 0 or 1: whether this index is opaque under the LIVE palette --
+ * deliberately NOT multiplied by sample(hd_tex).a, unlike out_rgb. The
+ * master's own reference index 0 is ALWAYS (0,0,0,0) -- the universal PS1
+ * "raw word 0 = transparent" convention -- so hd_tex has no real captured
+ * color there at all; multiplying by it would permanently hide any index
+ * that's opaque under a DIFFERENT live palette even though nothing is wrong
+ * with its color. Matches this project's own HD shader convention anyway --
+ * see gpu_gl_renderer.c's HD_FS comment -- a hard 0/1 cutout for these
+ * primitives, never soft alpha blending, so there was no blend information
+ * to preserve by keeping the multiply. Validated against 1030 real runtime
+ * captures of one texture family, 100% exact once this and the ratio cap
+ * below were both fixed -- see tools/disc_texture_export/
+ * validate_recolor_table.py and docs/DISC_TEXTURE_EXTRACTION.md.)
+ *
+ * Returns the table size actually filled (out_scale/out_offset must hold at
+ * least this many entries) -- ALWAYS 16 or 256, matching
+ * HdRecolorMasterInfo::palette_count's documented range, regardless of
+ * m.ref_palette_count (how many REAL reference colors export_hd_pack.py
+ * happened to record for this texture_hash). 2026-09-11 bugfix: this used
+ * to loop only up to m.ref_palette_count and callers allocated/uploaded
+ * exactly that many table entries -- fine for map/effect textures (always
+ * exactly 16 or 256), but a character/monster SHP or WEP texture's raw index
+ * bytes are literal 0-255 values independent of how many colors that
+ * specific costume's OWN palette happens to define (confirmed live: texture
+ * 83059c83's master has ref_palette_count 160, but its index map legitimately
+ * contains values up to 255). Any index >= ref_palette_count then had NO
+ * table entry written by this function at all, and the GPU-side lookup
+ * texture (gpu_gl_renderer.c's shared, reused-every-draw s_hd_recolor_table_
+ * tex) was only ever glTexSubImage2D'd for the first ref_palette_count
+ * columns -- sampling index 160 there read whatever a PREVIOUS, unrelated
+ * draw's table happened to leave in that column, i.e. genuine garbage --
+ * reported live as parts of a character rendering the wrong color (skin
+ * that should have been gray, wasn't) and other parts going fully
+ * transparent (a shield vanishing), both explained by reading stale/
+ * unrelated scale+offset data. Now every legal index for this master's bit
+ * depth gets a DEFINED entry: real reference/live correction where
+ * m.ref_palette_rgba actually has data for it, otherwise an identity
+ * passthrough (show the master's own upscaled art unmodified) gated by the
+ * REAL live palette's own opacity at that slot -- graceful degradation
+ * instead of undefined behavior. */
+uint32_t compute_recolor_table(const RecolorableMaster& m, const uint8_t* live_palette_rgba,
+                               uint32_t live_count, float* out_scale, float* out_offset) {
+    const uint32_t table_size = m.ref_palette_count <= 16 ? 16u : 256u;
+    for (uint32_t i = 0; i < table_size; ++i) {
+        float scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float offset[3] = {0.0f, 0.0f, 0.0f};
+        if (i < live_count) {
+            const uint8_t* live_c = &live_palette_rgba[size_t{i} * 4];
+            if (i < m.ref_palette_count) {
+                const uint8_t* ref_c = &m.ref_palette_rgba[size_t{i} * 4];
+                for (int ch = 0; ch < 3; ++ch) {
+                    if (ref_c[ch] < 4) {
+                        scale[ch] = 1.0f;
+                        offset[ch] = (static_cast<float>(live_c[ch]) - static_cast<float>(ref_c[ch])) / 255.0f;
+                    } else {
+                        /* Cap at 64, not some smaller "reasonable-looking" value:
+                         * validated against 1030 real runtime captures of one
+                         * texture family (tools/disc_texture_export/
+                         * validate_recolor_table.py) -- an earlier cap of 4.0
+                         * silently wrong-colored 445 of them (real required
+                         * ratios up to ~27x for THIS texture alone), because nothing
+                         * about a dark reference index needing to become a much
+                         * brighter live color is unusual; PS1 games routinely
+                         * reuse one dim "master" pattern under very different
+                         * room lighting. 64 is the true worst case for any legal
+                         * ref_c/live_c pair here (ref_c's own branch above
+                         * guarantees ref_c >= 4, and live_c <= 255, so 255/4 = ~64
+                         * is the largest ratio that could EVER be meaningful --
+                         * this cap now only guards against float weirdness, never
+                         * real data). */
+                        scale[ch] = std::min(64.0f, static_cast<float>(live_c[ch]) / static_cast<float>(ref_c[ch]));
+                        offset[ch] = 0.0f;
+                    }
+                }
+            }
+            /* i >= m.ref_palette_count: no known reference color -- scale/
+             * offset stay identity (1,0), showing the master's own upscaled
+             * pixel as-is, but alpha still comes from the REAL live palette
+             * so a slot the live CLUT doesn't use is still correctly hidden
+             * rather than shown as an arbitrary leftover color. */
+            scale[3] = live_c[3] != 0 ? 1.0f : 0.0f;
+        } else {
+            scale[3] = 0.0f;  /* no live palette data at all for this slot */
+        }
+        std::memcpy(out_scale + size_t{i} * 4, scale, sizeof(scale));
+        std::memcpy(out_offset + size_t{i} * 3, offset, sizeof(offset));
+    }
+    return table_size;
 }
 
 } // namespace
@@ -1481,23 +1695,6 @@ int hd_texture_pack_match(HdTexturePack* pack,
     }
     if (!candidate_serials.empty() && !diag_saw_hash_match) ++g_hd_pack_diag_no_hash_match;
     if (diag_saw_hash_match && !candidate) ++g_hd_pack_diag_not_covered;
-    if (!candidate || !candidate_entry) {
-        /* Missing-texture export: only worth the extra covered_by_upload
-         * pass on the (presumably rare) miss path -- the common matched
-         * path above never pays for it. Picks the first tracked upload that
-         * actually covers this query, so the exported PNG is named with
-         * the exact (hash, palette) pair the pack would need. */
-        for (const uint64_t serial : candidate_serials) {
-            const auto indexed = pack->upload_by_serial.find(serial);
-            if (indexed == pack->upload_by_serial.end() || !indexed->second) continue;
-            const Upload& upload = *indexed->second;
-            if (!covered_by_upload(upload, wanted)) continue;
-            hd_texture_pack_export_missing(pack, *query, upload.hash, palette_hash, wanted[0]);
-            break;
-        }
-        return HD_TEXTURE_LOOKUP_NONE;
-    }
-
     const unsigned pixels_per_word = query->depth == HD_TEXTURE_DEPTH_4BPP ? 4u :
                                      query->depth == HD_TEXTURE_DEPTH_8BPP ? 2u : 1u;
     const unsigned first_x = (unsigned{query->page_x} +
@@ -1505,6 +1702,48 @@ int hd_texture_pack_match(HdTexturePack* pack,
                              (kVramWidth - 1);
     const unsigned first_y = (unsigned{query->page_y} + query->v_first) &
                              (kVramHeight - 1);
+
+    if (!candidate || !candidate_entry) {
+        /* No exact (hash, palette) file. Report which texture_hash this
+         * query WOULD have needed (the first tracked upload that actually
+         * covers it) even on a miss, so the caller can separately check
+         * hd_texture_pack_get_recolor_master for it -- live GPU recoloring
+         * replaced the old CPU pre-bake-and-cache path here (see
+         * docs/DISC_TEXTURE_EXTRACTION.md), which needed this same
+         * information but resolved it internally instead of handing it back.
+         * Also fills the SAME upload_width_words/upload_height/source_word_x/
+         * source_y fields the FOUND path below fills (from THIS covering
+         * upload's own fragments, not candidate's -- there is no candidate
+         * here), since gpu_gl_renderer.c's recolor draw needs the exact same
+         * UV-remap inputs a normal match would have given it to sample the
+         * master's hd_rgba/index textures at the right sub-region. */
+        for (const uint64_t serial : candidate_serials) {
+            const auto indexed = pack->upload_by_serial.find(serial);
+            if (indexed == pack->upload_by_serial.end() || !indexed->second) continue;
+            const Upload& upload = *indexed->second;
+            if (!covered_by_upload(upload, wanted)) continue;
+            if (out_match) {
+                out_match->miss_texture_hash = upload.hash;
+                out_match->has_miss_texture_hash = 1;
+                out_match->upload_serial = upload.serial;
+                out_match->upload_width_words = upload.width;
+                out_match->upload_height = upload.height;
+                for (const Fragment& fragment : upload.fragments) {
+                    if (contains_point(fragment.rect, first_x, first_y)) {
+                        out_match->source_word_x = static_cast<uint16_t>(
+                            fragment.source_x + first_x - fragment.rect.x);
+                        out_match->source_y = static_cast<uint16_t>(
+                            fragment.source_y + first_y - fragment.rect.y);
+                        break;
+                    }
+                }
+            }
+            hd_texture_pack_export_missing(pack, *query, upload.hash, palette_hash, wanted[0]);
+            break;
+        }
+        return HD_TEXTURE_LOOKUP_NONE;
+    }
+
     uint16_t source_word_x = 0, source_y = 0;
     bool anchor_found = false;
     for (const Fragment& fragment : candidate->fragments) {
@@ -1944,6 +2183,63 @@ int hd_texture_pack_diag_dump_ring(char* out, size_t out_capacity) {
         if (pos >= out_capacity) break;
     }
     return 1;
+}
+
+int hd_texture_pack_get_recolor_master(const HdTexturePack* pack, uint32_t texture_hash,
+                                       HdRecolorMasterInfo* out_info) {
+    if (out_info) std::memset(out_info, 0, sizeof(*out_info));
+    if (!pack || !out_info) return 0;
+    const auto it = pack->masters.find(texture_hash);
+    if (it == pack->masters.end()) return 0;
+    const RecolorableMaster& m = it->second;
+    out_info->hd_rgba = m.hd_rgba.data();
+    out_info->hd_width = m.hd_width;
+    out_info->hd_height = m.hd_height;
+    out_info->index = m.index.data();
+    out_info->native_width = m.native_width;
+    out_info->native_height = m.native_height;
+    /* ALWAYS 16 or 256 (never the raw m.ref_palette_count, which can be any
+     * value like 160 for a character/monster texture whose specific costume
+     * palette doesn't define every color a byte-indexed SHP/WEP texture's raw
+     * index bytes can legally reference) -- see compute_recolor_table's
+     * 2026-09-11 bugfix comment for why the table must always cover the full
+     * legal index range for this bit depth. Must match hd_texture_pack_
+     * compute_recolor_table's own return value exactly, since callers
+     * (gpu_gl_renderer.c) size their GPU upload/table by whichever of the two
+     * they read first. */
+    out_info->palette_count = m.ref_palette_count <= 16 ? 16u : 256u;
+    return 1;
+}
+
+uint32_t hd_texture_pack_compute_recolor_table(const HdTexturePack* pack, uint32_t texture_hash,
+                                               const uint16_t* vram, size_t vram_word_count,
+                                               uint16_t clut_x, uint16_t clut_y, uint8_t depth,
+                                               float* out_scale, float* out_offset) {
+    if (!pack || !vram || vram_word_count < kVramWords || !out_scale || !out_offset ||
+        depth > HD_TEXTURE_DEPTH_8BPP)
+        return 0;
+    const auto it = pack->masters.find(texture_hash);
+    if (it == pack->masters.end()) return 0;
+    const RecolorableMaster& m = it->second;
+    /* Always reads the full 256-word window regardless of depth (harmless --
+     * compute_recolor_table only ever reads live_palette[i] for i below its
+     * own table_size, which independently caps at 16 or 256 from m.ref_
+     * palette_count) rather than sizing this buffer from depth like an
+     * earlier version did: that made live_count and table_size two
+     * INDEPENDENTLY derived sizes (one from the query's depth, one from
+     * m.ref_palette_count) that could disagree -- a 4bpp query (live_count
+     * 16) against a master whose ref_palette_count was > 16 (table_size 256)
+     * read compute_recolor_table's live_palette_rgba out of bounds past a
+     * 16-entry buffer. Always allocating/reading the max size sidesteps that
+     * mismatch entirely. */
+    constexpr unsigned kMaxLiveCount = 256;
+    uint8_t live_palette[kMaxLiveCount * 4] = {0};
+    const unsigned cy = clut_y & (kVramHeight - 1);
+    for (unsigned i = 0; i < kMaxLiveCount; ++i) {
+        const uint16_t word = vram[cy * kVramWidth + ((unsigned{clut_x} + i) & (kVramWidth - 1))];
+        hd_texture_rgba5551_to_rgba8(word, live_palette + size_t{i} * 4);
+    }
+    return compute_recolor_table(m, live_palette, kMaxLiveCount, out_scale, out_offset);
 }
 
 void hd_texture_pack_diag_last_match(char* out_path, size_t path_capacity,

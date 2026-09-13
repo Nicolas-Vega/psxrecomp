@@ -52,6 +52,12 @@ sdl2-msvc/
 *.jsonl
 /.aot_capture_history/
 
+# gpu_capture_state.py / gpu_replay_capture.py / gpu_isolate_diff.py bundles:
+# VRAM snapshots, GP0 stream captures, and per-primitive isolated-diff PNG
+# crops (hundreds to thousands of files per bundle) -- reproducible debug
+# output from a live session, not source. Regenerate by re-capturing.
+/analysis/captures/
+
 # Local additive overlay-capture store configuration and game-derived data.
 .psxrecomp.env
 .env

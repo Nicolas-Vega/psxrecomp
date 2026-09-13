@@ -65,6 +65,14 @@ typedef struct HdTextureMatch {
     uint16_t upload_height;
     uint16_t source_word_x; /* first queried word within the original upload */
     uint16_t source_y;
+    /* Set even when this match is otherwise a MISS (entry is invalid): the
+     * texture_hash of the first tracked upload that actually covers this
+     * query, if any. Lets the caller check hd_texture_pack_get_recolor_master
+     * for a live-recolorable master when there's no exact (texture_hash,
+     * palette_hash) file -- see that function's comment. Zero/0 when no
+     * covering upload was found at all (has_miss_texture_hash stays 0). */
+    uint32_t miss_texture_hash;
+    int has_miss_texture_hash;
 } HdTextureMatch;
 
 /* explicit_root wins. When it is NULL/empty, PSXRECOMP_HD_TEXTURE_ROOT is
@@ -210,6 +218,49 @@ int hd_texture_pack_diag_dump_uploads(const HdTexturePack* pack, char* out,
  * {query,entries,pieces}) keys into out; truncates silently if out_capacity
  * is too small. Returns 0 only for a null/zero-capacity out. */
 int hd_texture_pack_diag_dump_fused_last(char* out, size_t out_capacity);
+
+/* Recolorable-master live-GPU-recolor support (2026-09-11: replaced an
+ * earlier CPU pre-bake-and-cache approach -- see docs/DISC_TEXTURE_EXTRACTION.md
+ * for why: a status-effect flash or a whole-scene retint like Vagrant Story's
+ * battle mode can ask for a brand-new palette on a texture every single
+ * frame, or on dozens of different textures in the same instant, and both
+ * baking a whole new HD image and encoding it to disk were too expensive to
+ * do synchronously that often). The intended use, when hd_texture_pack_match
+ * misses but out_match->has_miss_texture_hash is set: call
+ * hd_texture_pack_get_recolor_master once per texture_hash (cache its
+ * hd_rgba/index as GL textures, keyed by texture_hash, for the pack's
+ * lifetime), then hd_texture_pack_compute_recolor_table once per (texture_
+ * hash, palette_hash) combination actually seen (cheap -- at most 256
+ * entries, not image-sized) to get a tiny per-palette-index affine transform
+ * a fragment shader applies per pixel: sample the master's hd_rgba, look up
+ * this pixel's index in the master's index map, then
+ * out.rgb = hd.rgb * scale[index].rgb + offset[index],
+ * out.a = hd.a * scale[index].a (0 or 1: whether that index is opaque under
+ * this palette). No new files, no per-combination image encode. */
+typedef struct HdRecolorMasterInfo {
+    const uint8_t* hd_rgba;  /* hd_width*hd_height*4 RGBA8, valid until pack destroyed */
+    uint32_t hd_width, hd_height;
+    const uint8_t* index;    /* native_width*native_height, 1 byte/pixel, valid until pack destroyed */
+    uint32_t native_width, native_height;
+    uint32_t palette_count;  /* 16 or up to 256 -- size of the table compute_recolor_table fills */
+} HdRecolorMasterInfo;
+
+/* Returns 1 and fills out_info if a recolorable master exists for
+ * texture_hash, 0 (out_info zeroed) otherwise. */
+int hd_texture_pack_get_recolor_master(const HdTexturePack* pack, uint32_t texture_hash,
+                                       HdRecolorMasterInfo* out_info);
+
+/* Computes the master's per-index (scale, offset) table against the
+ * CURRENTLY ACTIVE clut (same vram/clut_x/clut_y/depth convention as
+ * HdTextureDrawQuery). out_scale must hold at least palette_count*4 floats
+ * (RGBA, index-ordered, A = opacity mask), out_offset at least
+ * palette_count*3 (RGB). Returns the palette_count actually used (matches
+ * HdRecolorMasterInfo::palette_count), or 0 if there's no master for
+ * texture_hash or depth has no palette (16bpp). */
+uint32_t hd_texture_pack_compute_recolor_table(const HdTexturePack* pack, uint32_t texture_hash,
+                                               const uint16_t* vram, size_t vram_word_count,
+                                               uint16_t clut_x, uint16_t clut_y, uint8_t depth,
+                                               float* out_scale, float* out_offset);
 
 /* Ring of the last ~32 hd_texture_pack_match_fused FAILURES with a reason
  * code (1=UV-wrapped/empty query, 2=ambiguous pack entry, 3=more than

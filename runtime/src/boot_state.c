@@ -370,7 +370,17 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    h.section_count = 16;
+    h.section_count = 17;  /* CPU RAM SPAD IRQ TIMER CLOCK GPU VRAM SPU SPURAM
+                              CDROM DMA SIO MDEC ICACHE DIRTY HD_TRACKER --
+                              this is a HARDCODED total, not derived from the
+                              write_section calls below: adding/removing a
+                              section here MUST update this count to match,
+                              or every section from the mismatch point on
+                              writes real bytes to the file but falls outside
+                              what the reader's section_count-bounded loop
+                              ever looks at (silently orphaned trailing bytes
+                              -- exactly what happened when BS_SEC_HD_TRACKER
+                              was added without bumping this from 16). */
 
     ok = write_header_le(o, &h);
 
@@ -431,6 +441,9 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) ok = write_module_section(o, BS_SEC_DMA,   dma_snapshot_bytes,   dma_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_SIO,   sio_snapshot_bytes,   sio_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_MDEC,  mdec_snapshot_bytes,  mdec_snapshot_write);
+    if (ok) ok = write_module_section(o, BS_SEC_HD_TRACKER,
+                                      gpu_hd_tracking_snapshot_bytes,
+                                      gpu_hd_tracking_snapshot_write);
     if (ok) {
         /* I-cache tags: warm loads must replay with the fetch-cost state the
          * live timeline had, or miss cycles differ per peer/retry and IRQ
@@ -676,6 +689,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
             if (!pst_r_u32(&r, &g_psx_icache_tv[i])) return 0;
         return 1;
     }
+    case BS_SEC_HD_TRACKER:
+        return gpu_hd_tracking_snapshot_read(p, len);
     default:
         /* Unknown section: SKIP, never fail. This was `return 0`, which made
          * every state written by a build with one extra section a poison pill
